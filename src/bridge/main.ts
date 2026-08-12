@@ -18,12 +18,15 @@ import type { BridgeDeps } from "./server";
  */
 const DEFAULT_PORT = 8765;
 const HOSTNAME = "127.0.0.1";
+/** Bridge protocol/daemon version surfaced in `GET /v1/state` (tracked with the package). */
+const BRIDGE_VERSION = "0.1.0";
 
 export function createBridgeDeps(env: Record<string, string> = process.env as Record<string, string>): BridgeDeps {
   const runner = new BunCommandRunner(env);
   const adb = new AdbWrapper(runner);
   const cli = new AndroidCli(runner);
   return {
+    bridge: { version: BRIDGE_VERSION, pid: process.pid },
     adb,
     cli,
     env,

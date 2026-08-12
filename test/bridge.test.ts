@@ -21,6 +21,7 @@ function makeDeps(overrides: Partial<BridgeDeps> = {}) {
     captures: [],
   };
   const deps: BridgeDeps = {
+    bridge: { version: "test", pid: 1234 },
     adb: {
       devices: async () => state.devices,
       inputTap: async (s, x, y) => void state.taps.push({ s, x, y }),
@@ -59,7 +60,7 @@ const req = (
 ) => srv.dispatch(path, init);
 
 describe("GET /v1/state", () => {
-  it("returns 200 always, with selected/frame (nullable) and device+emulator lists", async () => {
+  it("returns 200 always, with schema/bridge metadata, selected/frame (nullable) and device+emulator lists", async () => {
     const { deps, state } = makeDeps();
     state.devices = [
       { serial: "emulator-5554", state: "device", model: "Pixel_9_Pro" },
@@ -71,11 +72,15 @@ describe("GET /v1/state", () => {
       const res = await req(srv, "/v1/state");
       expect(res.status).toBe(200);
       const body = (await res.json()) as {
+        schema: string;
+        bridge: { version: string; pid: number };
         selected: unknown;
         frame: unknown;
         devices: unknown[];
         emulators: unknown[];
       };
+      expect(body.schema).toBe("v1");
+      expect(body.bridge).toEqual({ version: "test", pid: 1234 });
       expect(body.selected).toBeNull(); // 2 devices, none selected
       expect(body.frame).toBeNull();
       expect(body.devices).toHaveLength(2);
@@ -210,8 +215,10 @@ describe("POST /v1/input/tap", () => {
       });
       expect(res.status).toBe(200);
       expect(state.taps).toEqual([{ s: "emulator-5554", x: 100, y: 200 }]);
-      const body = (await res.json()) as { injected: string; serial: string };
-      expect(body.injected).toBe("tap");
+      const body = (await res.json()) as { ok: boolean; x: number; y: number; serial: string };
+      expect(body.ok).toBe(true);
+      expect(body.x).toBe(100);
+      expect(body.y).toBe(200);
       expect(body.serial).toBe("emulator-5554");
     } finally {
       srv.stop();

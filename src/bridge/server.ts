@@ -16,6 +16,8 @@ import type { AVD, Device } from "../device/types";
 
 /** Narrow dependency surface the bridge needs from the device core. */
 export interface BridgeDeps {
+  /** Self-describing bridge metadata (locked contract: surfaced in /v1/state). */
+  bridge: { version: string; pid: number };
   adb: {
     devices(): Promise<Device[]>;
     inputTap(serial: string, x: number, y: number): Promise<void>;
@@ -190,7 +192,8 @@ async function handleState(deps: BridgeDeps, explicit?: string): Promise<Respons
     }
   }
   // `frame` is reserved for future annotated-screen content; always null today.
-  return json(200, { selected, frame: null, devices, emulators });
+  // `bridge` self-describes the daemon (locked contract); `schema` pins the shape.
+  return json(200, { schema: "v1", bridge: deps.bridge, selected, frame: null, devices, emulators });
 }
 
 async function handleScreenshot(deps: BridgeDeps, explicit?: string): Promise<Response> {
@@ -210,7 +213,7 @@ async function handleTap(deps: BridgeDeps, explicit: string | undefined, req: Re
   const y = needNumber(body, "y");
   const serial = await requireUsable(deps, explicit);
   await deps.adb.inputTap(serial, x, y);
-  return json(200, { injected: "tap", serial, x, y });
+  return json(200, { ok: true, x, y, serial });
 }
 
 async function handleSwipe(
@@ -226,7 +229,7 @@ async function handleSwipe(
   const durationMs = readOptionalNumber(body, "durationMs");
   const serial = await requireUsable(deps, explicit);
   await deps.adb.inputSwipe(serial, x1, y1, x2, y2, durationMs);
-  return json(200, { injected: "swipe", serial });
+  return json(200, { ok: true, serial });
 }
 
 async function handleText(deps: BridgeDeps, explicit: string | undefined, req: Request): Promise<Response> {
@@ -245,7 +248,7 @@ async function handleText(deps: BridgeDeps, explicit: string | undefined, req: R
   }
   serial = await requireUsable(deps, explicit);
   await deps.adb.inputText(serial, raw);
-  return json(200, { injected: "text", serial });
+  return json(200, { ok: true, serial });
 }
 
 /** Build the HTTP handler. Testable directly; `main.ts` binds it to loopback. */
