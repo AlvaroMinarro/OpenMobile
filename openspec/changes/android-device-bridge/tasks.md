@@ -48,11 +48,11 @@ Chain strategy: stacked-to-main
 - [x] 4.2 Contract tests per locked D2: GET /v1/state, GET /v1/screenshot, POST /v1/input/{tap,swipe,text} statuses + error bodies (`{error:{code,message,details?}}` → spec local-bridge)
 
 ## Phase 5: Plugin (`src/plugin/`)
-- [ ] 5.1 hooks: `session.idle` + `tool.execute.after` → GET /v1/state → `session.prompt({noReply:true})`; debounce 2000ms + content-hash dedupe; skip when no selected device (D4)
-- [ ] 5.2 `experimental.session.compacting` → `output.context.push`; E2E debounce/dedupe tests; sample `opencode.json` + `.opencode/plugins/`
+- [x] 5.1 hooks: `session.idle` + `tool.execute.after` → GET /v1/state → `session.prompt({noReply:true})`; debounce 2000ms + content-hash dedupe; skip when no selected device (D4)
+- [x] 5.2 `experimental.session.compacting` → `output.context.push`; E2E debounce/dedupe tests; sample `opencode.json` + `.opencode/plugins/`
 
 ## Phase 6: Verification / Docs
-- [ ] 6.1 `bun test` + `bun build` green across unit/integration/E2E; finalize README /v1 contract reference
+- [x] 6.1 `bun test` + `bun build` green across unit/integration/E2E; finalize README /v1 contract reference
 
 ## Decisions / Blockers
 - Live re-verify at apply: `layout --diff` output shapes + emulator-start vs `sys.boot_completed=1` (design Open Questions) — tests use in-memory doubles, so real CLI bob confirmed at apply.
