@@ -26,15 +26,15 @@ Chain strategy: stacked-to-main
 | 4 | Plugin + samples + docs | PR 4 | final /v1 README + verification |
 
 ## Phase 1: Foundation / Scaffold
-- [ ] 1.1 bun init → `package.json` (3 entrypoints: `bin/mcp-server`, `exports/plugin`, `src/bridge/main.ts`), `tsconfig.json`, `bun.lock`; pin `@modelcontextprotocol/sdk` v1.29.x; `test_command: bun test` enables strict_tdd
-- [ ] 1.2 Add MIT `LICENSE` + `README.md` scaffold (usage, latency notes, stub /v1 contract section)
+- [x] 1.1 bun init → `package.json` (3 entrypoints: `bin/mcp-server`, `exports/plugin`, `src/bridge/main.ts`), `tsconfig.json`, `bun.lock`; pin `@modelcontextprotocol/sdk` v1.29.x; `test_command: bun test` enables strict_tdd
+- [x] 1.2 Add MIT `LICENSE` + `README.md` scaffold (usage, latency notes, stub /v1 contract section)
 
 ## Phase 2: Device Core (`src/device/`)
-- [ ] 2.1 `src/device/androidCli.ts`: run / layout / `--diff`, capture / `--annotate`, screen resolve, emulator, install/run; version + feature-detect
-- [ ] 2.2 `src/device/adb.ts`: devices/state, logcat, screencap, uiautomator, shell input (input channel + fallback)
-- [ ] 2.3 `src/device/selection.ts`: `--device` > `ANDROID_DEVICE` > auto-detect; ambiguous error listing serials
-- [ ] 2.4 `src/device/serialize.ts`: UIElement→JSON, diff-shape detection, XML→tree parser
-- [ ] 2.5 `test/`: in-memory CLI + adb runners + fixtures; unit tests (selection precedence, XML→JSON, diff-shape, logcat filter → spec device-discovery, ui-tree, logcat-read)
+- [x] 2.1 `src/device/androidCli.ts`: run / layout / `--diff`, capture / `--annotate`, screen resolve, emulator, install/run; version + feature-detect
+- [x] 2.2 `src/device/adb.ts`: devices/state, logcat, screencap, uiautomator, shell input (input channel + fallback)
+- [x] 2.3 `src/device/selection.ts`: `--device` > `ANDROID_DEVICE` > auto-detect; ambiguous error listing serials
+- [x] 2.4 `src/device/serialize.ts`: UIElement→JSON, diff-shape detection, XML→tree parser
+- [x] 2.5 `test/`: in-memory CLI + adb runners + fixtures; unit tests (selection precedence, XML→JSON, diff-shape, logcat filter → spec device-discovery, ui-tree, logcat-read)
 
 ## Phase 3: MCP Tools (`src/tools/` + `src/mcp-server.ts`)
 - [ ] 3.1 tools: list_devices, get_device_info, emulator_list/start/stop/create, deploy_app
