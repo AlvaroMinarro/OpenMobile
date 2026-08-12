@@ -1,0 +1,37 @@
+schema: spec-driven
+
+context: |
+  Tech stack: greenfield (TypeScript/Bun planned, not yet scaffolded)
+  Architecture: TBD (to be decided during sdd-explore)
+  Testing: bun test (planned; no runner scaffolded yet)
+  Style: TBD
+
+testing:
+  strict_tdd: true
+  test_command: "bun test"
+  note: >
+    Bun runtime is scaffolded (package.json / bun.lock present), `bun test` and
+    `bun run typecheck` work. strict_tdd enabled → RED-GREEN-REFACTOR active.
+
+rules:
+  proposal:
+    - Include rollback plan for risky changes
+  specs:
+    - Use Given/When/Then for scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+  design:
+    - Include sequence diagrams for complex flows
+    - Document architecture decisions with rationale
+  tasks:
+    - Group by phase, use hierarchical numbering
+    - Keep tasks completable in one session
+  apply:
+    - Follow existing code patterns
+    tdd: true
+    test_command: "bun test"
+  verify:
+    test_command: "bun test"
+    build_command: "bun build"
+    coverage_threshold: 0
+  archive:
+    - Warn before merging destructive deltas
