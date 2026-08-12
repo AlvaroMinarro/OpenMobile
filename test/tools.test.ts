@@ -10,6 +10,7 @@ import {
   resolveScreenLabels,
   tap,
   pressKey,
+  deployApp,
 } from "../src/tools/handlers";
 import { createContext } from "../src/tools/context";
 import type { DeviceContext } from "../src/tools/context";
@@ -121,6 +122,87 @@ describe("emulator_start — CLI-delegated readiness gated on adb state 'device'
     expect(res.isError).toBe(true);
     expect(textOf(res)).toContain("Pixel_9_Pro");
     expect(textOf(res)).toContain("offline");
+    runner.assertSatisfied();
+  });
+});
+
+describe("deploy_app — android CLI install/run with adb fallback", () => {
+  const serial = "emulator-5554";
+  const apk = "/tmp/app.apk";
+
+  it("installs via the android CLI (no activity)", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["android", "install", `--device=${serial}`, apk], { exitCode: 0 });
+    const ctx = makeCtx(runner);
+    const res = await deployApp(ctx, { apk, device: serial });
+    expect(res.isError).toBeFalsy();
+    const parsed = JSON.parse(textOf(res)) as {
+      installed: string;
+      serial: string;
+      launched: unknown;
+    };
+    expect(parsed.installed).toBe(apk);
+    expect(parsed.serial).toBe(serial);
+    expect(parsed.launched).toBe(false);
+    runner.assertSatisfied();
+  });
+
+  it("installs and launches via the android CLI when an activity is given", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["android", "install", `--device=${serial}`, apk], { exitCode: 0 });
+    runner.expect(["android", "run", `--device=${serial}`, apk, "com.x/.Main"], {
+      exitCode: 0,
+    });
+    const ctx = makeCtx(runner);
+    const res = await deployApp(ctx, { apk, activity: "com.x/.Main", device: serial });
+    expect(res.isError).toBeFalsy();
+    const parsed = JSON.parse(textOf(res)) as { launched: unknown };
+    expect(parsed.launched).toBe("com.x/.Main");
+    runner.assertSatisfied();
+  });
+
+  it("falls back to adb install when the CLI install fails", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["android", "install", `--device=${serial}`, apk], {
+      exitCode: 1,
+      stderr: "CLI install exploded",
+    });
+    runner.expect(["adb", "-s", serial, "install", "-r", apk], { exitCode: 0 });
+    const ctx = makeCtx(runner);
+    const res = await deployApp(ctx, { apk, device: serial });
+    expect(res.isError).toBeFalsy();
+    expect(runner.called("adb", "-s", serial, "install", "-r", apk)).toBe(true);
+    runner.assertSatisfied();
+  });
+
+  it("falls back to adb am start when the CLI run fails", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["android", "install", `--device=${serial}`, apk], { exitCode: 0 });
+    runner.expect(["android", "run", `--device=${serial}`, apk, "com.x/.Main"], {
+      exitCode: 1,
+      stderr: "CLI run exploded",
+    });
+    runner.expect(["adb", "-s", serial, "shell", "am", "start", "-n", "com.x/.Main"], {
+      exitCode: 0,
+    });
+    const ctx = makeCtx(runner);
+    const res = await deployApp(ctx, { apk, activity: "com.x/.Main", device: serial });
+    expect(res.isError).toBeFalsy();
+    expect(runner.called("adb", "-s", serial, "shell", "am", "start", "-n", "com.x/.Main")).toBe(
+      true,
+    );
+    runner.assertSatisfied();
+  });
+
+  it("refuses with an actionable error when multiple devices are present", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "devices", "-l"], {
+      stdout: "emulator-5554\tdevice\ndeadbeef\tdevice\n",
+    });
+    const ctx = makeCtx(runner);
+    const res = await deployApp(ctx, { apk });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("multiple devices");
     runner.assertSatisfied();
   });
 });

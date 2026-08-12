@@ -121,6 +121,16 @@ export class AdbWrapper {
     return { lines, truncated };
   }
 
+  /** `adb install -r <apk>` — fallback when the android CLI install is unavailable. */
+  async install(serial: string, apk: string): Promise<void> {
+    await this.exec(["adb", "-s", serial, "install", "-r", apk]);
+  }
+
+  /** `adb shell am start -n <activity>` — fallback launch when the CLI run is unavailable. */
+  async amStart(serial: string, activity: string): Promise<void> {
+    await this.shell(serial, "am", "start", "-n", activity);
+  }
+
   /** Shell-capture a PNG to a device path, then pull it to `localPath`. */
   async screencap(serial: string, localPath: string): Promise<void> {
     const devicePath = "/sdcard/om_shot.png";

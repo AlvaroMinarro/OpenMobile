@@ -155,19 +155,30 @@ export const deployApp = (
   safe(async () => {
     const target = await requireTarget(ctx, args.device);
     if (!target.ok) return errText(target.error);
-    await withTimeout(
-      ctx.cli.install({ serial: target.serial, apk: args.apk }),
-      ctx.timeoutMs,
-      `install of ${args.apk} timed out`,
-    );
-    if (args.activity) {
-      await withTimeout(
-        ctx.cli.run({ serial: target.serial, apk: args.apk, activity: args.activity }),
-        ctx.timeoutMs,
-        `launch of ${args.activity} timed out`,
-      );
+    // Primary: android CLI install; fallback: adb install (design: CLI installs
+    // are best-effort, adb ALWAYS works). Wrapped so a CLI failure never fails
+    // the whole deploy when adb can do the job.
+    const install = async () => {
+      try {
+        await ctx.cli.install({ serial: target.serial, apk: args.apk });
+      } catch {
+        await ctx.adb.install(target.serial, args.apk);
+      }
+    };
+    await withTimeout(install(), ctx.timeoutMs, `install of ${args.apk} timed out`);
+    const activity = args.activity;
+    if (activity) {
+      // Primary: android CLI run; fallback: adb `am start -n <activity>`.
+      const launch = async () => {
+        try {
+          await ctx.cli.run({ serial: target.serial, apk: args.apk, activity });
+        } catch {
+          await ctx.adb.amStart(target.serial, activity);
+        }
+      };
+      await withTimeout(launch(), ctx.timeoutMs, `launch of ${activity} timed out`);
     }
-    return { installed: args.apk, serial: target.serial, launched: args.activity ?? false };
+    return { installed: args.apk, serial: target.serial, launched: activity ?? false };
   });
 
 // ---------------------------------------------------------------------------
