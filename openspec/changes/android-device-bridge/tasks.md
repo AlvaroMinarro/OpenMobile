@@ -44,8 +44,8 @@ Chain strategy: stacked-to-main
 - [x] 3.5 `src/mcp-server.ts`: stdio server registering ~12 tools; integration tests tool→device round trips
 
 ## Phase 4: Bridge Daemon (`src/bridge/`)
-- [ ] 4.1 `src/bridge/server.ts` + `main.ts`: localhost-only HTTP `/v1/*` routes, state cache, error mapping (400/404/409/422/500), loopback bind
-- [ ] 4.2 Contract tests per locked D2: GET /v1/state, GET /v1/screenshot, POST /v1/input/{tap,swipe,text} statuses + error bodies (`{error:{code,message,details?}}` → spec local-bridge)
+- [x] 4.1 `src/bridge/server.ts` + `main.ts`: localhost-only HTTP `/v1/*` routes, state cache, error mapping (400/404/409/422/500), loopback bind
+- [x] 4.2 Contract tests per locked D2: GET /v1/state, GET /v1/screenshot, POST /v1/input/{tap,swipe,text} statuses + error bodies (`{error:{code,message,details?}}` → spec local-bridge)
 
 ## Phase 5: Plugin (`src/plugin/`)
 - [ ] 5.1 hooks: `session.idle` + `tool.execute.after` → GET /v1/state → `session.prompt({noReply:true})`; debounce 2000ms + content-hash dedupe; skip when no selected device (D4)
