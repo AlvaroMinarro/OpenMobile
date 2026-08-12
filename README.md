@@ -64,8 +64,19 @@ The plugin keeps the agent's context fresh with compact device snapshots. It is
 - Bridge-down: fetch failures are logged and skipped — the plugin never crashes
   the session.
 
-Wire it via package export (see `opencode.json` / `.opencode/plugins/` for a
-sample config):
+Wire it via package export, or load the **local** sample straight from source
+(before publishing) by pointing OpenCode at `.opencode/plugins/`:
+
+```jsonc
+// .opencode/opencode.json — loads the plugin without publishing
+{
+  "plugin": [{ "id": "openmobile", "path": "./.opencode/plugins/openmobile.ts" }]
+}
+```
+
+`.opencode/plugins/openmobile.ts` re-exports the plugin from this repo's
+TypeScript source, so you can run it as-is. Once the package is published, you
+can switch to the package export instead:
 
 ```jsonc
 {
