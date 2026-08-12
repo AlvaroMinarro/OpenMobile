@@ -1,0 +1,12 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "//": "Sample consumption config for the OpenMobile feedback-loop plugin.",
+  "//2": "Point the plugin path at the package export ./plugin. With bun-linked installs:",
+  "//3": "node_modules/@openmobile/android-device-bridge/plugin",
+  "plugin": [
+    {
+      "id": "openmobile-adaptive",
+      "path": "./node_modules/@openmobile/android-device-bridge/plugin"
+    }
+  ]
+}
