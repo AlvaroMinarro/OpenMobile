@@ -37,11 +37,11 @@ Chain strategy: stacked-to-main
 - [x] 2.5 `test/`: in-memory CLI + adb runners + fixtures; unit tests (selection precedence, XML→JSON, diff-shape, logcat filter → spec device-discovery, ui-tree, logcat-read)
 
 ## Phase 3: MCP Tools (`src/tools/` + `src/mcp-server.ts`)
-- [ ] 3.1 tools: list_devices, get_device_info, emulator_list/start/stop/create, deploy_app
-- [ ] 3.2 tools: get_ui_tree, get_ui_tree_diff (in-memory baselineEstablished per D1; never stale diff)
-- [ ] 3.3 tools: take_screenshot, get_annotated_screen, resolve_screen_labels
-- [ ] 3.4 tools: read_logcat, tap/swipe/input_text/press_key (retry-once on transient adb latency)
-- [ ] 3.5 `src/mcp-server.ts`: stdio server registering ~12 tools; integration tests tool→device round trips
+- [x] 3.1 tools: list_devices, get_device_info, emulator_list/start/stop/create, deploy_app
+- [x] 3.2 tools: get_ui_tree, get_ui_tree_diff (in-memory baselineEstablished per D1; never stale diff)
+- [x] 3.3 tools: take_screenshot, get_annotated_screen, resolve_screen_labels
+- [x] 3.4 tools: read_logcat, tap/swipe/input_text/press_key (retry-once on transient adb latency)
+- [x] 3.5 `src/mcp-server.ts`: stdio server registering ~12 tools; integration tests tool→device round trips
 
 ## Phase 4: Bridge Daemon (`src/bridge/`)
 - [ ] 4.1 `src/bridge/server.ts` + `main.ts`: localhost-only HTTP `/v1/*` routes, state cache, error mapping (400/404/409/422/500), loopback bind
