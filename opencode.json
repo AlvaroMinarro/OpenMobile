@@ -1,0 +1,8 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "//": "Sample consumption config for the OpenMobile feedback-loop plugin.",
+  "//2": "OpenCode auto-discovers plugins in .opencode/plugins/, so the plugin runs",
+  "//3": "right here without publishing. The 'plugin' array accepts string paths or",
+  "//4": "package names; after publish use the package export: @openmobile/android-device-bridge/plugin",
+  "plugin": ["./.opencode/plugins/openmobile.ts"]
+}
