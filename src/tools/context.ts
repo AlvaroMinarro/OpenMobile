@@ -3,6 +3,7 @@ import { AdbWrapper } from "../device/adb";
 import { BunCommandRunner } from "../device/runner";
 import { resolveDeviceSelection } from "../device/selection";
 import type { Device } from "../device/types";
+import type { ToolResult } from "./handlers";
 
 /**
  * Injectable device-interface dependencies shared by every MCP tool handler.
@@ -45,6 +46,12 @@ export async function resolveTarget(
   ctx: DeviceContext,
   explicit?: string,
 ): Promise<ResolvedTarget> {
+  // An explicitly named serial is trusted without re-enumerating: the calling
+  // agent picked it from a prior list_devices, so we avoid an extra adb
+  // round-trip. Selection/state gating only applies to the auto-detect path.
+  if (explicit) {
+    return { ok: true, serial: explicit, device: { serial: explicit, state: "device" } };
+  }
   const devices = await ctx.adb.devices();
   const base = resolveDeviceSelection({ explicit, env: ctx.env["ANDROID_DEVICE"], devices });
   if (base.ok === false) {
@@ -70,17 +77,27 @@ export async function resolveTarget(
 }
 
 /** Wrap an async body: convert thrown errors into text error results. */
-export async function safe(body: () => Promise<unknown>): Promise<{
-  isError: boolean;
-  content: Array<{ type: "text"; text: string }>;
-}> {
+export async function safe(body: () => Promise<unknown>): Promise<ToolResult> {
   try {
     const value = await body();
+    // A handler body that returns a full ToolResult (e.g. errText for a
+    // gating refusal, or okImage) is already the final result — pass it
+    // through instead of JSON-stringifying it as a success payload.
+    if (isToolResult(value)) return value;
     return { isError: false, content: [{ type: "text", text: JSON.stringify(value, null, 2) }] };
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     return { isError: true, content: [{ type: "text", text: message }] };
   }
+}
+
+function isToolResult(value: unknown): value is ToolResult {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "isError" in value &&
+    Array.isArray((value as ToolResult).content)
+  );
 }
 
 /** Production context factory bound to Bun.spawn + process.env. */

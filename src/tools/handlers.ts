@@ -65,7 +65,7 @@ async function toBase64(bytes: Uint8Array): Promise<string> {
 // device-discovery
 // ---------------------------------------------------------------------------
 
-export const listDevices = (ctx: DeviceContext) =>
+export const listDevices = (ctx: DeviceContext, _args?: unknown) =>
   safe(async () => {
     const [devices, avds, cliVersion] = await Promise.all([
       ctx.adb.devices(),
@@ -97,7 +97,7 @@ export const getDeviceInfo = (ctx: DeviceContext, args: { device?: string }) =>
 // emulator-lifecycle
 // ---------------------------------------------------------------------------
 
-export const emulatorList = (ctx: DeviceContext) =>
+export const emulatorList = (ctx: DeviceContext, _args?: unknown) =>
   safe(async () => ({ avds: await ctx.cli.emulatorList() }));
 
 export const emulatorStart = (ctx: DeviceContext, args: { name?: string; timeoutMs?: number }) =>
