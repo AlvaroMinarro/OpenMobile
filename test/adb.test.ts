@@ -179,6 +179,41 @@ describe("AdbWrapper — devices/state, logcat, screencap, uiautomator, input ch
     runner.assertSatisfied();
   });
 
+  it("getprop() runs `adb shell getprop` for a single property and returns its trimmed value", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(
+      ["adb", "-s", "emulator-5554", "shell", "getprop", "ro.build.version.sdk"],
+      { stdout: "36\n" },
+    );
+    const adb = new AdbWrapper(runner);
+    expect(await adb.getprop("emulator-5554", "ro.build.version.sdk")).toBe("36");
+    runner.assertSatisfied();
+  });
+
+  it("wm() returns parsed physical size and density from `wm size`/`wm density` output", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(
+      ["adb", "-s", "emulator-5554", "shell", "wm", "size"],
+      { stdout: "Physical size: 1280x2856\n" },
+    );
+    runner.expect(
+      ["adb", "-s", "emulator-5554", "shell", "wm", "density"],
+      { stdout: "Physical density: 480\n" },
+    );
+    const adb = new AdbWrapper(runner);
+    expect(await adb.wm("emulator-5554")).toEqual({ size: "1280x2856", density: "480" });
+    runner.assertSatisfied();
+  });
+
+  it("wm() returns undefined fields when the device reports no physical values", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "-s", "emulator-5554", "shell", "wm", "size"], { stdout: "" });
+    runner.expect(["adb", "-s", "emulator-5554", "shell", "wm", "density"], { stdout: "" });
+    const adb = new AdbWrapper(runner);
+    expect(await adb.wm("emulator-5554")).toEqual({ size: undefined, density: undefined });
+    runner.assertSatisfied();
+  });
+
   it("uiautomatorDump() reads XML from the device's window dump path", async () => {
     const runner = new MemoryRunner();
     runner.expect(

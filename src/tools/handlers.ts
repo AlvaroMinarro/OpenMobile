@@ -95,17 +95,18 @@ export const getDeviceInfo = (ctx: DeviceContext, args: { device?: string }) =>
   safe(async () => {
     const target = await requireTarget(ctx, args.device);
     if (!target.ok) return errText(target.error);
-    let sdk: string | undefined;
-    try {
-      sdk = await ctx.cli.info("ro.build.version.sdk");
-    } catch {
-      sdk = undefined; // CLI unavailable; fall back to the device metadata we have
-    }
+    // Device truth via adb getprop (design D6); `android info` reports
+    // environment fields, not device state.
+    const model = await ctx.adb.getprop(target.serial, "ro.product.model");
+    const sdk = await ctx.adb.getprop(target.serial, "ro.build.version.sdk");
+    const screen = await ctx.adb.wm(target.serial);
     return {
       serial: target.device.serial,
       state: target.device.state,
-      model: target.device.model,
-      sdk,
+      ...(model !== "" ? { model } : target.device.model ? { model: target.device.model } : {}),
+      ...(sdk !== "" ? { sdk } : {}),
+      ...(screen.size !== undefined ? { screenSize: screen.size } : {}),
+      ...(screen.density !== undefined ? { density: screen.density } : {}),
     };
   });
 

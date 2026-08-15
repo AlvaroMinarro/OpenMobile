@@ -143,6 +143,27 @@ export class AdbWrapper {
     await this.shell(serial, SPAWN_TIMEOUTS.install, "am", "start", "-n", activity);
   }
 
+  /** Read a single device system property via `adb shell getprop` (device truth; D6). */
+  async getprop(serial: string, prop: string): Promise<string> {
+    return (await this.shell(serial, SPAWN_TIMEOUTS.devices, "getprop", prop)).trim();
+  }
+
+  /** Best-effort screen metrics via `wm size` / `wm density`; both may be missing on quirky devices. */
+  async wm(serial: string): Promise<{ size?: string; density?: string }> {
+    const parsePhysical = (out: string): string | undefined => {
+      const m = /Physical (?:size|density):\s*(.+)/.exec(out);
+      return m ? (m[1] as string).trim() : undefined;
+    };
+    const [sizeOut, densityOut] = await Promise.all([
+      this.shell(serial, SPAWN_TIMEOUTS.devices, "wm", "size").catch(() => ""),
+      this.shell(serial, SPAWN_TIMEOUTS.devices, "wm", "density").catch(() => ""),
+    ]);
+    return {
+      size: parsePhysical(sizeOut),
+      density: parsePhysical(densityOut),
+    };
+  }
+
   /** Shell-capture a PNG to a device path, then pull it to `localPath`. */
   async screencap(serial: string, localPath: string): Promise<void> {
     const devicePath = "/sdcard/om_shot.png";

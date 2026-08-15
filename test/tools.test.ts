@@ -4,6 +4,7 @@ import { AdbWrapper } from "../src/device/adb";
 import { MemoryRunner } from "./helpers/memoryRunner";
 import {
   listDevices,
+  getDeviceInfo,
   emulatorList,
   emulatorStart,
   getUiTreeDiff,
@@ -95,6 +96,81 @@ describe("emulator_list", () => {
       { name: "Pixel_9_Pro", running: true, serial: "emulator-5554" },
       { name: "Medium_Phone_API_36.1", running: false },
     ]);
+    runner.assertSatisfied();
+  });
+});
+
+describe("get_device_info — device props via adb getprop (D6: never android info)", () => {
+  it("reports SDK/model from getprop with best-effort screen metrics", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "devices", "-l"], {
+      stdout: "List of devices attached\nemulator-5554\tdevice model:Pixel_9_Pro\n",
+    });
+    runner.expect(
+      ["adb", "-s", "emulator-5554", "shell", "getprop", "ro.build.version.sdk"],
+      { stdout: "36\n" },
+    );
+    runner.expect(
+      ["adb", "-s", "emulator-5554", "shell", "getprop", "ro.product.model"],
+      { stdout: "Pixel_9_Pro\n" },
+    );
+    runner.expect(["adb", "-s", "emulator-5554", "shell", "wm", "size"], {
+      stdout: "Physical size: 1280x2856\n",
+    });
+    runner.expect(["adb", "-s", "emulator-5554", "shell", "wm", "density"], {
+      stdout: "Physical density: 480\n",
+    });
+    const ctx = makeCtx(runner);
+    const res = await getDeviceInfo(ctx, {});
+    expect(res.isError).toBeFalsy();
+    const parsed = JSON.parse(textOf(res)) as Record<string, unknown>;
+    expect(parsed).toEqual({
+      serial: "emulator-5554",
+      state: "device",
+      model: "Pixel_9_Pro",
+      sdk: "36",
+      screenSize: "1280x2856",
+      density: "480",
+    });
+    runner.assertSatisfied();
+  });
+
+  it("degrades gracefully when wm metrics or props are unavailable", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5554\tdevice\n" }); // no model from devices -l
+    runner.expect(
+      ["adb", "-s", "emulator-5554", "shell", "getprop", "ro.build.version.sdk"],
+      { stdout: "36\n" },
+    );
+    runner.expect(
+      ["adb", "-s", "emulator-5554", "shell", "getprop", "ro.product.model"],
+      { stdout: "\n" },
+    ); // model prop empty
+    runner.expect(["adb", "-s", "emulator-5554", "shell", "wm", "size"], { exitCode: 1 }); // wm unsupported
+    const ctx = makeCtx(runner);
+    const res = await getDeviceInfo(ctx, {});
+    expect(res.isError).toBeFalsy();
+    const parsed = JSON.parse(textOf(res)) as Record<string, unknown>;
+    expect(parsed.sdk).toBe("36");
+    expect(parsed.screenSize).toBeUndefined();
+    runner.assertSatisfied();
+  });
+
+  it("never calls `android info` for device metadata", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5554\tdevice\n" });
+    runner.expect(
+      ["adb", "-s", "emulator-5554", "shell", "getprop", "ro.build.version.sdk"],
+      { stdout: "36\n" },
+    );
+    runner.expect(
+      ["adb", "-s", "emulator-5554", "shell", "getprop", "ro.product.model"],
+      { stdout: "Pixel_9_Pro\n" },
+    );
+    const ctx = makeCtx(runner);
+    const res = await getDeviceInfo(ctx, {});
+    expect(res.isError).toBeFalsy();
+    expect(runner.called("android", "info")).toBe(false);
     runner.assertSatisfied();
   });
 });
