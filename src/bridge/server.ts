@@ -200,20 +200,52 @@ async function handleState(deps: BridgeDeps, explicit?: string): Promise<Respons
   return json(200, { schema: "v1", bridge: deps.bridge, selected, frame: null, devices, emulators });
 }
 
-async function handleScreenshot(deps: BridgeDeps, explicit?: string): Promise<Response> {
+async function handleScreenshot(deps: BridgeDeps, explicit: string | undefined, url: URL): Promise<Response> {
   const serial = await requireUsable(deps, explicit);
   const path = deps.tempPngPath("br", serial);
   try {
     await deps.cli.capture({ serial, outPath: path });
     const bytes = await deps.readFile(path);
-    return new Response(bytes, {
+    // Optional downscale/JPEG params (V2 surface live mode). Defaults stay
+    // PNG-full for contract compatibility; the surface asks for a compact
+    // JPEG via query params to cut transfer size and decode cost.
+    const maxWidth = readOptionalPositiveInt(url.searchParams.get("maxWidth"));
+    const quality = readOptionalBoundedInt(url.searchParams.get("quality"), 10, 95, 80);
+    const format = url.searchParams.get("format");
+    let body: Uint8Array = bytes;
+    let contentType = "image/png";
+    if (format === "jpeg" || (maxWidth !== undefined && maxWidth < 10000)) {
+      const sharp = (await import("sharp")).default;
+      let pipeline = sharp(bytes).rotate();
+      if (maxWidth !== undefined) pipeline = pipeline.resize({ width: maxWidth });
+      if (format === "jpeg") {
+        pipeline = (pipeline as unknown as ReturnType<typeof sharp>).jpeg({ quality: quality ?? 80 });
+        contentType = "image/jpeg";
+      }
+      body = new Uint8Array(await pipeline.toBuffer());
+    }
+    return new Response(body, {
       status: 200,
-      headers: { "content-type": "image/png" },
+      headers: { "content-type": contentType },
     });
   } finally {
     // Temp PNG hygiene (D7): delete after the bytes are read — failure too.
     await rm(path, { force: true }).catch(() => {});
   }
+}
+
+/** Parse a positive int query param, undefined when absent/invalid. */
+function readOptionalPositiveInt(raw: string | null): number | undefined {
+  if (raw === null) return undefined;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
+/** Parse an int bounded to [min,max], defaulting to `fallback` when absent/invalid. */
+function readOptionalBoundedInt(raw: string | null, min: number, max: number, fallback: number): number {
+  if (raw === null) return fallback;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= min && n <= max ? n : fallback;
 }
 
 async function handleTap(deps: BridgeDeps, explicit: string | undefined, req: Request): Promise<Response> {
@@ -298,7 +330,7 @@ export function createBridgeHandler(deps: BridgeDeps, opts: BridgeOptions = {}):
     let response: Response;
     try {
       if (req.method === "GET" && path === "/v1/state") response = await handleState(deps, explicit);
-      else if (req.method === "GET" && path === "/v1/screenshot") response = await handleScreenshot(deps, explicit);
+      else if (req.method === "GET" && path === "/v1/screenshot") response = await handleScreenshot(deps, explicit, url);
       else if (req.method === "POST" && path === "/v1/input/tap") response = await handleTap(deps, explicit, req);
       else if (req.method === "POST" && path === "/v1/input/swipe") response = await handleSwipe(deps, explicit, req);
       else if (req.method === "POST" && path === "/v1/input/text") response = await handleText(deps, explicit, req);

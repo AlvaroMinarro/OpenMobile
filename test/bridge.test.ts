@@ -37,7 +37,17 @@ function makeDeps(overrides: Partial<BridgeDeps> = {}) {
       capture: async (t) => void state.captures.push(t),
     },
     env: {},
-    readFile: async () => new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), // PNG magic
+    readFile: async () => {
+      // A real 2x2 PNG (sharp-generated) so the JPEG-param tests can decode.
+      return new Uint8Array([
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
+        0, 0, 0, 2, 0, 0, 0, 2, 8, 2, 0, 0, 0, 253, 212, 154, 115,
+        0, 0, 0, 9, 112, 72, 89, 115, 0, 0, 3, 232, 0, 0, 3, 232,
+        1, 181, 123, 82, 107, 0, 0, 0, 18, 73, 68, 65, 84, 8, 153, 99,
+        56, 145, 98, 116, 34, 197, 136, 1, 66, 1, 0, 40, 174, 5, 121,
+        159, 94, 63, 149, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+      ]);
+    },
     tempPngPath: (_kind: string, _serial: string) => "/tmp/om-br-mock.png",
     ...overrides,
   };
@@ -539,6 +549,53 @@ describe("CORS (V2 OpenChamber surface readiness)", () => {
       });
       expect(res.status).toBe(422);
       expect(res.headers.get("access-control-allow-origin")).toBe("http://localhost:5180");
+    } finally {
+      srv.stop();
+    }
+  });
+});
+
+describe("GET /v1/screenshot — V2 live-mode params", () => {
+  it("defaults to PNG-full when no params are sent (contract preserved)", async () => {
+    const { deps, state } = makeDeps();
+    state.devices = [{ serial: "emulator-5554", state: "device" }];
+    const srv = makeInMemoryServer(deps);
+    try {
+      const res = await srv.dispatch("/v1/screenshot");
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/png");
+    } finally {
+      srv.stop();
+    }
+  });
+
+  it("re-encodes to a downscaled JPEG when format=jpeg&maxWidth are sent", async () => {
+    const { deps, state } = makeDeps();
+    state.devices = [{ serial: "emulator-5554", state: "device" }];
+    const srv = makeInMemoryServer(deps);
+    try {
+      const res = await srv.dispatch("/v1/screenshot?maxWidth=480&quality=60&format=jpeg");
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/jpeg");
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      // JPEG magic: FF D8 FF
+      expect(bytes.length).toBeGreaterThan(4);
+      expect(bytes[0]).toBe(0xff);
+      expect(bytes[1]).toBe(0xd8);
+      expect(bytes[2]).toBe(0xff);
+    } finally {
+      srv.stop();
+    }
+  });
+
+  it("treats an invalid quality as the default 80", async () => {
+    const { deps, state } = makeDeps();
+    state.devices = [{ serial: "emulator-5554", state: "device" }];
+    const srv = makeInMemoryServer(deps);
+    try {
+      const res = await srv.dispatch("/v1/screenshot?quality=abc&format=jpeg");
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/jpeg");
     } finally {
       srv.stop();
     }
