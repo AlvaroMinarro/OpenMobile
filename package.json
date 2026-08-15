@@ -15,7 +15,8 @@
   },
   "scripts": {
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "record-fixtures": "bun scripts/record-fixtures.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0"
