@@ -42,8 +42,8 @@ Delivery strategy: ask-on-risk
 
 ## Phase 3: Handlers + Lifecycle + Hygiene — PR 3 (D5-start, D6, D7)
 
-- [ ] 3.1 RED `test/tools.test.ts` (MemoryRunner+fixtures): start polls THAT serial (never first `state=device`); `getDeviceInfo` via getprop; temp PNG unique + deleted (specs: Start Confirms Started Emulator, Device Properties via adb, Unique Temp PNG, Cleanup)
-- [ ] 3.2 GREEN `androidCli.ts` `emulatorStart`: parse `started as '(emulator-\d+)'` → serial (fallback: pre/post device-list diff); `handlers.ts` polls that serial to `device`
-- [ ] 3.3 GREEN `adb.ts` `getprop(serial, prop)`; `handlers.ts` `getDeviceInfo` model/sdk via getprop (+ `wm size/density` best-effort); drop `cli.info` SDK
-- [ ] 3.4 GREEN `tempPngPath(kind, serial)` (`crypto.randomUUID`), `try/finally rm(force)`; unique device-side screencap path + `adb shell rm`
-- [ ] 3.5 Live verify Pixel_9_Pro: `/v1/state` running:true, non-zero coords, logcat returns; `bun run typecheck` clean; commit `fix(tools): start correlation, getprop info, temp PNG hygiene`
+- [x] 3.1 RED `test/tools.test.ts` (MemoryRunner+fixtures): start polls THAT serial (never first `state=device`); `getDeviceInfo` via getprop; temp PNG unique + deleted (specs: Start Confirms Started Emulator, Device Properties via adb, Unique Temp PNG, Cleanup)
+- [x] 3.2 GREEN `androidCli.ts` `emulatorStart`: parse `started as '(emulator-\d+)'` → serial (fallback: pre/post device-list diff); `handlers.ts` polls that serial to `device`
+- [x] 3.3 GREEN `adb.ts` `getprop(serial, prop)`; `handlers.ts` `getDeviceInfo` model/sdk via getprop (+ `wm size/density` best-effort); drop `cli.info` SDK
+- [x] 3.4 GREEN `tempPngPath(kind, serial)` (`crypto.randomUUID`), `try/finally rm(force)`; unique device-side screencap path + `adb shell rm`
+- [x] 3.5 Live verify Pixel_9_Pro: `/v1/state` running:true, non-zero coords, logcat returns; `bun run typecheck` clean; commit `fix(tools): start correlation, getprop info, temp PNG hygiene`

@@ -147,6 +147,24 @@ describe("AndroidCli — command builder + typed results", () => {
     runner.assertSatisfied();
   });
 
+  it("emulatorStart() parses the started serial from the 'started as' marker", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], {
+      stdout: "Virtual device successfully started as 'emulator-5554'.\n",
+    });
+    const cli = new AndroidCli(runner);
+    expect(await cli.emulatorStart("Pixel_9_Pro")).toBe("emulator-5554");
+    runner.assertSatisfied();
+  });
+
+  it("emulatorStart() returns null when the CLI prints no 'started as' marker", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], { exitCode: 0, stdout: "" });
+    const cli = new AndroidCli(runner);
+    expect(await cli.emulatorStart("Pixel_9_Pro")).toBeNull();
+    runner.assertSatisfied();
+  });
+
   it("emulatorStop() issues the stop command for a named AVD", async () => {
     const runner = new MemoryRunner();
     runner.expect(["android", "emulator", "stop", "Pixel_9_Pro"], { exitCode: 0 });

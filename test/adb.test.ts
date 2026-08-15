@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { AdbWrapper } from "../src/device/adb";
+import { AdbWrapper, deviceShotPath } from "../src/device/adb";
 import { InputError } from "../src/device/input";
 import { expectFixture, loadFixture } from "./helpers/fixtures";
 import { MemoryRunner } from "./helpers/memoryRunner";
@@ -165,17 +165,84 @@ describe("AdbWrapper — devices/state, logcat, screencap, uiautomator, input ch
     runner.assertSatisfied();
   });
 
-  it("screencap() shell-captures to a device path then pulls to a local path", async () => {
+  it("screencap() shell-captures to a UNIQUE device path, pulls, then removes the device file", async () => {
+    const devicePath = "/sdcard/om_shot_abc123.png"; // explicit for deterministic argv
     const runner = new MemoryRunner();
     runner.expect(
-      ["adb", "-s", "emulator-5554", "shell", "screencap", "-p", "/sdcard/om_shot.png"],
+      ["adb", "-s", "emulator-5554", "shell", "screencap", "-p", devicePath],
       { exitCode: 0 },
     );
-    runner.expect(["adb", "-s", "emulator-5554", "pull", "/sdcard/om_shot.png", "/tmp/raw.png"], {
+    runner.expect(["adb", "-s", "emulator-5554", "pull", devicePath, "/tmp/raw.png"], {
+      exitCode: 0,
+    });
+    runner.expect(["adb", "-s", "emulator-5554", "shell", "rm", "-f", devicePath], {
       exitCode: 0,
     });
     const adb = new AdbWrapper(runner);
-    await adb.screencap("emulator-5554", "/tmp/raw.png");
+    await adb.screencap("emulator-5554", "/tmp/raw.png", devicePath);
+    runner.assertSatisfied();
+  });
+
+  it("deviceShotPath() returns unique device-side paths (no fixed /sdcard/om_shot.png)", async () => {
+    const a = deviceShotPath();
+    const b = deviceShotPath();
+    expect(a).toMatch(/^\/sdcard\/om_shot_\w{6}\.png$/);
+    expect(b).toMatch(/^\/sdcard\/om_shot_\w{6}\.png$/);
+    expect(a).not.toBe(b);
+  });
+
+  it("screencap() removes the device file even when the pull fails", async () => {
+    const devicePath = "/sdcard/om_shot_fail123.png";
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "-s", "emulator-5554", "shell", "screencap", "-p", devicePath], {
+      exitCode: 0,
+    });
+    runner.expect(["adb", "-s", "emulator-5554", "pull", devicePath, "/tmp/raw.png"], {
+      exitCode: 1,
+      stderr: "pull exploded",
+    });
+    runner.expect(["adb", "-s", "emulator-5554", "shell", "rm", "-f", devicePath], {
+      exitCode: 0,
+    });
+    const adb = new AdbWrapper(runner);
+    await expect(adb.screencap("emulator-5554", "/tmp/raw.png", devicePath)).rejects.toThrow(
+      "pull exploded",
+    );
+    runner.assertSatisfied();
+  });
+
+  it("getprop() runs `adb shell getprop` for a single property and returns its trimmed value", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(
+      ["adb", "-s", "emulator-5554", "shell", "getprop", "ro.build.version.sdk"],
+      { stdout: "36\n" },
+    );
+    const adb = new AdbWrapper(runner);
+    expect(await adb.getprop("emulator-5554", "ro.build.version.sdk")).toBe("36");
+    runner.assertSatisfied();
+  });
+
+  it("wm() returns parsed physical size and density from `wm size`/`wm density` output", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(
+      ["adb", "-s", "emulator-5554", "shell", "wm", "size"],
+      { stdout: "Physical size: 1280x2856\n" },
+    );
+    runner.expect(
+      ["adb", "-s", "emulator-5554", "shell", "wm", "density"],
+      { stdout: "Physical density: 480\n" },
+    );
+    const adb = new AdbWrapper(runner);
+    expect(await adb.wm("emulator-5554")).toEqual({ size: "1280x2856", density: "480" });
+    runner.assertSatisfied();
+  });
+
+  it("wm() returns undefined fields when the device reports no physical values", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "-s", "emulator-5554", "shell", "wm", "size"], { stdout: "" });
+    runner.expect(["adb", "-s", "emulator-5554", "shell", "wm", "density"], { stdout: "" });
+    const adb = new AdbWrapper(runner);
+    expect(await adb.wm("emulator-5554")).toEqual({ size: undefined, density: undefined });
     runner.assertSatisfied();
   });
 

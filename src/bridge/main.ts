@@ -3,6 +3,7 @@ import { AndroidCli } from "../device/androidCli";
 import { AdbWrapper } from "../device/adb";
 import { BunCommandRunner } from "../device/runner";
 import { createBridgeHandler } from "./server";
+import { tempPngPath } from "../device/temp";
 import type { BridgeDeps } from "./server";
 
 /**
@@ -31,6 +32,7 @@ export function createBridgeDeps(env: Record<string, string> = process.env as Re
     cli,
     env,
     readFile: async (path: string) => new Uint8Array(await Bun.file(path).arrayBuffer()),
+    tempPngPath,
   };
 }
 

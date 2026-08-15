@@ -205,11 +205,21 @@ export class AndroidCli {
     return avds;
   }
 
-  async emulatorStart(name: string, timeoutMs?: number): Promise<void> {
-    await this.exec(
+  /**
+   * Start an AVD. The official CLI blocks until boot and prints the serial of
+   * the started emulator (`Virtual device successfully started as 'emulator-NNN'`),
+   * which is the ONLY reliable name→serial correlation under multi-device
+   * conditions (design D5). Returns the started serial, or null when the CLI
+   * prints no marker (caller falls back to a device-list diff).
+   */
+  async emulatorStart(name: string, timeoutMs?: number): Promise<string | null> {
+    const stdout = await this.exec(
       this.cmd("emulator", "start", name),
       timeoutMs ?? SPAWN_TIMEOUTS.emulatorStart,
     );
+    const m = /started as '(emulator-\d+)'/.exec(stdout);
+    if (!m) return null;
+    return m[1] as string;
   }
 
   async emulatorStop(name: string): Promise<void> {
