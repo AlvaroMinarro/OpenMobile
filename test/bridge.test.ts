@@ -175,10 +175,18 @@ describe("GET /v1/screenshot", () => {
   it("GET /v1/screenshot deletes its unique temp PNG after the read", async () => {
     const dir = await mkdtemp(join(tmpdir(), "om-br-test-"));
     const shotPath = join(dir, "shot.png");
+    const validPng = new Uint8Array([
+      137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
+      0, 0, 0, 2, 0, 0, 0, 2, 8, 2, 0, 0, 0, 253, 212, 154, 115,
+      0, 0, 0, 9, 112, 72, 89, 115, 0, 0, 3, 232, 0, 0, 3, 232,
+      1, 181, 123, 82, 107, 0, 0, 0, 18, 73, 68, 65, 84, 8, 153, 99,
+      56, 145, 98, 116, 34, 197, 136, 1, 66, 1, 0, 40, 174, 5, 121,
+      159, 94, 63, 149, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ]);
     const { deps, state } = makeDeps({
       readFile: async (path: string) => {
-        await writeFile(path, new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]));
-        return new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+        await writeFile(path, validPng);
+        return validPng;
       },
       tempPngPath: (_kind: string, _serial: string) => shotPath,
     });

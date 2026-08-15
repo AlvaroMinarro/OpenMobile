@@ -214,19 +214,37 @@ async function handleScreenshot(deps: BridgeDeps, explicit: string | undefined, 
     const format = url.searchParams.get("format");
     let body: Uint8Array = bytes;
     let contentType = "image/png";
-    if (format === "jpeg" || (maxWidth !== undefined && maxWidth < 10000)) {
+    // Original capture dimensions — the surface needs them for correct
+    // click→device-coordinate mapping when the image is downscaled.
+    let originalWidth = bytes.length; // placeholder, replaced by sharp metadata below when re-encoding
+    let originalHeight = bytes.length;
+    if (format === "jpeg" || maxWidth !== undefined) {
       const sharp = (await import("sharp")).default;
-      let pipeline = sharp(bytes).rotate();
+      const img = sharp(bytes).rotate();
+      const meta = await img.metadata();
+      originalWidth = meta.width ?? 0;
+      originalHeight = meta.height ?? 0;
+      let pipeline = img;
       if (maxWidth !== undefined) pipeline = pipeline.resize({ width: maxWidth });
       if (format === "jpeg") {
-        pipeline = (pipeline as unknown as ReturnType<typeof sharp>).jpeg({ quality: quality ?? 80 });
+        pipeline = pipeline.jpeg({ quality });
         contentType = "image/jpeg";
       }
       body = new Uint8Array(await pipeline.toBuffer());
+    } else {
+      // PNG-full path: still parse dims for the size headers (cheap metadata read).
+      const sharp = (await import("sharp")).default;
+      const meta = await sharp(bytes).metadata();
+      originalWidth = meta.width ?? 0;
+      originalHeight = meta.height ?? 0;
     }
     return new Response(body, {
       status: 200,
-      headers: { "content-type": contentType },
+      headers: {
+        "content-type": contentType,
+        "x-device-width": String(originalWidth),
+        "x-device-height": String(originalHeight),
+      },
     });
   } finally {
     // Temp PNG hygiene (D7): delete after the bytes are read — failure too.
