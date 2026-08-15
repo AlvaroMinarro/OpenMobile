@@ -1,4 +1,8 @@
 import { describe, expect, it } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { AndroidCli } from "../src/device/androidCli";
 import { AdbWrapper } from "../src/device/adb";
 import { MemoryRunner } from "./helpers/memoryRunner";
@@ -9,6 +13,9 @@ import {
   emulatorStart,
   getUiTreeDiff,
   resolveScreenLabels,
+  takeScreenshot,
+  getAnnotatedScreen,
+  tempPngPath,
   tap,
   pressKey,
   deployApp,
@@ -25,6 +32,7 @@ function makeCtx(runner: MemoryRunner, timeoutMs = 200): DeviceContext {
     env: {},
     baselineEstablished: new Set<string>(),
     timeoutMs,
+    tempPngPath: () => `/tmp/om-test-${Date.now()}-${Math.random()}.png`,
   };
 }
 
@@ -411,6 +419,93 @@ describe("resolve_screen_labels", () => {
     const res = await resolveScreenLabels(ctx, { screenshot: "/tmp/ann.png", labels: ["#3", "#7"] });
     const parsed = JSON.parse(textOf(res)) as { points: Array<{ label: string }> };
     expect(parsed.points.length).toBe(2);
+    runner.assertSatisfied();
+  });
+});
+
+describe("temp PNG hygiene — unique names and cleanup after read (D7)", () => {
+  const serial = "emulator-5554";
+
+  it("tempPngPath() returns unique, sanitized, serial-bearing names per call", async () => {
+    const a = tempPngPath("shot", "emulator-5554");
+    const b = tempPngPath("shot", "emulator-5554");
+    expect(a).toMatch(/^\/tmp\/om-shot-emulator-5554-\d+-\w{6}\.png$/);
+    expect(b).toMatch(/^\/tmp\/om-shot-emulator-5554-\d+-\w{6}\.png$/);
+    expect(a).not.toBe(b); // never the same path, even same-process same-ms
+    expect(tempPngPath("annotated", "emulator-5554")).toMatch(
+      /^\/tmp\/om-annotated-emulator-5554-\d+-\w{6}\.png$/,
+    );
+  });
+
+  it("takeScreenshot reads its temp file THEN deletes it (file gone after result)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "om-shot-test-"));
+    const shotPath = join(dir, "shot.png");
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5554\tdevice\n" });
+    runner.expect(["android", "screen", "capture", `--device=${serial}`, "-o", shotPath], {
+      exitCode: 0,
+    });
+    const ctx = makeCtx(runner);
+    ctx.tempPngPath = (_kind: string, _serial: string) => shotPath;
+    ctx.readFile = async (path: string) => {
+      // Simulate the capture having written a real file: created HERE so a
+      // premature deletion (before read) leaves the file behind and FAILS.
+      await writeFile(path, new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]));
+      return new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+    };
+    const res = await takeScreenshot(ctx, {});
+    expect(res.isError).toBeFalsy();
+    expect(res.content.some((c) => c.type === "image")).toBe(true);
+    expect(existsSync(shotPath)).toBe(false); // cleanup ran after the read
+    await rm(dir, { recursive: true, force: true });
+    runner.assertSatisfied();
+  });
+
+  it("cleans up the temp file even when the read throws", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "om-fail-test-"));
+    const shotPath = join(dir, "shot.png");
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5554\tdevice\n" });
+    runner.expect(["android", "screen", "capture", `--device=${serial}`, "-o", shotPath], {
+      exitCode: 0,
+    });
+    const ctx = makeCtx(runner);
+    ctx.tempPngPath = (_kind: string, _serial: string) => shotPath;
+    ctx.readFile = async (path: string) => {
+      await writeFile(path, new Uint8Array([1]));
+      throw new Error("read exploded");
+    };
+    const res = await takeScreenshot(ctx, {});
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("read exploded");
+    expect(existsSync(shotPath)).toBe(false); // cleanup on failure too
+    await rm(dir, { recursive: true, force: true });
+    runner.assertSatisfied();
+  });
+
+  it("getAnnotatedScreen uses the annotated kind with the same hygiene", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "om-ann-test-"));
+    const annPath = join(dir, "ann.png");
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5554\tdevice\n" });
+    runner.expect(
+      ["android", "screen", "capture", `--device=${serial}`, "-o", annPath, "--annotate"],
+      { exitCode: 0 },
+    );
+    const ctx = makeCtx(runner);
+    ctx.tempPngPath = (kind: string, _serial: string) => {
+      expect(kind).toBe("annotated");
+      return annPath;
+    };
+    ctx.readFile = async (path: string) => {
+      await writeFile(path, new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]));
+      return new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+    };
+    const res = await getAnnotatedScreen(ctx, {});
+    expect(res.isError).toBeFalsy();
+    expect(res.content.some((c) => c.type === "image")).toBe(true);
+    expect(existsSync(annPath)).toBe(false);
+    await rm(dir, { recursive: true, force: true });
     runner.assertSatisfied();
   });
 });

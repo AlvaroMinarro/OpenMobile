@@ -2,6 +2,11 @@ import type { DeviceContext, ResolvedTarget } from "./context";
 import { resolveTarget, safe, ToolError } from "./context";
 import { xmlToTree, uiElementToJson } from "../device/serialize";
 import type { Device } from "../device/types";
+import { tempPngPath } from "../device/temp";
+import { rm } from "node:fs/promises";
+
+/** Re-export the unique temp-PNG namer for tests and bridge consumers (D7). */
+export { tempPngPath };
 
 /** A single content block in a tool result (text or image). */
 export type ToolBlock =
@@ -268,20 +273,30 @@ export const takeScreenshot = (ctx: DeviceContext, args: { device?: string }) =>
   safe(async () => {
     const target = await requireTarget(ctx, args.device);
     if (!target.ok) return errText(target.error);
-    const path = `/tmp/om-shot-${target.serial}-${Date.now()}.png`;
-    await ctx.cli.capture({ serial: target.serial, outPath: path });
-    const bytes = await ctx.readFile!(path);
-    return okImage(await toBase64(bytes));
+    const path = ctx.tempPngPath!("shot", target.serial);
+    try {
+      await ctx.cli.capture({ serial: target.serial, outPath: path });
+      const bytes = await ctx.readFile!(path);
+      return okImage(await toBase64(bytes));
+    } finally {
+      // Temp PNG hygiene (D7): always delete the temp file after the bytes are
+      // read — including on failure.
+      await rm(path, { force: true }).catch(() => {});
+    }
   });
 
 export const getAnnotatedScreen = (ctx: DeviceContext, args: { device?: string }) =>
   safe(async () => {
     const target = await requireTarget(ctx, args.device);
     if (!target.ok) return errText(target.error);
-    const path = `/tmp/om-annotated-${target.serial}-${Date.now()}.png`;
-    await ctx.cli.captureAnnotated({ serial: target.serial, outPath: path });
-    const bytes = await ctx.readFile!(path);
-    return okImage(await toBase64(bytes));
+    const path = ctx.tempPngPath!("annotated", target.serial);
+    try {
+      await ctx.cli.captureAnnotated({ serial: target.serial, outPath: path });
+      const bytes = await ctx.readFile!(path);
+      return okImage(await toBase64(bytes));
+    } finally {
+      await rm(path, { force: true }).catch(() => {});
+    }
   });
 
 export const resolveScreenLabels = (

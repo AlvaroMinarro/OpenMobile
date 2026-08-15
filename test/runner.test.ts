@@ -200,11 +200,14 @@ describe("Timeout wiring — wrappers pass their per-op SPAWN_TIMEOUTS entry (D1
     await adb.amStart(serial, "com.x/.Main");
     expect(runner.optsLog[5]?.timeoutMs).toBe(SPAWN_TIMEOUTS.install);
 
-    runner.expect(["adb", "-s", serial, "shell", "screencap", "-p", "/sdcard/om_shot.png"], {});
-    runner.expect(["adb", "-s", serial, "pull", "/sdcard/om_shot.png", "/tmp/raw.png"], {});
-    await adb.screencap(serial, "/tmp/raw.png");
+    const devicePath = "/sdcard/om_shot_abc123.png";
+    runner.expect(["adb", "-s", serial, "shell", "screencap", "-p", devicePath], {});
+    runner.expect(["adb", "-s", serial, "pull", devicePath, "/tmp/raw.png"], {});
+    runner.expect(["adb", "-s", serial, "shell", "rm", "-f", devicePath], {});
+    await adb.screencap(serial, "/tmp/raw.png", devicePath);
     expect(runner.optsLog[6]?.timeoutMs).toBe(SPAWN_TIMEOUTS.capture);
     expect(runner.optsLog[7]?.timeoutMs).toBe(SPAWN_TIMEOUTS.capture);
+    expect(runner.optsLog[8]?.timeoutMs).toBe(SPAWN_TIMEOUTS.capture);
 
     runner.expect(["adb", "-s", serial, "shell", "uiautomator", "dump", "/sdcard/window_dump.xml"], {
       stdout: "",
@@ -213,8 +216,8 @@ describe("Timeout wiring — wrappers pass their per-op SPAWN_TIMEOUTS entry (D1
       stdout: "<hierarchy/>",
     });
     await adb.uiautomatorDump(serial);
-    expect(runner.optsLog[8]?.timeoutMs).toBe(SPAWN_TIMEOUTS.layout);
     expect(runner.optsLog[9]?.timeoutMs).toBe(SPAWN_TIMEOUTS.layout);
+    expect(runner.optsLog[10]?.timeoutMs).toBe(SPAWN_TIMEOUTS.layout);
 
     runner.assertSatisfied();
   });

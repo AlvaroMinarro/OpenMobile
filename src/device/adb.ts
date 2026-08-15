@@ -1,5 +1,6 @@
 import { escapeForAdb } from "./input";
 import { SPAWN_TIMEOUTS, type CommandRunner } from "./runner";
+import { randomUUID } from "node:crypto";
 import type { Device, DeviceState, LogcatResult } from "./types";
 
 export interface LogcatOptions {
@@ -19,6 +20,15 @@ const KEYCODES: Record<string, string> = {
   volume_down: "25",
   power: "26",
 };
+
+/**
+ * Unique device-side screencap path (design D7): `/sdcard/om_shot_<rand6>.png`
+ * — never the fixed `om_shot.png`, so concurrent captures cannot collide.
+ */
+export function deviceShotPath(): string {
+  const rand6 = randomUUID().replace(/-/g, "").slice(0, 6);
+  return `/sdcard/om_shot_${rand6}.png`;
+}
 
 /** Extract a logcat priority token (V/D/I/W/E/F/S) from a `-v time` line. */
 function priorityOf(line: string): string | null {
@@ -164,11 +174,18 @@ export class AdbWrapper {
     };
   }
 
-  /** Shell-capture a PNG to a device path, then pull it to `localPath`. */
-  async screencap(serial: string, localPath: string): Promise<void> {
-    const devicePath = "/sdcard/om_shot.png";
-    await this.shell(serial, SPAWN_TIMEOUTS.capture, "screencap", "-p", devicePath);
-    await this.exec(["adb", "-s", serial, "pull", devicePath, localPath], SPAWN_TIMEOUTS.capture);
+  /**
+   * Shell-capture a PNG to a UNIQUE device path, pull it to `localPath`, then
+   * remove the device-side file in `finally` (temp hygiene on failure too).
+   * An explicit device path is accepted for deterministic tests/embargos.
+   */
+  async screencap(serial: string, localPath: string, devicePath = deviceShotPath()): Promise<void> {
+    try {
+      await this.shell(serial, SPAWN_TIMEOUTS.capture, "screencap", "-p", devicePath);
+      await this.exec(["adb", "-s", serial, "pull", devicePath, localPath], SPAWN_TIMEOUTS.capture);
+    } finally {
+      await this.shell(serial, SPAWN_TIMEOUTS.capture, "rm", "-f", devicePath).catch(() => {});
+    }
   }
 
   /** Dump the window hierarchy XML via uiautomator and return its contents. */
