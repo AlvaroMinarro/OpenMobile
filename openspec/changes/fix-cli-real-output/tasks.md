@@ -32,13 +32,13 @@ Delivery strategy: ask-on-risk
 
 ## Phase 2: Fixtures + Parsers — PR 2 (D2–D4, D5-list)
 
-- [ ] 2.1 Create `scripts/record-fixtures.ts` + `package.json` script; run vs Pixel_9_Pro; commit 6 envelopes + `test/fixtures/README.md` (pin v1.0.15985488, re-record procedure)
-- [ ] 2.2 Create `test/helpers/fixtures.ts`: `loadFixture`/`expectFixture` → `MemoryRunner.expect` by exact argv; provenance assertion test (spec: Recorded Real-Output Fixtures)
-- [ ] 2.3 RED `test/androidCli.test.ts`/`serialize.test.ts` from fixtures: string `center:"[x,y]"`, hyphenated `resource-id`/`content-desc`/`off-screen`, sparse keys, `--diff` shape (ui-tree: Shape Tolerance / Full Tree / Diff); MUST fail pre-fix
-- [ ] 2.4 GREEN: `serialize.ts` export `parseBounds`, relax `detectDiffShape`; `types.ts` `UIElement += resourceId?/contentDesc?/targetable?`; `androidCli.ts` `toUiElement` dual-shape, `targetable:false` fallback — no silent (0,0) tap (No Silent Fallback)
-- [ ] 2.5 RED→GREEN `test/adb.test.ts`: logcat `-d -t N -v time` bounded, priority regex `/\s([VDIWEFS])\//`, headers dropped under filter (logcat-read: Dump-and-Tail, Filtered, Bounded)
-- [ ] 2.6 RED→GREEN `emulatorList`: parse `emulator list --long` (Online/Offline, `AVD += serial?`); delete plain-list parse (spec: Real Running Markers, List AVDs)
-- [ ] 2.7 `bun test` green; commit `fix(device): parse real CLI output shapes with recorded fixtures`
+- [x] 2.1 Create `scripts/record-fixtures.ts` + `package.json` script; run vs Pixel_9_Pro; commit 6 envelopes + `test/fixtures/README.md` (pin v1.0.15985488, re-record procedure)
+- [x] 2.2 Create `test/helpers/fixtures.ts`: `loadFixture`/`expectFixture` → `MemoryRunner.expect` by exact argv; provenance assertion test (spec: Recorded Real-Output Fixtures)
+- [x] 2.3 RED `test/androidCli.test.ts`/`serialize.test.ts` from fixtures: string `center:"[x,y]"`, hyphenated `resource-id`/`content-desc`/`off-screen`, sparse keys, `--diff` shape (ui-tree: Shape Tolerance / Full Tree / Diff); MUST fail pre-fix
+- [x] 2.4 GREEN: `serialize.ts` export `parseBounds`, relax `detectDiffShape`; `types.ts` `UIElement += resourceId?/contentDesc?/targetable?`; `androidCli.ts` `toUiElement` dual-shape, `targetable:false` fallback — no silent (0,0) tap (No Silent Fallback)
+- [x] 2.5 RED→GREEN `test/adb.test.ts`: logcat `-d -t N -v time` bounded, priority regex `/\s([VDIWEFS])\//`, headers dropped under filter (logcat-read: Dump-and-Tail, Filtered, Bounded)
+- [x] 2.6 RED→GREEN `emulatorList`: parse `emulator list --long` (Online/Offline, `AVD += serial?`); delete plain-list parse (spec: Real Running Markers, List AVDs)
+- [x] 2.7 `bun test` green; commit `fix(device): parse real CLI output shapes with recorded fixtures`
 
 ## Phase 3: Handlers + Lifecycle + Hygiene — PR 3 (D5-start, D6, D7)
 
