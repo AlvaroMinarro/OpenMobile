@@ -32,18 +32,18 @@ Delivery strategy: ask-on-risk
 
 ## Phase 2: Fixtures + Parsers — PR 2 (D2–D4, D5-list)
 
-- [ ] 2.1 Create `scripts/record-fixtures.ts` + `package.json` script; run vs Pixel_9_Pro; commit 6 envelopes + `test/fixtures/README.md` (pin v1.0.15985488, re-record procedure)
-- [ ] 2.2 Create `test/helpers/fixtures.ts`: `loadFixture`/`expectFixture` → `MemoryRunner.expect` by exact argv; provenance assertion test (spec: Recorded Real-Output Fixtures)
-- [ ] 2.3 RED `test/androidCli.test.ts`/`serialize.test.ts` from fixtures: string `center:"[x,y]"`, hyphenated `resource-id`/`content-desc`/`off-screen`, sparse keys, `--diff` shape (ui-tree: Shape Tolerance / Full Tree / Diff); MUST fail pre-fix
-- [ ] 2.4 GREEN: `serialize.ts` export `parseBounds`, relax `detectDiffShape`; `types.ts` `UIElement += resourceId?/contentDesc?/targetable?`; `androidCli.ts` `toUiElement` dual-shape, `targetable:false` fallback — no silent (0,0) tap (No Silent Fallback)
-- [ ] 2.5 RED→GREEN `test/adb.test.ts`: logcat `-d -t N -v time` bounded, priority regex `/\s([VDIWEFS])\//`, headers dropped under filter (logcat-read: Dump-and-Tail, Filtered, Bounded)
-- [ ] 2.6 RED→GREEN `emulatorList`: parse `emulator list --long` (Online/Offline, `AVD += serial?`); delete plain-list parse (spec: Real Running Markers, List AVDs)
-- [ ] 2.7 `bun test` green; commit `fix(device): parse real CLI output shapes with recorded fixtures`
+- [x] 2.1 Create `scripts/record-fixtures.ts` + `package.json` script; run vs Pixel_9_Pro; commit 6 envelopes + `test/fixtures/README.md` (pin v1.0.15985488, re-record procedure)
+- [x] 2.2 Create `test/helpers/fixtures.ts`: `loadFixture`/`expectFixture` → `MemoryRunner.expect` by exact argv; provenance assertion test (spec: Recorded Real-Output Fixtures)
+- [x] 2.3 RED `test/androidCli.test.ts`/`serialize.test.ts` from fixtures: string `center:"[x,y]"`, hyphenated `resource-id`/`content-desc`/`off-screen`, sparse keys, `--diff` shape (ui-tree: Shape Tolerance / Full Tree / Diff); MUST fail pre-fix
+- [x] 2.4 GREEN: `serialize.ts` export `parseBounds`, relax `detectDiffShape`; `types.ts` `UIElement += resourceId?/contentDesc?/targetable?`; `androidCli.ts` `toUiElement` dual-shape, `targetable:false` fallback — no silent (0,0) tap (No Silent Fallback)
+- [x] 2.5 RED→GREEN `test/adb.test.ts`: logcat `-d -t N -v time` bounded, priority regex `/\s([VDIWEFS])\//`, headers dropped under filter (logcat-read: Dump-and-Tail, Filtered, Bounded)
+- [x] 2.6 RED→GREEN `emulatorList`: parse `emulator list --long` (Online/Offline, `AVD += serial?`); delete plain-list parse (spec: Real Running Markers, List AVDs)
+- [x] 2.7 `bun test` green; commit `fix(device): parse real CLI output shapes with recorded fixtures`
 
 ## Phase 3: Handlers + Lifecycle + Hygiene — PR 3 (D5-start, D6, D7)
 
-- [ ] 3.1 RED `test/tools.test.ts` (MemoryRunner+fixtures): start polls THAT serial (never first `state=device`); `getDeviceInfo` via getprop; temp PNG unique + deleted (specs: Start Confirms Started Emulator, Device Properties via adb, Unique Temp PNG, Cleanup)
-- [ ] 3.2 GREEN `androidCli.ts` `emulatorStart`: parse `started as '(emulator-\d+)'` → serial (fallback: pre/post device-list diff); `handlers.ts` polls that serial to `device`
-- [ ] 3.3 GREEN `adb.ts` `getprop(serial, prop)`; `handlers.ts` `getDeviceInfo` model/sdk via getprop (+ `wm size/density` best-effort); drop `cli.info` SDK
-- [ ] 3.4 GREEN `tempPngPath(kind, serial)` (`crypto.randomUUID`), `try/finally rm(force)`; unique device-side screencap path + `adb shell rm`
-- [ ] 3.5 Live verify Pixel_9_Pro: `/v1/state` running:true, non-zero coords, logcat returns; `bun run typecheck` clean; commit `fix(tools): start correlation, getprop info, temp PNG hygiene`
+- [x] 3.1 RED `test/tools.test.ts` (MemoryRunner+fixtures): start polls THAT serial (never first `state=device`); `getDeviceInfo` via getprop; temp PNG unique + deleted (specs: Start Confirms Started Emulator, Device Properties via adb, Unique Temp PNG, Cleanup)
+- [x] 3.2 GREEN `androidCli.ts` `emulatorStart`: parse `started as '(emulator-\d+)'` → serial (fallback: pre/post device-list diff); `handlers.ts` polls that serial to `device`
+- [x] 3.3 GREEN `adb.ts` `getprop(serial, prop)`; `handlers.ts` `getDeviceInfo` model/sdk via getprop (+ `wm size/density` best-effort); drop `cli.info` SDK
+- [x] 3.4 GREEN `tempPngPath(kind, serial)` (`crypto.randomUUID`), `try/finally rm(force)`; unique device-side screencap path + `adb shell rm`
+- [x] 3.5 Live verify Pixel_9_Pro: `/v1/state` running:true, non-zero coords, logcat returns; `bun run typecheck` clean; commit `fix(tools): start correlation, getprop info, temp PNG hygiene`

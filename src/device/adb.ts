@@ -1,5 +1,6 @@
 import { escapeForAdb } from "./input";
 import { SPAWN_TIMEOUTS, type CommandRunner } from "./runner";
+import { randomUUID } from "node:crypto";
 import type { Device, DeviceState, LogcatResult } from "./types";
 
 export interface LogcatOptions {
@@ -20,9 +21,21 @@ const KEYCODES: Record<string, string> = {
   power: "26",
 };
 
+/**
+ * Unique device-side screencap path (design D7): `/sdcard/om_shot_<rand6>.png`
+ * — never the fixed `om_shot.png`, so concurrent captures cannot collide.
+ */
+export function deviceShotPath(): string {
+  const rand6 = randomUUID().replace(/-/g, "").slice(0, 6);
+  return `/sdcard/om_shot_${rand6}.png`;
+}
+
 /** Extract a logcat priority token (V/D/I/W/E/F/S) from a `-v time` line. */
 function priorityOf(line: string): string | null {
-  const m = /\s([VDIWEFSW])\s/.exec(line);
+  // Real recorded lines: "MM-DD HH:MM:SS.mmm P/Tag(  pid): msg" — priority is
+  // followed by '/' (e.g. " I/AiAiEcho("), NOT a space as the legacy regex
+  // assumed.
+  const m = /\s([VDIWEFS])\//.exec(line);
   return m ? (m[1] as string) : null;
 }
 
@@ -100,25 +113,34 @@ export class AdbWrapper {
     await this.shell(serial, SPAWN_TIMEOUTS.input, "input", "keyevent", keycode);
   }
 
-  /** Read logcat scoped by pid, filtered by priority, bounded to `tail`. */
+  /** Read logcat scoped by pid, priority-filtered, bounded to `tail`.
+   *
+   * Bounded read: `-d` dumps and exits (never streams), `-t N` bounds the
+   * device-side buffer. When `tail` is set, the in-process bound slices to a
+   * MAXIMUM of `tail` lines (newest-first) and flags `truncated`.
+   */
   async logcat(serial: string, opts: LogcatOptions = {}): Promise<LogcatResult> {
-    const args = ["adb", "-s", serial, "logcat", "-v", "time"];
+    const args = ["adb", "-s", serial, "logcat", "-d"];
+    const tail = opts.tail ?? 0;
+    if (tail > 0) args.push("-t", String(tail));
+    args.push("-v", "time");
+    if (opts.priority !== undefined) args.push(`${opts.priority}:*`);
     if (opts.pid !== undefined) args.push("--pid", String(opts.pid));
     const stdout = await this.exec(args, SPAWN_TIMEOUTS.logcatDump);
 
-    let lines = stdout.split("\n").filter((l) => l.trim() !== "");
-    if (opts.priority) {
-      const target = opts.priority;
-      lines = lines.filter((l) => priorityOf(l) === target);
-    }
+    const all = stdout.split("\n").filter((l) => l.trim() !== "");
+    const lines = opts.priority ? all.filter((l) => priorityOf(l) === opts.priority) : all;
+    // Buffer headers ("--------- beginning of main") carry no priority token,
+    // so the priority filter above already drops them.
 
     let truncated = false;
-    const tail = opts.tail ?? 0;
     if (tail > 0 && lines.length > tail) {
-      lines = lines.slice(lines.length - tail).reverse();
       truncated = true;
     }
-    return { lines, truncated };
+    return {
+      lines: lines.slice(-tail || undefined).reverse(),
+      truncated,
+    };
   }
 
   /** `adb install -r <apk>` — fallback when the android CLI install is unavailable. */
@@ -131,11 +153,39 @@ export class AdbWrapper {
     await this.shell(serial, SPAWN_TIMEOUTS.install, "am", "start", "-n", activity);
   }
 
-  /** Shell-capture a PNG to a device path, then pull it to `localPath`. */
-  async screencap(serial: string, localPath: string): Promise<void> {
-    const devicePath = "/sdcard/om_shot.png";
-    await this.shell(serial, SPAWN_TIMEOUTS.capture, "screencap", "-p", devicePath);
-    await this.exec(["adb", "-s", serial, "pull", devicePath, localPath], SPAWN_TIMEOUTS.capture);
+  /** Read a single device system property via `adb shell getprop` (device truth; D6). */
+  async getprop(serial: string, prop: string): Promise<string> {
+    return (await this.shell(serial, SPAWN_TIMEOUTS.devices, "getprop", prop)).trim();
+  }
+
+  /** Best-effort screen metrics via `wm size` / `wm density`; both may be missing on quirky devices. */
+  async wm(serial: string): Promise<{ size?: string; density?: string }> {
+    const parsePhysical = (out: string): string | undefined => {
+      const m = /Physical (?:size|density):\s*(.+)/.exec(out);
+      return m ? (m[1] as string).trim() : undefined;
+    };
+    const [sizeOut, densityOut] = await Promise.all([
+      this.shell(serial, SPAWN_TIMEOUTS.devices, "wm", "size").catch(() => ""),
+      this.shell(serial, SPAWN_TIMEOUTS.devices, "wm", "density").catch(() => ""),
+    ]);
+    return {
+      size: parsePhysical(sizeOut),
+      density: parsePhysical(densityOut),
+    };
+  }
+
+  /**
+   * Shell-capture a PNG to a UNIQUE device path, pull it to `localPath`, then
+   * remove the device-side file in `finally` (temp hygiene on failure too).
+   * An explicit device path is accepted for deterministic tests/embargos.
+   */
+  async screencap(serial: string, localPath: string, devicePath = deviceShotPath()): Promise<void> {
+    try {
+      await this.shell(serial, SPAWN_TIMEOUTS.capture, "screencap", "-p", devicePath);
+      await this.exec(["adb", "-s", serial, "pull", devicePath, localPath], SPAWN_TIMEOUTS.capture);
+    } finally {
+      await this.shell(serial, SPAWN_TIMEOUTS.capture, "rm", "-f", devicePath).catch(() => {});
+    }
   }
 
   /** Dump the window hierarchy XML via uiautomator and return its contents. */

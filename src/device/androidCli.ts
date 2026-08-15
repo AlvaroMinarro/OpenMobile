@@ -1,4 +1,4 @@
-import { detectDiffShape } from "./serialize";
+import { detectDiffShape, parseBounds } from "./serialize";
 import { SPAWN_TIMEOUTS, type CommandRunner } from "./runner";
 import type { AVD, LayoutDiffResult, Point, UIElement } from "./types";
 
@@ -6,32 +6,89 @@ export interface DeviceTarget {
   serial: string;
 }
 
-/** Normalize a CLI-layout element into the UIElement shape, computing center if absent. */
+/** Parse the recorded string center format `"[x,y]"` (or `"[x, y]"`). */
+function parseCenterString(raw: string): Point | null {
+  const m = /\[(-?\d+)\s*,\s*(-?\d+)\]/.exec(raw);
+  if (!m) return null;
+  return { x: Number(m[1]), y: Number(m[2]) };
+}
+
+/** Parse an object-form center `{x, y}` or `{left, top, right, bottom}`. */
+function objectCenter(raw: Record<string, unknown>): Point | null {
+  if (raw["x"] !== undefined && raw["y"] !== undefined) {
+    const x = Number(raw["x"]);
+    const y = Number(raw["y"]);
+    if (Number.isFinite(x) && Number.isFinite(y)) return { x, y };
+  }
+  if (raw["left"] !== undefined && raw["top"] !== undefined && raw["right"] !== undefined && raw["bottom"] !== undefined) {
+    const left = Number(raw["left"]);
+    const top = Number(raw["top"]);
+    const right = Number(raw["right"]);
+    const bottom = Number(raw["bottom"]);
+    if (Number.isFinite(left) && Number.isFinite(top) && Number.isFinite(right) && Number.isFinite(bottom)) {
+      return {
+        x: Math.round((left + right) / 2),
+        y: Math.round((top + bottom) / 2),
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Normalize a CLI-layout element into the UIElement shape. Tolerant of the
+ * REAL `android layout` output (recorded fixtures): string center/bounds,
+ * hyphenated `resource-id`/`content-desc` keys, sparse JSON. Elements with
+ * data that cannot be parsed become `targetable:false` — NEVER silently
+ * tappable at (0,0).
+ */
 function toUiElement(raw: Record<string, unknown>): UIElement {
-  const boundsRaw = (raw["bounds"] ?? {}) as Partial<{ left: number; top: number; right: number; bottom: number }>;
-  const bounds = {
-    left: Number(boundsRaw["left"] ?? 0),
-    top: Number(boundsRaw["top"] ?? 0),
-    right: Number(boundsRaw["right"] ?? 0),
-    bottom: Number(boundsRaw["bottom"] ?? 0),
-  };
-  const center: Point =
-    typeof raw["center"] === "object" && raw["center"] !== null
-      ? {
-          x: Number((raw["center"] as Point).x),
-          y: Number((raw["center"] as Point).y),
-        }
-      : {
-          x: Math.round((bounds.left + bounds.right) / 2),
-          y: Math.round((bounds.top + bounds.bottom) / 2),
-        };
+  const boundsRaw = raw["bounds"];
+  let bounds: { left: number; top: number; right: number; bottom: number };
+  if (typeof boundsRaw === "string") {
+    // Recorded shape: "[left,top][right,bottom]"
+    bounds = parseBounds(boundsRaw);
+  } else if (typeof boundsRaw === "object" && boundsRaw !== null) {
+    const rec = boundsRaw as Record<string, unknown>;
+    bounds = {
+      left: Number(rec["left"] ?? 0),
+      top: Number(rec["top"] ?? 0),
+      right: Number(rec["right"] ?? 0),
+      bottom: Number(rec["bottom"] ?? 0),
+    };
+  } else {
+    bounds = { left: 0, top: 0, right: 0, bottom: 0 };
+  }
+
+  const centerVal = raw["center"];
+  let center: Point | null =
+    typeof centerVal === "string"
+      ? parseCenterString(centerVal)
+      : typeof centerVal === "object" && centerVal !== null
+        ? objectCenter(centerVal as Record<string, unknown>)
+        : null;
+
+  // Fallback: midpoint of parseable bounds when no center key exists.
+  if (
+    center === null &&
+    (bounds.left !== 0 || bounds.top !== 0 || bounds.right !== 0 || bounds.bottom !== 0)
+  ) {
+    center = {
+      x: Math.round((bounds.left + bounds.right) / 2),
+      y: Math.round((bounds.top + bounds.bottom) / 2),
+    };
+  }
+
   return {
     bounds,
-    center,
+    center: center ?? { x: 0, y: 0 },
     interactions: Array.isArray(raw["interactions"]) ? (raw["interactions"] as string[]) : [],
     state: typeof raw["state"] === "string" ? raw["state"] : "default",
-    offScreen: raw["offScreen"] === true,
+    offScreen: raw["offScreen"] === true || raw["off-screen"] === true || raw["off-screen"] === "true",
     ...(typeof raw["text"] === "string" ? { text: raw["text"] as string } : {}),
+    ...(typeof raw["resource-id"] === "string" ? { resourceId: raw["resource-id"] as string } : {}),
+    ...(typeof raw["content-desc"] === "string" ? { contentDesc: raw["content-desc"] as string } : {}),
+    ...(center !== null ? {} : { targetable: false }),
   };
 }
 
@@ -118,27 +175,51 @@ export class AndroidCli {
     return { x: Number(m[1]), y: Number(m[2]) };
   }
 
-  /** List AVDs; a leading `*` marks a running emulator (format live-verified at apply). */
+  /**
+   * List AVDs from `android emulator list --long`. The recorded real output
+   * (v1.0.15985488) is a column table:
+   *
+   *   AVD ID                AVD Name               API Level      Status    Serial
+   *   Pixel_9_Pro           Pixel 9 Pro            android-36     Online    emulator-5554
+   *
+   * Running detection comes from the Status column (Online|Offline) — the
+   * plain list has NO running marker at all (design D5; old `* ` parse
+   * removed). AVD ID (first token) is the name for start/stop; the serial
+   * column is present only while Online.
+   */
   async emulatorList(): Promise<AVD[]> {
-    const stdout = await this.exec(this.cmd("emulator", "list"), SPAWN_TIMEOUTS.emulatorManage);
+    const stdout = await this.exec(this.cmd("emulator", "list", "--long"), SPAWN_TIMEOUTS.emulatorManage);
     const avds: AVD[] = [];
     for (const line of stdout.split("\n")) {
       const trimmed = line.trim();
-      if (trimmed === "") continue;
-      if (trimmed.startsWith("* ")) {
-        avds.push({ name: trimmed.slice(2), running: true });
-      } else {
-        avds.push({ name: trimmed, running: false });
-      }
+      if (trimmed === "" || trimmed.startsWith("AVD ID")) continue; // header
+      const tokens = trimmed.split(/\s+/);
+      const name = tokens[0];
+      if (name === undefined) continue;
+      const status = tokens.find((t) => t === "Online" || t === "Offline");
+      const serial = tokens.find((t) => /^emulator-\d+$/.test(t));
+      const avd: AVD = { name, running: status === "Online" };
+      if (serial !== undefined) avd.serial = serial;
+      avds.push(avd);
     }
     return avds;
   }
 
-  async emulatorStart(name: string, timeoutMs?: number): Promise<void> {
-    await this.exec(
+  /**
+   * Start an AVD. The official CLI blocks until boot and prints the serial of
+   * the started emulator (`Virtual device successfully started as 'emulator-NNN'`),
+   * which is the ONLY reliable name→serial correlation under multi-device
+   * conditions (design D5). Returns the started serial, or null when the CLI
+   * prints no marker (caller falls back to a device-list diff).
+   */
+  async emulatorStart(name: string, timeoutMs?: number): Promise<string | null> {
+    const stdout = await this.exec(
       this.cmd("emulator", "start", name),
       timeoutMs ?? SPAWN_TIMEOUTS.emulatorStart,
     );
+    const m = /started as '(emulator-\d+)'/.exec(stdout);
+    if (!m) return null;
+    return m[1] as string;
   }
 
   async emulatorStop(name: string): Promise<void> {

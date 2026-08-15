@@ -1,4 +1,8 @@
 import { describe, expect, it } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { createBridgeHandler } from "../src/bridge/server";
 import type { BridgeDeps } from "../src/bridge/server";
 import type { AVD, Device } from "../src/device/types";
@@ -34,6 +38,7 @@ function makeDeps(overrides: Partial<BridgeDeps> = {}) {
     },
     env: {},
     readFile: async () => new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), // PNG magic
+    tempPngPath: (_kind: string, _serial: string) => "/tmp/om-br-mock.png",
     ...overrides,
   };
   return { deps, state };
@@ -154,6 +159,29 @@ describe("GET /v1/screenshot", () => {
       expect(state.captures[0]?.serial).toBe("emulator-5554");
     } finally {
       srv.stop();
+    }
+  });
+
+  it("GET /v1/screenshot deletes its unique temp PNG after the read", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "om-br-test-"));
+    const shotPath = join(dir, "shot.png");
+    const { deps, state } = makeDeps({
+      readFile: async (path: string) => {
+        await writeFile(path, new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]));
+        return new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+      },
+      tempPngPath: (_kind: string, _serial: string) => shotPath,
+    });
+    state.devices = [{ serial: "emulator-5554", state: "device" }];
+    const srv = makeInMemoryServer(deps);
+    try {
+      const res = await req(srv, "/v1/screenshot");
+      expect(res.status).toBe(200);
+      expect(existsSync(shotPath)).toBe(false); // cleaned up after bytes read
+      expect(state.captures[0]?.outPath).toBe(shotPath);
+    } finally {
+      srv.stop();
+      await rm(dir, { recursive: true, force: true });
     }
   });
 

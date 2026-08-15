@@ -1,4 +1,6 @@
 import { escapeForAdb, InputError } from "../device/input";
+import { tempPngPath } from "../device/temp";
+import { rm } from "node:fs/promises";
 import type { AVD, Device } from "../device/types";
 
 /**
@@ -40,6 +42,8 @@ export interface BridgeDeps {
   env: Record<string, string>;
   /** Embargo for reading capture output bytes (defaults in `main.ts`). */
   readFile: (path: string) => Promise<Uint8Array>;
+  /** Unique temp PNG path for a capture kind+serial (defaults to /tmp/om-<kind>-<serial>-<ts>-<rand6>.png). */
+  tempPngPath: (kind: string, serial: string) => string;
 }
 
 export interface BridgeOptions {
@@ -198,13 +202,18 @@ async function handleState(deps: BridgeDeps, explicit?: string): Promise<Respons
 
 async function handleScreenshot(deps: BridgeDeps, explicit?: string): Promise<Response> {
   const serial = await requireUsable(deps, explicit);
-  const path = `/tmp/om-br-${serial}-${Date.now()}.png`;
-  await deps.cli.capture({ serial, outPath: path });
-  const bytes = await deps.readFile(path);
-  return new Response(bytes, {
-    status: 200,
-    headers: { "content-type": "image/png" },
-  });
+  const path = deps.tempPngPath("br", serial);
+  try {
+    await deps.cli.capture({ serial, outPath: path });
+    const bytes = await deps.readFile(path);
+    return new Response(bytes, {
+      status: 200,
+      headers: { "content-type": "image/png" },
+    });
+  } finally {
+    // Temp PNG hygiene (D7): delete after the bytes are read — failure too.
+    await rm(path, { force: true }).catch(() => {});
+  }
 }
 
 async function handleTap(deps: BridgeDeps, explicit: string | undefined, req: Request): Promise<Response> {

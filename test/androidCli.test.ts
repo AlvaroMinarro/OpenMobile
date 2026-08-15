@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { AndroidCli } from "../src/device/androidCli";
+import { expectFixture, loadFixture } from "./helpers/fixtures";
 import { MemoryRunner } from "./helpers/memoryRunner";
 
 const oneElement = [
@@ -42,6 +43,45 @@ describe("AndroidCli — command builder + typed results", () => {
     runner.assertSatisfied();
   });
 
+  it("layout() parses the recorded real CLI shape: string center/bounds, hyphenated keys, sparse JSON", async () => {
+    const runner = new MemoryRunner();
+    expectFixture(runner, loadFixture("android-layout"));
+    const cli = new AndroidCli(runner);
+
+    const tree = await cli.layout({ serial: "emulator-5554" });
+    // Real fixture: non-empty flat array of elements
+    expect(tree.length).toBeGreaterThan(0);
+
+    const workspace = tree.find((e) => e.resourceId === "workspace");
+    expect(workspace).toBeDefined();
+    expect(workspace!.center).toEqual({ x: 640, y: 1428 });
+    expect(workspace!.bounds).toEqual({ left: 0, top: 0, right: 1280, bottom: 2856 });
+
+    const search = tree.find((e) => e.contentDesc === "Google search");
+    expect(search).toBeDefined();
+    expect(search!.interactions).toEqual(["clickable", "focusable", "long-clickable"]);
+    expect(search!.resourceId).toBe("search_container_hotseat");
+
+    // No element may silently collapse to (0,0) when REAL data is present
+    for (const el of tree) {
+      expect(el.center).not.toEqual({ x: 0, y: 0 });
+    }
+    runner.assertSatisfied();
+  });
+
+  it("layoutDiff() parses the recorded real --diff shape (added/modified arrays)", async () => {
+    const runner = new MemoryRunner();
+    expectFixture(runner, loadFixture("android-layout-diff"));
+    const cli = new AndroidCli(runner);
+
+    const res = await cli.layoutDiff({ serial: "emulator-5554" });
+    expect(res.shape).toBe("diff");
+    if (res.shape !== "diff") throw new Error("expected diff shape");
+    expect(res.added).toEqual([]);
+    expect(res.modified).toEqual([]);
+    runner.assertSatisfied();
+  });
+
   it("capture() writes PNG via `screen capture -o <path>`", async () => {
     const runner = new MemoryRunner();
     runner.expect(
@@ -76,18 +116,26 @@ describe("AndroidCli — command builder + typed results", () => {
     runner.assertSatisfied();
   });
 
-  it("emulatorList() parses AVD names and running status", async () => {
+  it("emulatorList() parses the recorded `--long` table: Online/Offline + serial", async () => {
     const runner = new MemoryRunner();
-    runner.expect(["android", "emulator", "list"], {
-      stdout: "* Pixel_9_Pro\nMedium_Phone_API_36.1\n",
-      exitCode: 0,
-    });
+    expectFixture(runner, loadFixture("android-emulator-list-long"));
     const cli = new AndroidCli(runner);
     const avds = await cli.emulatorList();
     expect(avds).toEqual([
-      { name: "Pixel_9_Pro", running: true },
       { name: "Medium_Phone_API_36.1", running: false },
+      { name: "Pixel_9_Pro", running: true, serial: "emulator-5554" },
+      { name: "Pixel_9_Pro_Fold", running: false },
     ]);
+    runner.assertSatisfied();
+  });
+
+  it("emulatorList() reads the AVD ID column as the name (spaces only in the display name)", async () => {
+    const runner = new MemoryRunner();
+    expectFixture(runner, loadFixture("android-emulator-list-long"));
+    const cli = new AndroidCli(runner);
+    const avds = await cli.emulatorList();
+    // "Pixel 9 Pro" display name contains spaces but the ID token is "Pixel_9_Pro"
+    expect(avds.find((a) => a.running)?.name).toBe("Pixel_9_Pro");
     runner.assertSatisfied();
   });
 
@@ -96,6 +144,24 @@ describe("AndroidCli — command builder + typed results", () => {
     runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], { exitCode: 0 });
     const cli = new AndroidCli(runner);
     await cli.emulatorStart("Pixel_9_Pro");
+    runner.assertSatisfied();
+  });
+
+  it("emulatorStart() parses the started serial from the 'started as' marker", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], {
+      stdout: "Virtual device successfully started as 'emulator-5554'.\n",
+    });
+    const cli = new AndroidCli(runner);
+    expect(await cli.emulatorStart("Pixel_9_Pro")).toBe("emulator-5554");
+    runner.assertSatisfied();
+  });
+
+  it("emulatorStart() returns null when the CLI prints no 'started as' marker", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], { exitCode: 0, stdout: "" });
+    const cli = new AndroidCli(runner);
+    expect(await cli.emulatorStart("Pixel_9_Pro")).toBeNull();
     runner.assertSatisfied();
   });
 
@@ -120,6 +186,27 @@ describe("AndroidCli — command builder + typed results", () => {
     runner.expect(["android", "info", "ro.build.version.sdk"], { stdout: "36", exitCode: 0 });
     const cli = new AndroidCli(runner);
     expect(await cli.info("ro.build.version.sdk")).toBe("36");
+    runner.assertSatisfied();
+  });
+
+  it("maps hyphenated off-screen key to offScreen (dual-shape like center/resource-id)", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["android", "layout", "--device=emulator-5554"], {
+      stdout: JSON.stringify([
+        {
+          center: "[640,1384]",
+          "off-screen": "true",
+          interactions: ["focusable"],
+          text: "Below the fold",
+        },
+      ]),
+      exitCode: 0,
+    });
+    const cli = new AndroidCli(runner);
+    const tree = await cli.layout({ serial: "emulator-5554" });
+    expect(tree).toHaveLength(1);
+    expect(tree[0]!.offScreen).toBe(true);
+    expect(tree[0]!.center).toEqual({ x: 640, y: 1384 });
     runner.assertSatisfied();
   });
 });

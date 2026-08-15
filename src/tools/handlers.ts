@@ -1,6 +1,12 @@
 import type { DeviceContext, ResolvedTarget } from "./context";
 import { resolveTarget, safe, ToolError } from "./context";
 import { xmlToTree, uiElementToJson } from "../device/serialize";
+import type { Device } from "../device/types";
+import { tempPngPath } from "../device/temp";
+import { rm } from "node:fs/promises";
+
+/** Re-export the unique temp-PNG namer for tests and bridge consumers (D7). */
+export { tempPngPath };
 
 /** A single content block in a tool result (text or image). */
 export type ToolBlock =
@@ -28,6 +34,21 @@ const okImage = (data: string, mimeType = "image/png"): ToolResult => ({
 });
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Correlate the emulator we just started when the CLI prints no `started as`
+ * marker: the post-start device list must contain exactly one NEW `emulator-*`
+ * serial that was not present before the start (design D5 fallback). Returns
+ * null when no serial can be attributed — the caller refuses success rather
+ * than guessing the first state=device device.
+ */
+function diffNewEmulatorSerial(before: Device[], after: Device[]): string | null {
+  const beforeEmulators = new Set(before.filter((d) => /^emulator-\d+$/.test(d.serial)).map((d) => d.serial));
+  const candidates = after.filter(
+    (d) => /^emulator-\d+$/.test(d.serial) && !beforeEmulators.has(d.serial),
+  );
+  return candidates.length === 1 ? (candidates[0]!.serial as string) : null;
+}
 
 async function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -79,17 +100,18 @@ export const getDeviceInfo = (ctx: DeviceContext, args: { device?: string }) =>
   safe(async () => {
     const target = await requireTarget(ctx, args.device);
     if (!target.ok) return errText(target.error);
-    let sdk: string | undefined;
-    try {
-      sdk = await ctx.cli.info("ro.build.version.sdk");
-    } catch {
-      sdk = undefined; // CLI unavailable; fall back to the device metadata we have
-    }
+    // Device truth via adb getprop (design D6); `android info` reports
+    // environment fields, not device state.
+    const model = await ctx.adb.getprop(target.serial, "ro.product.model");
+    const sdk = await ctx.adb.getprop(target.serial, "ro.build.version.sdk");
+    const screen = await ctx.adb.wm(target.serial);
     return {
       serial: target.device.serial,
       state: target.device.state,
-      model: target.device.model,
-      sdk,
+      ...(model !== "" ? { model } : target.device.model ? { model: target.device.model } : {}),
+      ...(sdk !== "" ? { sdk } : {}),
+      ...(screen.size !== undefined ? { screenSize: screen.size } : {}),
+      ...(screen.density !== undefined ? { density: screen.density } : {}),
     };
   });
 
@@ -113,20 +135,36 @@ export const emulatorStart = (ctx: DeviceContext, args: { name?: string; timeout
       }
       name = available[0]!.name;
     }
-    // CLI-delegated readiness (design D3): start blocks until boot, wrapped in
-    // an outer timeout, then gate success on adb state 'device'.
-    await withTimeout(ctx.cli.emulatorStart(name), timeout, `emulator start for ${name} timed out`);
+    // CLI-delegated readiness: the start command blocks until boot, wrapped in
+    // an outer timeout, and prints the serial of the STARTED emulator. We poll
+    // THAT serial to state 'device' — never the first state=device device
+    // (design D5: an already-attached device must not be mistaken for the one
+    // we started). When the CLI prints no marker we diff the pre/post device
+    // lists for a NEW emulator-* serial.
+    const preStart = await ctx.adb.devices();
+    const started = await withTimeout(
+      ctx.cli.emulatorStart(name),
+      timeout,
+      `emulator start for ${name} timed out`,
+    );
+    const serial = started ?? diffNewEmulatorSerial(preStart, await ctx.adb.devices());
+    if (!serial) {
+      throw new ToolError(
+        `emulator ${name} started, but its serial could not be determined (no 'started as' marker and no new emulator-* device appeared)`,
+      );
+    }
     const deadline = Date.now() + timeout;
     let last = "no-device";
     while (Date.now() < deadline) {
       const devices = await ctx.adb.devices();
-      const ready = devices.find((d) => d.state === "device");
-      if (ready) return { started: name, serial: ready.serial };
-      last = devices[0] ? devices[0].state : "no-device";
+      const ready = devices.find((d) => d.serial === serial && d.state === "device");
+      if (ready) return { started: name, serial };
+      const observed = devices.find((d) => d.serial === serial);
+      last = observed ? observed.state : "no-device";
       await sleep(200);
     }
     throw new ToolError(
-      `emulator ${name} did not reach 'device' state within ${timeout}ms (last observed state: ${last})`,
+      `emulator ${name} did not reach 'device' state within ${timeout}ms (serial ${serial}, last observed state: ${last})`,
     );
   });
 
@@ -235,20 +273,30 @@ export const takeScreenshot = (ctx: DeviceContext, args: { device?: string }) =>
   safe(async () => {
     const target = await requireTarget(ctx, args.device);
     if (!target.ok) return errText(target.error);
-    const path = `/tmp/om-shot-${target.serial}-${Date.now()}.png`;
-    await ctx.cli.capture({ serial: target.serial, outPath: path });
-    const bytes = await ctx.readFile!(path);
-    return okImage(await toBase64(bytes));
+    const path = ctx.tempPngPath!("shot", target.serial);
+    try {
+      await ctx.cli.capture({ serial: target.serial, outPath: path });
+      const bytes = await ctx.readFile!(path);
+      return okImage(await toBase64(bytes));
+    } finally {
+      // Temp PNG hygiene (D7): always delete the temp file after the bytes are
+      // read — including on failure.
+      await rm(path, { force: true }).catch(() => {});
+    }
   });
 
 export const getAnnotatedScreen = (ctx: DeviceContext, args: { device?: string }) =>
   safe(async () => {
     const target = await requireTarget(ctx, args.device);
     if (!target.ok) return errText(target.error);
-    const path = `/tmp/om-annotated-${target.serial}-${Date.now()}.png`;
-    await ctx.cli.captureAnnotated({ serial: target.serial, outPath: path });
-    const bytes = await ctx.readFile!(path);
-    return okImage(await toBase64(bytes));
+    const path = ctx.tempPngPath!("annotated", target.serial);
+    try {
+      await ctx.cli.captureAnnotated({ serial: target.serial, outPath: path });
+      const bytes = await ctx.readFile!(path);
+      return okImage(await toBase64(bytes));
+    } finally {
+      await rm(path, { force: true }).catch(() => {});
+    }
   });
 
 export const resolveScreenLabels = (

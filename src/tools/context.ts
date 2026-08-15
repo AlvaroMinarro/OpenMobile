@@ -1,6 +1,7 @@
 import { AndroidCli } from "../device/androidCli";
 import { AdbWrapper } from "../device/adb";
 import { BunCommandRunner } from "../device/runner";
+import { tempPngPath } from "../device/temp";
 import { resolveDeviceSelection } from "../device/selection";
 import type { Device } from "../device/types";
 import type { ToolResult } from "./handlers";
@@ -20,6 +21,8 @@ export interface DeviceContext {
   baselineEstablished: Set<string>;
   /** Embargo for reading screenshot PNG files (defaults to Bun.file). */
   readFile?: (path: string) => Promise<Uint8Array>;
+  /** Unique temp PNG path for a capture kind+serial (defaults to /tmp/om-<kind>-<serial>-<ts>-<rand6>.png). */
+  tempPngPath?: (kind: string, serial: string) => string;
   /** Outer timeout (ms) for CLI-delegated emulator readiness / deploy. */
   timeoutMs: number;
 }
@@ -110,5 +113,6 @@ export function createContext(opts: Partial<Omit<DeviceContext, "cli" | "adb">> 
     baselineEstablished: new Set<string>(),
     timeoutMs: opts.timeoutMs ?? 120_000,
     readFile: opts.readFile ?? (async (p: string) => new Uint8Array(await Bun.file(p).arrayBuffer())),
+    tempPngPath: opts.tempPngPath ?? tempPngPath,
   };
 }
