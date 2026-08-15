@@ -175,18 +175,32 @@ export class AndroidCli {
     return { x: Number(m[1]), y: Number(m[2]) };
   }
 
-  /** List AVDs; a leading `*` marks a running emulator (format live-verified at apply). */
+  /**
+   * List AVDs from `android emulator list --long`. The recorded real output
+   * (v1.0.15985488) is a column table:
+   *
+   *   AVD ID                AVD Name               API Level      Status    Serial
+   *   Pixel_9_Pro           Pixel 9 Pro            android-36     Online    emulator-5554
+   *
+   * Running detection comes from the Status column (Online|Offline) — the
+   * plain list has NO running marker at all (design D5; old `* ` parse
+   * removed). AVD ID (first token) is the name for start/stop; the serial
+   * column is present only while Online.
+   */
   async emulatorList(): Promise<AVD[]> {
-    const stdout = await this.exec(this.cmd("emulator", "list"), SPAWN_TIMEOUTS.emulatorManage);
+    const stdout = await this.exec(this.cmd("emulator", "list", "--long"), SPAWN_TIMEOUTS.emulatorManage);
     const avds: AVD[] = [];
     for (const line of stdout.split("\n")) {
       const trimmed = line.trim();
-      if (trimmed === "") continue;
-      if (trimmed.startsWith("* ")) {
-        avds.push({ name: trimmed.slice(2), running: true });
-      } else {
-        avds.push({ name: trimmed, running: false });
-      }
+      if (trimmed === "" || trimmed.startsWith("AVD ID")) continue; // header
+      const tokens = trimmed.split(/\s+/);
+      const name = tokens[0];
+      if (name === undefined) continue;
+      const status = tokens.find((t) => t === "Online" || t === "Offline");
+      const serial = tokens.find((t) => /^emulator-\d+$/.test(t));
+      const avd: AVD = { name, running: status === "Online" };
+      if (serial !== undefined) avd.serial = serial;
+      avds.push(avd);
     }
     return avds;
   }

@@ -116,18 +116,26 @@ describe("AndroidCli — command builder + typed results", () => {
     runner.assertSatisfied();
   });
 
-  it("emulatorList() parses AVD names and running status", async () => {
+  it("emulatorList() parses the recorded `--long` table: Online/Offline + serial", async () => {
     const runner = new MemoryRunner();
-    runner.expect(["android", "emulator", "list"], {
-      stdout: "* Pixel_9_Pro\nMedium_Phone_API_36.1\n",
-      exitCode: 0,
-    });
+    expectFixture(runner, loadFixture("android-emulator-list-long"));
     const cli = new AndroidCli(runner);
     const avds = await cli.emulatorList();
     expect(avds).toEqual([
-      { name: "Pixel_9_Pro", running: true },
       { name: "Medium_Phone_API_36.1", running: false },
+      { name: "Pixel_9_Pro", running: true, serial: "emulator-5554" },
+      { name: "Pixel_9_Pro_Fold", running: false },
     ]);
+    runner.assertSatisfied();
+  });
+
+  it("emulatorList() reads the AVD ID column as the name (spaces only in the display name)", async () => {
+    const runner = new MemoryRunner();
+    expectFixture(runner, loadFixture("android-emulator-list-long"));
+    const cli = new AndroidCli(runner);
+    const avds = await cli.emulatorList();
+    // "Pixel 9 Pro" display name contains spaces but the ID token is "Pixel_9_Pro"
+    expect(avds.find((a) => a.running)?.name).toBe("Pixel_9_Pro");
     runner.assertSatisfied();
   });
 
