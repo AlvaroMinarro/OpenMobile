@@ -1,0 +1,23 @@
+{
+  "argv": [
+    "adb",
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-t",
+    "20",
+    "-v",
+    "time",
+    "*:D"
+  ],
+  "stdout": "--------- beginning of main\n08-15 15:39:48.826 I/AiAiEcho( 1436): Predicting[0]:  [CONTEXT sampling_count=5 ]\n08-15 15:39:48.826 I/AiAiEcho( 1436): EchoTargets: \n08-15 15:39:48.826 I/AiAiEcho( 1436): Filtered by AiAi flag check: \n08-15 15:39:48.826 I/AiAiEcho( 1436): [CONTEXT ratelimit_period=\"10 SECONDS\" ]\n08-15 15:39:48.827 I/AiAiEcho( 1436): #remoteViewsTwiddler: feature disabled.\n08-15 15:39:48.827 W/IPCThreadState(  658): Sending oneway calls to frozen process.\n08-15 15:39:48.827 W/IPCThreadState(  658): Sending oneway calls to frozen process.\n08-15 15:39:48.827 W/IPCThreadState(  658): Sending oneway calls to frozen process.\n08-15 15:39:48.827 W/IPCThreadState(  658): Sending oneway calls to frozen process.\n08-15 15:39:48.827 W/IPCThreadState(  658): Sending oneway calls to frozen process.\n08-15 15:39:48.827 W/IPCThreadState(  658): Sending oneway calls to frozen process.\n08-15 15:39:48.827 W/IPCThreadState(  658): Sending oneway calls to frozen process.\n--------- beginning of system\n08-15 15:39:48.827 D/BatterySaverPolicy(  658): accessibility changed to false, updating policy.\n08-15 15:39:48.828 I/AiAiEcho( 1436): #postPredictionTargets: Sending updates to UISurface lockscreen with targets# 0 (types=[])\n08-15 15:39:48.829 W/PageIndicator(  896): Total number of pages invalid: 0. Assuming 1 page.\n08-15 15:39:48.829 I/AiAiEcho( 1436): #postPredictionTargets: Sending updates to UISurface home with targets# 0 (types=[])\n08-15 15:39:48.830 D/SsBaseTemplateCard( 1028): No text view can be set up\n08-15 15:39:48.830 D/SsBaseTemplateCard( 1028): Passed-in item info is null\n08-15 15:39:48.830 D/SsBaseTemplateCard( 1028): Passed-in item info is null\n08-15 15:39:48.830 D/SsBaseTemplateCard( 1028): Passed-in item info is null\n08-15 15:39:48.831 I/SsBaseTemplateCard( 1028): Secondary card pane is null\n08-15 15:39:50.081 I/wpa_supplicant(  881): wlan0: CTRL-EVENT-BEACON-LOSS \n",
+  "stderr": "",
+  "exitCode": 0,
+  "provenance": {
+    "tool": "adb",
+    "version": "1.0.15985488",
+    "capturedAt": "2026-08-15T13:39:54.193Z",
+    "context": "logcat-dump"
+  }
+}

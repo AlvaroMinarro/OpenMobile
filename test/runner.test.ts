@@ -131,7 +131,7 @@ describe("Timeout wiring — wrappers pass their per-op SPAWN_TIMEOUTS entry (D1
     await cli.resolveScreenLabel({ screenshot: "/tmp/a.png", label: "OK" });
     expect(runner.optsLog[4]?.timeoutMs).toBe(SPAWN_TIMEOUTS.capture);
 
-    runner.expect(["android", "emulator", "list"], { stdout: "Pixel_9_Pro\n" });
+    runner.expect(["android", "emulator", "list", "--long"], { stdout: "Pixel_9_Pro\n" });
     await cli.emulatorList();
     expect(runner.optsLog[5]?.timeoutMs).toBe(SPAWN_TIMEOUTS.emulatorManage);
 
@@ -188,7 +188,7 @@ describe("Timeout wiring — wrappers pass their per-op SPAWN_TIMEOUTS entry (D1
     await adb.inputKeyevent(serial, "back");
     expect(runner.optsLog[2]?.timeoutMs).toBe(SPAWN_TIMEOUTS.input);
 
-    runner.expect(["adb", "-s", serial, "logcat", "-v", "time"], { stdout: "" });
+    runner.expect(["adb", "-s", serial, "logcat", "-d", "-v", "time"], { stdout: "" });
     await adb.logcat(serial);
     expect(runner.optsLog[3]?.timeoutMs).toBe(SPAWN_TIMEOUTS.logcatDump);
 

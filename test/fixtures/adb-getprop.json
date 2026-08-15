@@ -1,0 +1,19 @@
+{
+  "argv": [
+    "adb",
+    "-s",
+    "emulator-5554",
+    "shell",
+    "getprop",
+    "ro.build.version.sdk"
+  ],
+  "stdout": "36\n",
+  "stderr": "",
+  "exitCode": 0,
+  "provenance": {
+    "tool": "adb",
+    "version": "1.0.15985488",
+    "capturedAt": "2026-08-15T13:39:54.215Z",
+    "context": "getprop"
+  }
+}

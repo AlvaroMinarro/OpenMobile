@@ -47,13 +47,15 @@ describe("list_devices", () => {
     runner.expect(["adb", "devices", "-l"], {
       stdout: "List of devices attached\nemulator-5554\tdevice model:Pixel_9_Pro\n",
     });
-    runner.expect(["android", "emulator", "list"], { stdout: "* Pixel_9_Pro\n" });
+    runner.expect(["android", "emulator", "list", "--long"], {
+      stdout: "AVD ID            AVD Name       API Level    Status   Serial\nPixel_9_Pro       Pixel 9 Pro    android-36   Online   emulator-5554\n",
+    });
     runner.expect(["android", "info", "version"], { stdout: "android 1.0.15985488\n" });
     const ctx = makeCtx(runner);
     const res = await listDevices(ctx, {});
     const parsed = JSON.parse(textOf(res)) as {
       devices: Array<{ serial: string; state: string; model?: string }>;
-      avds: Array<{ name: string; running: boolean }>;
+      avds: Array<{ name: string; running: boolean; serial?: string }>;
       cliVersion: string;
     };
     expect(parsed.devices[0]).toEqual({
@@ -61,7 +63,7 @@ describe("list_devices", () => {
       state: "device",
       model: "Pixel_9_Pro",
     });
-    expect(parsed.avds[0]).toEqual({ name: "Pixel_9_Pro", running: true });
+    expect(parsed.avds[0]).toEqual({ name: "Pixel_9_Pro", running: true, serial: "emulator-5554" });
     expect(parsed.cliVersion).toContain("1.0");
     runner.assertSatisfied();
   });
@@ -69,7 +71,7 @@ describe("list_devices", () => {
   it("returns an empty device list (not an error) when nothing is attached", async () => {
     const runner = new MemoryRunner();
     runner.expect(["adb", "devices", "-l"], { stdout: "List of devices attached\n" });
-    runner.expect(["android", "emulator", "list"], { stdout: "" });
+    runner.expect(["android", "emulator", "list", "--long"], { stdout: "" });
     runner.expect(["android", "info", "version"], { stdout: "" });
     const ctx = makeCtx(runner);
     const res = await listDevices(ctx, {});
@@ -83,14 +85,14 @@ describe("list_devices", () => {
 describe("emulator_list", () => {
   it("returns every AVD with running status", async () => {
     const runner = new MemoryRunner();
-    runner.expect(["android", "emulator", "list"], {
-      stdout: "* Pixel_9_Pro\nMedium_Phone_API_36.1\n",
+    runner.expect(["android", "emulator", "list", "--long"], {
+      stdout: "AVD ID            AVD Name       API Level    Status   Serial\nPixel_9_Pro       Pixel 9 Pro    android-36   Online   emulator-5554\nMedium_Phone_API_36.1  Medium Phone API 36.1  android-36.1  Offline\n",
     });
     const ctx = makeCtx(runner);
     const res = await emulatorList(ctx, {});
     const parsed = JSON.parse(textOf(res)) as { avds: unknown[] };
     expect(parsed.avds).toEqual([
-      { name: "Pixel_9_Pro", running: true },
+      { name: "Pixel_9_Pro", running: true, serial: "emulator-5554" },
       { name: "Medium_Phone_API_36.1", running: false },
     ]);
     runner.assertSatisfied();
@@ -100,7 +102,9 @@ describe("emulator_list", () => {
 describe("emulator_start — CLI-delegated readiness gated on adb state 'device'", () => {
   it("starts the AVD and reports success once adb reports state 'device'", async () => {
     const runner = new MemoryRunner();
-    runner.expect(["android", "emulator", "list"], { stdout: "Pixel_9_Pro\n" });
+    runner.expect(["android", "emulator", "list", "--long"], {
+      stdout: "AVD ID            AVD Name       API Level    Status   Serial\nPixel_9_Pro       Pixel 9 Pro    android-36   Offline\n",
+    });
     runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], { exitCode: 0 });
     runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5554\tdevice\n" });
     const ctx = makeCtx(runner, 100);
@@ -113,7 +117,9 @@ describe("emulator_start — CLI-delegated readiness gated on adb state 'device'
 
   it("returns an actionable error when the device never reaches 'device' within the timeout", async () => {
     const runner = new MemoryRunner();
-    runner.expect(["android", "emulator", "list"], { stdout: "Pixel_9_Pro\n" });
+    runner.expect(["android", "emulator", "list", "--long"], {
+      stdout: "AVD ID            AVD Name       API Level    Status   Serial\nPixel_9_Pro       Pixel 9 Pro    android-36   Offline\n",
+    });
     runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], { exitCode: 0 });
     // adb keeps reporting offline so readiness never flips within the tiny timeout
     runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5554\toffline\n" });

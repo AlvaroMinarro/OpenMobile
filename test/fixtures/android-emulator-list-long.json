@@ -1,0 +1,17 @@
+{
+  "argv": [
+    "android",
+    "emulator",
+    "list",
+    "--long"
+  ],
+  "stdout": "AVD ID                   AVD Name                      API Level      Status         Serial\nMedium_Phone_API_36.1    Medium Phone API 36.1         android-36.1   Offline\nPixel_9_Pro              Pixel 9 Pro                   android-36     Online         emulator-5554\nPixel_9_Pro_Fold         Pixel 9 Pro Fold              android-36     Offline\n\n",
+  "stderr": "",
+  "exitCode": 0,
+  "provenance": {
+    "tool": "android-cli",
+    "version": "1.0.15985488",
+    "capturedAt": "2026-08-15T13:39:54.121Z",
+    "context": "emulator-list-long"
+  }
+}

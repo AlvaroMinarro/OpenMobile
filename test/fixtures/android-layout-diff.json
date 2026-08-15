@@ -1,0 +1,17 @@
+{
+  "argv": [
+    "android",
+    "layout",
+    "--device=emulator-5554",
+    "--diff"
+  ],
+  "stdout": "{\"added\":[],\"modified\":[]}\n",
+  "stderr": "",
+  "exitCode": 0,
+  "provenance": {
+    "tool": "android-cli",
+    "version": "1.0.15985488",
+    "capturedAt": "2026-08-15T13:39:53.144Z",
+    "context": "layout-diff"
+  }
+}

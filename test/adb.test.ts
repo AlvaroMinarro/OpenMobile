@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { AdbWrapper } from "../src/device/adb";
 import { InputError } from "../src/device/input";
+import { expectFixture, loadFixture } from "./helpers/fixtures";
 import { MemoryRunner } from "./helpers/memoryRunner";
 
 describe("AdbWrapper — devices/state, logcat, screencap, uiautomator, input channel", () => {
@@ -71,34 +72,96 @@ describe("AdbWrapper — devices/state, logcat, screencap, uiautomator, input ch
 
   it("logcat() scopes to a pid, defaults to errors-only, and bounds + notes truncation", async () => {
     const runner = new MemoryRunner();
-    runner.expect(["adb", "-s", "emulator-5554", "logcat", "-v", "time", "--pid", "1234"], {
+    runner.expect(["adb", "-s", "emulator-5554", "logcat", "-d", "-t", "100", "-v", "time", "E:*", "--pid", "1234"], {
       stdout: [
-        "08-12 17:00:00.000  1234  1234 I Tag: info line",
-        "08-12 17:00:01.000  1234  1234 E Tag: error line",
-        "08-12 17:00:02.000  1234  1234 W Tag: warn line",
-        "08-12 17:00:03.000  1234  1234 E Tag: second error",
+        "08-12 17:00:00.000  1234  1234 I/Tag( 1234): info line",
+        "08-12 17:00:01.000  1234  1234 E/Tag( 1234): error line",
+        "08-12 17:00:02.000  1234  1234 W/Tag( 1234): warn line",
+        "08-12 17:00:03.000  1234  1234 E/Tag( 1234): second error",
       ].join("\n"),
       exitCode: 0,
     });
     const adb = new AdbWrapper(runner);
     const res = await adb.logcat("emulator-5554", { pid: 1234, priority: "E", tail: 100 });
-    expect(res.lines.some((l) => l.includes("E Tag: error line"))).toBe(true);
-    expect(res.lines.some((l) => l.includes("I Tag: info line"))).toBe(false);
-    expect(res.lines.some((l) => l.includes("W Tag: warn line"))).toBe(false);
+    expect(res.lines.some((l) => l.includes("E/Tag( 1234): error line"))).toBe(true);
+    expect(res.lines.some((l) => l.includes("I/Tag( 1234): info line"))).toBe(false);
+    expect(res.lines.some((l) => l.includes("W/Tag( 1234): warn line"))).toBe(false);
     expect(res.truncated).toBe(false);
     runner.assertSatisfied();
   });
 
   it("logcat() truncates to the tail bound and flags it", async () => {
     const runner = new MemoryRunner();
-    runner.expect(["adb", "-s", "emulator-5554", "logcat", "-v", "time"], {
-      stdout: ["...  E Tag: one", "...  E Tag: two", "...  E Tag: three"].join("\n"),
+    runner.expect(["adb", "-s", "emulator-5554", "logcat", "-d", "-t", "2", "-v", "time", "E:*"], {
+      // Real line shape (P/Tag( pid):) so the in-process priority regex matches
+      stdout: [
+        "08-12 17:00:01.000  1234  1234 E/Tag( 1234): one",
+        "08-12 17:00:02.000  1234  1234 E/Tag( 1234): two",
+        "08-12 17:00:03.000  1234  1234 E/Tag( 1234): three",
+      ].join("\n"),
       exitCode: 0,
     });
     const adb = new AdbWrapper(runner);
     const res = await adb.logcat("emulator-5554", { priority: "E", tail: 2 });
-    expect(res.lines).toEqual(["...  E Tag: three", "...  E Tag: two"]);
+    expect(res.lines).toEqual([
+      "08-12 17:00:03.000  1234  1234 E/Tag( 1234): three",
+      "08-12 17:00:02.000  1234  1234 E/Tag( 1234): two",
+    ]);
     expect(res.truncated).toBe(true);
+    runner.assertSatisfied();
+  });
+
+  it("logcat() dumps a bounded tail (`-d -t N`) of the recorded real output", async () => {
+    const runner = new MemoryRunner();
+    // Play the RECORDED stdout (real line shapes) through the wrapper's argv
+    // (default tail 100, native priority filter). The envelope's own argv was
+    // recorded with `-t 20 *:D`; what matters is that the real line shape
+    // flows through the bounded read.
+    runner.expect(["adb", "-s", "emulator-5554", "logcat", "-d", "-t", "100", "-v", "time"], {
+      stdout: loadFixture("adb-logcat-d-t").stdout,
+      exitCode: 0,
+    });
+    const adb = new AdbWrapper(runner);
+    const res = await adb.logcat("emulator-5554", { tail: 100 });
+
+    // The recorded dump fits the requested bound: a bounded read succeeded
+    // (no truncation flag) and returned real lines newest-first.
+    expect(res.lines.length).toBeGreaterThan(0);
+    expect(res.truncated).toBe(false);
+    // Real line shape: "MM-DD HH:MM:SS.mmm P/Tag(  pid): msg"
+    expect(res.lines[0]).toMatch(/^\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} [VDIWEFS]\//);
+    runner.assertSatisfied();
+  });
+
+  it("logcat() filters by priority on the real line shape (P/Tag, no trailing space)", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "-s", "emulator-5554", "logcat", "-d", "-t", "100", "-v", "time", "W:*"], {
+      stdout: loadFixture("adb-logcat-d-t").stdout,
+      exitCode: 0,
+    });
+    const adb = new AdbWrapper(runner);
+    const res = await adb.logcat("emulator-5554", { priority: "W", tail: 100 });
+
+    expect(res.lines.length).toBeGreaterThan(0);
+    for (const line of res.lines) {
+      expect(line).toMatch(/\sW\//);
+    }
+    expect(res.lines.some((l) => l.includes("IPCThreadState"))).toBe(true);
+    runner.assertSatisfied();
+  });
+
+  it("logcat() drops buffer headers under a priority filter (no priority token)", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "-s", "emulator-5554", "logcat", "-d", "-t", "100", "-v", "time", "E:*"], {
+      stdout: loadFixture("adb-logcat-d-t").stdout,
+      exitCode: 0,
+    });
+    const adb = new AdbWrapper(runner);
+    const res = await adb.logcat("emulator-5554", { priority: "E", tail: 100 });
+    // The recorded dump holds D/I/W lines but no E lines: the priority filter
+    // drops EVERYTHING without a priority token — including the buffer headers.
+    expect(res.lines.length).toBe(0);
+    expect(res.lines.some((l) => l.includes("beginning of"))).toBe(false);
     runner.assertSatisfied();
   });
 

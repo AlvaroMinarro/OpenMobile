@@ -9,17 +9,18 @@ export type DiffShape = "diff" | "full" | "unknown";
 
 /** Classify a CLI layout payload as a diff object, a full tree, or unrecognized. */
 export function detectDiffShape(obj: unknown): DiffShape {
+  if (Array.isArray(obj)) {
+    // Real `android layout` emits a FLAT JSON ARRAY of elements (string
+    // centers, sparse keys). Presence alone means a full tree.
+    if (obj.length === 0) return "unknown";
+    return obj.some((el) => typeof el === "object" && el !== null) ? "full" : "unknown";
+  }
   if (obj === null || typeof obj !== "object") return "unknown";
   const record = obj as Record<string, unknown>;
   if (Array.isArray(record["added"]) || Array.isArray(record["modified"])) return "diff";
-  if (
-    "bounds" in record &&
-    "center" in record &&
-    Array.isArray(record["interactions"]) &&
-    "offScreen" in record
-  ) {
-    return "full";
-  }
+  // Real elements carry bounds and/or center; sparse JSON has NO offScreen/state
+  // keys, so the old offScreen-based check would misclassify real output.
+  if ("bounds" in record || "center" in record) return "full";
   return "unknown";
 }
 
@@ -32,11 +33,15 @@ export function uiElementToJson(el: UIElement): Record<string, unknown> {
     state: el.state,
     offScreen: el.offScreen,
     ...(el.text !== undefined ? { text: el.text } : {}),
+    ...(el.resourceId !== undefined ? { resourceId: el.resourceId } : {}),
+    ...(el.contentDesc !== undefined ? { contentDesc: el.contentDesc } : {}),
+    ...(el.targetable !== undefined ? { targetable: el.targetable } : {}),
     ...(el.children !== undefined ? { children: el.children.map(uiElementToJson) } : {}),
   };
 }
 
-function parseBounds(raw: string): Bounds {
+/** Parse the recorded string bounds format `"[left,top][right,bottom]"`. */
+export function parseBounds(raw: string): Bounds {
   // Format: "[left,top][right,bottom]"
   const m = /\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]/.exec(raw);
   if (!m) return { left: 0, top: 0, right: 0, bottom: 0 };
