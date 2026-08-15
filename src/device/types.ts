@@ -11,6 +11,8 @@ export interface Device {
 export interface AVD {
   name: string;
   running: boolean;
+  /** `emulator-\d+` serial; present only while the AVD is Online (real `emulator list --long`). */
+  serial?: string;
 }
 
 export interface Bounds {
@@ -32,6 +34,15 @@ export interface UIElement {
   state: string;
   offScreen: boolean;
   text?: string;
+  /** Original `resource-id` from the CLI layout (sparse: present only when emitted). */
+  resourceId?: string;
+  /** Original `content-desc` from the CLI layout (sparse: present only when emitted). */
+  contentDesc?: string;
+  /**
+   * Whether the element is a safe tap target. Explicitly `false` when the CLI
+   * emitted coordinates that cannot be parsed — NEVER silently tappable at (0,0).
+   */
+  targetable?: boolean;
   children?: UIElement[];
 }
 

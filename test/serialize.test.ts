@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { detectDiffShape, xmlToTree, uiElementToJson } from "../src/device/serialize";
+import { detectDiffShape, parseBounds, xmlToTree, uiElementToJson } from "../src/device/serialize";
+import { loadFixture } from "./helpers/fixtures";
 
 describe("detectDiffShape", () => {
   it("classifies a CLI diff object by added/modified keys", () => {
@@ -22,6 +23,30 @@ describe("detectDiffShape", () => {
     expect(detectDiffShape(null)).toBe("unknown");
     expect(detectDiffShape("layout")).toBe("unknown");
     expect(detectDiffShape(42)).toBe("unknown");
+  });
+
+  it("classifies the recorded --diff envelope as diff ({" + "added,modified})", () => {
+    const env = loadFixture("android-layout-diff");
+    expect(detectDiffShape(JSON.parse(env.stdout) as unknown)).toBe("diff");
+  });
+
+  it("classifies the recorded layout as full despite sparse keys (no offScreen/state)", () => {
+    const env = loadFixture("android-layout");
+    const parsed = JSON.parse(env.stdout) as Record<string, unknown>[];
+    // Real CLI output: sparse JSON with string center/bounds and NO offScreen key
+    expect(parsed.length).toBeGreaterThan(0);
+    expect("offScreen" in (parsed[0] as Record<string, unknown>)).toBe(false);
+    expect(detectDiffShape(parsed)).toBe("full");
+  });
+});
+
+describe("parseBounds", () => {
+  it("parses the recorded string bounds format [l,t][r,b]", () => {
+    expect(parseBounds("[0,0][1280,2856]")).toEqual({ left: 0, top: 0, right: 1280, bottom: 2856 });
+  });
+
+  it("parses negative bounds", () => {
+    expect(parseBounds("[-40,-20][10,30]")).toEqual({ left: -40, top: -20, right: 10, bottom: 30 });
   });
 });
 
