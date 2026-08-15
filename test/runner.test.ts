@@ -5,6 +5,8 @@ import {
   SPAWN_TIMEOUTS,
   SpawnTimeoutError,
 } from "../src/device/runner";
+import { AdbWrapper } from "../src/device/adb";
+import { AndroidCli } from "../src/device/androidCli";
 import { MemoryRunner } from "./helpers/memoryRunner";
 
 describe("BunCommandRunner — per-spawn timeouts (D1)", () => {
@@ -92,5 +94,128 @@ describe("MemoryRunner — timeout-double support", () => {
     const runner = new MemoryRunner();
     runner.expectHang(["adb", "devices", "-l"]);
     expect(() => runner.assertSatisfied()).toThrow(/hang/);
+  });
+});
+
+describe("Timeout wiring — wrappers pass their per-op SPAWN_TIMEOUTS entry (D1)", () => {
+  it("AndroidCli maps each method to its timeout key", async () => {
+    const runner = new MemoryRunner();
+    const cli = new AndroidCli(runner);
+    const serial = "emulator-5554";
+
+    runner.expect(["android", "layout", `--device=${serial}`], { stdout: "[]" });
+    await cli.layout({ serial });
+    expect(runner.optsLog[0]?.timeoutMs).toBe(SPAWN_TIMEOUTS.layout);
+
+    runner.expect(["android", "layout", `--device=${serial}`, "--diff"], {
+      stdout: JSON.stringify({ added: [], modified: [] }),
+    });
+    await cli.layoutDiff({ serial });
+    expect(runner.optsLog[1]?.timeoutMs).toBe(SPAWN_TIMEOUTS.layout);
+
+    runner.expect(["android", "screen", "capture", `--device=${serial}`, "-o", "/tmp/a.png"], {});
+    await cli.capture({ serial, outPath: "/tmp/a.png" });
+    expect(runner.optsLog[2]?.timeoutMs).toBe(SPAWN_TIMEOUTS.capture);
+
+    runner.expect(
+      ["android", "screen", "capture", `--device=${serial}`, "-o", "/tmp/a.png", "--annotate"],
+      {},
+    );
+    await cli.captureAnnotated({ serial, outPath: "/tmp/a.png" });
+    expect(runner.optsLog[3]?.timeoutMs).toBe(SPAWN_TIMEOUTS.capture);
+
+    runner.expect(
+      ["android", "screen", "resolve", "--screenshot", "/tmp/a.png", "--string", "OK"],
+      { stdout: "100, 200" },
+    );
+    await cli.resolveScreenLabel({ screenshot: "/tmp/a.png", label: "OK" });
+    expect(runner.optsLog[4]?.timeoutMs).toBe(SPAWN_TIMEOUTS.capture);
+
+    runner.expect(["android", "emulator", "list"], { stdout: "Pixel_9_Pro\n" });
+    await cli.emulatorList();
+    expect(runner.optsLog[5]?.timeoutMs).toBe(SPAWN_TIMEOUTS.emulatorManage);
+
+    runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], {});
+    await cli.emulatorStart("Pixel_9_Pro");
+    expect(runner.optsLog[6]?.timeoutMs).toBe(SPAWN_TIMEOUTS.emulatorStart);
+
+    runner.expect(["android", "emulator", "stop", "Pixel_9_Pro"], {});
+    await cli.emulatorStop("Pixel_9_Pro");
+    expect(runner.optsLog[7]?.timeoutMs).toBe(SPAWN_TIMEOUTS.emulatorManage);
+
+    runner.expect(["android", "emulator", "create", "Pixel_9_Pro"], {});
+    await cli.emulatorCreate("Pixel_9_Pro");
+    expect(runner.optsLog[8]?.timeoutMs).toBe(SPAWN_TIMEOUTS.emulatorManage);
+
+    runner.expect(["android", "install", `--device=${serial}`, "/tmp/a.apk"], {});
+    await cli.install({ serial, apk: "/tmp/a.apk" });
+    expect(runner.optsLog[9]?.timeoutMs).toBe(SPAWN_TIMEOUTS.install);
+
+    runner.expect(["android", "run", `--device=${serial}`, "/tmp/a.apk"], {});
+    await cli.run({ serial, apk: "/tmp/a.apk" });
+    expect(runner.optsLog[10]?.timeoutMs).toBe(SPAWN_TIMEOUTS.install);
+
+    runner.expect(["android", "info", "version"], { stdout: "1.0.0\n" });
+    await cli.info("version");
+    expect(runner.optsLog[11]?.timeoutMs).toBe(SPAWN_TIMEOUTS.devices);
+
+    runner.assertSatisfied();
+  });
+
+  it("a per-call timeoutMs override wins over the SPAWN_TIMEOUTS default", async () => {
+    const runner = new MemoryRunner();
+    const cli = new AndroidCli(runner);
+    runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], {});
+    await cli.emulatorStart("Pixel_9_Pro", 300_000);
+    expect(runner.optsLog[0]?.timeoutMs).toBe(300_000);
+    runner.assertSatisfied();
+  });
+
+  it("AdbWrapper maps each method to its timeout key", async () => {
+    const runner = new MemoryRunner();
+    const adb = new AdbWrapper(runner);
+    const serial = "emulator-5554";
+
+    runner.expect(["adb", "devices", "-l"], { stdout: "List of devices attached\n" });
+    await adb.devices();
+    expect(runner.optsLog[0]?.timeoutMs).toBe(SPAWN_TIMEOUTS.devices);
+
+    runner.expect(["adb", "-s", serial, "shell", "input", "tap", "100", "200"], {});
+    await adb.inputTap(serial, 100, 200);
+    expect(runner.optsLog[1]?.timeoutMs).toBe(SPAWN_TIMEOUTS.input);
+
+    runner.expect(["adb", "-s", serial, "shell", "input", "keyevent", "4"], {});
+    await adb.inputKeyevent(serial, "back");
+    expect(runner.optsLog[2]?.timeoutMs).toBe(SPAWN_TIMEOUTS.input);
+
+    runner.expect(["adb", "-s", serial, "logcat", "-v", "time"], { stdout: "" });
+    await adb.logcat(serial);
+    expect(runner.optsLog[3]?.timeoutMs).toBe(SPAWN_TIMEOUTS.logcatDump);
+
+    runner.expect(["adb", "-s", serial, "install", "-r", "/tmp/a.apk"], {});
+    await adb.install(serial, "/tmp/a.apk");
+    expect(runner.optsLog[4]?.timeoutMs).toBe(SPAWN_TIMEOUTS.install);
+
+    runner.expect(["adb", "-s", serial, "shell", "am", "start", "-n", "com.x/.Main"], {});
+    await adb.amStart(serial, "com.x/.Main");
+    expect(runner.optsLog[5]?.timeoutMs).toBe(SPAWN_TIMEOUTS.install);
+
+    runner.expect(["adb", "-s", serial, "shell", "screencap", "-p", "/sdcard/om_shot.png"], {});
+    runner.expect(["adb", "-s", serial, "pull", "/sdcard/om_shot.png", "/tmp/raw.png"], {});
+    await adb.screencap(serial, "/tmp/raw.png");
+    expect(runner.optsLog[6]?.timeoutMs).toBe(SPAWN_TIMEOUTS.capture);
+    expect(runner.optsLog[7]?.timeoutMs).toBe(SPAWN_TIMEOUTS.capture);
+
+    runner.expect(["adb", "-s", serial, "shell", "uiautomator", "dump", "/sdcard/window_dump.xml"], {
+      stdout: "",
+    });
+    runner.expect(["adb", "-s", serial, "shell", "cat", "/sdcard/window_dump.xml"], {
+      stdout: "<hierarchy/>",
+    });
+    await adb.uiautomatorDump(serial);
+    expect(runner.optsLog[8]?.timeoutMs).toBe(SPAWN_TIMEOUTS.layout);
+    expect(runner.optsLog[9]?.timeoutMs).toBe(SPAWN_TIMEOUTS.layout);
+
+    runner.assertSatisfied();
   });
 });

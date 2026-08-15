@@ -1,5 +1,5 @@
 import { detectDiffShape } from "./serialize";
-import type { CommandRunner } from "./runner";
+import { SPAWN_TIMEOUTS, type CommandRunner } from "./runner";
 import type { AVD, LayoutDiffResult, Point, UIElement } from "./types";
 
 export interface DeviceTarget {
@@ -51,8 +51,8 @@ export class AndroidCli {
     return ["android", ...parts];
   }
 
-  private async exec(argv: string[]): Promise<string> {
-    const { stdout, stderr, exitCode } = await this.runner.run(argv);
+  private async exec(argv: string[], timeoutMs: number): Promise<string> {
+    const { stdout, stderr, exitCode } = await this.runner.run(argv, { timeoutMs });
     if (exitCode !== 0) {
       throw new Error(`android CLI failed (${argv.join(" ")}): ${stderr || stdout}`);
     }
@@ -61,7 +61,7 @@ export class AndroidCli {
 
   /** Full UI tree from `android layout`. Returns an empty tree explicitly. */
   async layout(target: DeviceTarget): Promise<UIElement[]> {
-    const stdout = await this.exec(this.cmd("layout", `--device=${target.serial}`));
+    const stdout = await this.exec(this.cmd("layout", `--device=${target.serial}`), SPAWN_TIMEOUTS.layout);
     if (stdout.trim() === "") return [];
     const parsed = JSON.parse(stdout) as unknown;
     if (Array.isArray(parsed)) {
@@ -75,7 +75,7 @@ export class AndroidCli {
 
   /** Change diff via `android layout --diff`; falls back to a full tree when the CLI cannot supply a baseline. */
   async layoutDiff(target: DeviceTarget): Promise<LayoutDiffResult> {
-    const stdout = await this.exec(this.cmd("layout", `--device=${target.serial}`, "--diff"));
+    const stdout = await this.exec(this.cmd("layout", `--device=${target.serial}`, "--diff"), SPAWN_TIMEOUTS.layout);
     const parsed = JSON.parse(stdout) as Record<string, unknown>;
     const shape = detectDiffShape(parsed);
     if (shape === "diff") {
@@ -96,12 +96,14 @@ export class AndroidCli {
   async capture(target: DeviceTarget & { outPath: string }): Promise<void> {
     await this.exec(
       this.cmd("screen", "capture", `--device=${target.serial}`, "-o", target.outPath),
+      SPAWN_TIMEOUTS.capture,
     );
   }
 
   async captureAnnotated(target: DeviceTarget & { outPath: string }): Promise<void> {
     await this.exec(
       this.cmd("screen", "capture", `--device=${target.serial}`, "-o", target.outPath, "--annotate"),
+      SPAWN_TIMEOUTS.capture,
     );
   }
 
@@ -109,6 +111,7 @@ export class AndroidCli {
   async resolveScreenLabel(target: { screenshot: string; label: string }): Promise<Point | null> {
     const stdout = await this.exec(
       this.cmd("screen", "resolve", "--screenshot", target.screenshot, "--string", target.label),
+      SPAWN_TIMEOUTS.capture,
     );
     const m = /(\-?\d+)\s*,\s*(\-?\d+)/.exec(stdout);
     if (!m) return null;
@@ -117,7 +120,7 @@ export class AndroidCli {
 
   /** List AVDs; a leading `*` marks a running emulator (format live-verified at apply). */
   async emulatorList(): Promise<AVD[]> {
-    const stdout = await this.exec(this.cmd("emulator", "list"));
+    const stdout = await this.exec(this.cmd("emulator", "list"), SPAWN_TIMEOUTS.emulatorManage);
     const avds: AVD[] = [];
     for (const line of stdout.split("\n")) {
       const trimmed = line.trim();
@@ -131,30 +134,33 @@ export class AndroidCli {
     return avds;
   }
 
-  async emulatorStart(name: string): Promise<void> {
-    await this.exec(this.cmd("emulator", "start", name));
+  async emulatorStart(name: string, timeoutMs?: number): Promise<void> {
+    await this.exec(
+      this.cmd("emulator", "start", name),
+      timeoutMs ?? SPAWN_TIMEOUTS.emulatorStart,
+    );
   }
 
   async emulatorStop(name: string): Promise<void> {
-    await this.exec(this.cmd("emulator", "stop", name));
+    await this.exec(this.cmd("emulator", "stop", name), SPAWN_TIMEOUTS.emulatorManage);
   }
 
   async emulatorCreate(name: string): Promise<void> {
-    await this.exec(this.cmd("emulator", "create", name));
+    await this.exec(this.cmd("emulator", "create", name), SPAWN_TIMEOUTS.emulatorManage);
   }
 
   async install(target: DeviceTarget & { apk: string }): Promise<void> {
-    await this.exec(this.cmd("install", `--device=${target.serial}`, target.apk));
+    await this.exec(this.cmd("install", `--device=${target.serial}`, target.apk), SPAWN_TIMEOUTS.install);
   }
 
   async run(target: DeviceTarget & { apk: string; activity?: string }): Promise<void> {
     const args = ["run", `--device=${target.serial}`, target.apk];
     if (target.activity) args.push(target.activity);
-    await this.exec(this.cmd(...args));
+    await this.exec(this.cmd(...args), SPAWN_TIMEOUTS.install);
   }
 
   async info(field: string): Promise<string> {
-    return (await this.exec(this.cmd("info", field))).trim();
+    return (await this.exec(this.cmd("info", field), SPAWN_TIMEOUTS.devices)).trim();
   }
 
   async version(): Promise<string> {
