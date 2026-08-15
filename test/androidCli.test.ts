@@ -170,4 +170,25 @@ describe("AndroidCli — command builder + typed results", () => {
     expect(await cli.info("ro.build.version.sdk")).toBe("36");
     runner.assertSatisfied();
   });
+
+  it("maps hyphenated off-screen key to offScreen (dual-shape like center/resource-id)", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["android", "layout", "--device=emulator-5554"], {
+      stdout: JSON.stringify([
+        {
+          center: "[640,1384]",
+          "off-screen": "true",
+          interactions: ["focusable"],
+          text: "Below the fold",
+        },
+      ]),
+      exitCode: 0,
+    });
+    const cli = new AndroidCli(runner);
+    const tree = await cli.layout({ serial: "emulator-5554" });
+    expect(tree).toHaveLength(1);
+    expect(tree[0]!.offScreen).toBe(true);
+    expect(tree[0]!.center).toEqual({ x: 640, y: 1384 });
+    runner.assertSatisfied();
+  });
 });

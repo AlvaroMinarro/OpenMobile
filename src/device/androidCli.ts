@@ -84,7 +84,7 @@ function toUiElement(raw: Record<string, unknown>): UIElement {
     center: center ?? { x: 0, y: 0 },
     interactions: Array.isArray(raw["interactions"]) ? (raw["interactions"] as string[]) : [],
     state: typeof raw["state"] === "string" ? raw["state"] : "default",
-    offScreen: raw["offScreen"] === true,
+    offScreen: raw["offScreen"] === true || raw["off-screen"] === true || raw["off-screen"] === "true",
     ...(typeof raw["text"] === "string" ? { text: raw["text"] as string } : {}),
     ...(typeof raw["resource-id"] === "string" ? { resourceId: raw["resource-id"] as string } : {}),
     ...(typeof raw["content-desc"] === "string" ? { contentDesc: raw["content-desc"] as string } : {}),
