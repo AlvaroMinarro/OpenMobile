@@ -1,0 +1,19 @@
+{
+  "bytes": 92,
+  "provenance": {
+    "tool": "scrcpy",
+    "version": "4.1",
+    "capturedAt": "2026-08-15T22:42:41.525Z",
+    "details": {
+      "serial": "emulator-5554",
+      "device": "sdk_gphone64_x86_64",
+      "jarSha256": "deacb991ed2509715160ffdc7907e47b4160eb30d1566217e9047fd5b8850cae",
+      "spawnCmd": "CLASSPATH=/data/local/tmp/scrcpy-server.jar /system/bin/app_process / com.genymobile.scrcpy.Server 4.1 scid=0x00000000 log_level=info video=true audio=false control=true send_dummy_byte=true send_device_meta=true send_stream_meta=true send_frame_meta=true tunnel_forward=false max_size=960 video_bit_rate=8000000 max_fps=30",
+      "videoSize": {
+        "width": 430,
+        "height": 960
+      }
+    },
+    "context": "session-meta"
+  }
+}
