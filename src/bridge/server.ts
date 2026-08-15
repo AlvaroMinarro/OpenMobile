@@ -254,33 +254,57 @@ async function handleText(deps: BridgeDeps, explicit: string | undefined, req: R
 /** Build the HTTP handler. Testable directly; `main.ts` binds it to loopback. */
 export function createBridgeHandler(deps: BridgeDeps, opts: BridgeOptions = {}): (req: Request) => Promise<Response> {
   return async (req) => {
+    // CORS: the bridge binds loopback (127.0.0.1), so granting cross-origin
+    // read/write to browsers/webviews on this same machine is safe — the
+    // surface UI (im-dot.webview / web PWA) fetches state+screenshot+input
+    // from a different origin. Fine-grained CORS would add nothing here:
+    // any process on this machine already owns the port. `*` keeps every
+    // runtime (Electron, web dev server, PWA) working without a config dance.
+    const requestOrigin = req.headers.get("origin");
+    const allowOrigin = requestOrigin || "*";
+    const corsHeaders = {
+      "access-control-allow-origin": allowOrigin,
+      "access-control-allow-methods": "GET, POST, OPTIONS",
+      "access-control-allow-headers": "content-type, x-openmobile-secret",
+    };
+    // Browser/webview preflight for non-simple requests (POST with
+    // application/json triggers it). Answer it immediately; the methods we
+    // expose are already GET/POST, and the allow-headers list matches what
+    // the surface sends.
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
     // Optional shared-secret gate (OFF by default: loopback is the trust boundary).
     if (opts.secret !== undefined && opts.secret !== "") {
       const provided = req.headers.get("x-openmobile-secret");
       if (provided !== opts.secret) {
-        return error(401, "UNAUTHORIZED", "missing or invalid X-OpenMobile-Secret header");
+        const body = error(401, "UNAUTHORIZED", "missing or invalid X-OpenMobile-Secret header");
+        corsHeaders["access-control-allow-origin"] = allowOrigin;
+        return new Response(await body.text(), { status: 401, headers: { ...corsHeaders, "content-type": "application/json; charset=utf-8" } });
       }
     }
     const url = new URL(req.url);
     const path = url.pathname;
     const explicit = url.searchParams.get("device") ?? undefined;
+    let response: Response;
     try {
-      if (req.method === "GET" && path === "/v1/state") return await handleState(deps, explicit);
-      if (req.method === "GET" && path === "/v1/screenshot")
-        return await handleScreenshot(deps, explicit);
-      if (req.method === "POST" && path === "/v1/input/tap")
-        return await handleTap(deps, explicit, req);
-      if (req.method === "POST" && path === "/v1/input/swipe")
-        return await handleSwipe(deps, explicit, req);
-      if (req.method === "POST" && path === "/v1/input/text")
-        return await handleText(deps, explicit, req);
-      return notFound(req.method, path);
+      if (req.method === "GET" && path === "/v1/state") response = await handleState(deps, explicit);
+      else if (req.method === "GET" && path === "/v1/screenshot") response = await handleScreenshot(deps, explicit);
+      else if (req.method === "POST" && path === "/v1/input/tap") response = await handleTap(deps, explicit, req);
+      else if (req.method === "POST" && path === "/v1/input/swipe") response = await handleSwipe(deps, explicit, req);
+      else if (req.method === "POST" && path === "/v1/input/text") response = await handleText(deps, explicit, req);
+      else response = notFound(req.method, path);
     } catch (e) {
       if (e instanceof HttpError) {
-        return error(e.status, e.code, e.message, e.details);
+        response = error(e.status, e.code, e.message, e.details);
+      } else {
+        const message = e instanceof Error ? e.message : String(e);
+        response = error(500, "INTERNAL_ERROR", message);
       }
-      const message = e instanceof Error ? e.message : String(e);
-      return error(500, "INTERNAL_ERROR", message);
     }
+    // Stamp CORS headers on every response (success, error, and 404 alike).
+    const headers = new Headers(response.headers);
+    headers.set("access-control-allow-origin", allowOrigin);
+    return new Response(response.body, { status: response.status, headers });
   };
 }

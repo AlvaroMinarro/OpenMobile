@@ -447,3 +447,72 @@ describe("routing and auth", () => {
     }
   });
 });
+
+describe("CORS (V2 OpenChamber surface readiness)", () => {
+  it("stamps Access-Control-Allow-Origin on GET responses", async () => {
+    const { deps } = makeDeps();
+    const srv = makeInMemoryServer(deps);
+    try {
+      const res = await srv.dispatch("/v1/state", {
+        headers: { origin: "http://localhost:5180" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("access-control-allow-origin")).toBe("http://localhost:5180");
+    } finally {
+      srv.stop();
+    }
+  });
+
+  it("echoes the request origin instead of a fixed * when one is sent", async () => {
+    const { deps } = makeDeps();
+    const srv = makeInMemoryServer(deps);
+    try {
+      const res = await srv.dispatch("/v1/state", {
+        headers: { origin: "https://example-dev.example" },
+      });
+      expect(res.headers.get("access-control-allow-origin")).toBe("https://example-dev.example");
+    } finally {
+      srv.stop();
+    }
+  });
+
+  it("answers OPTIONS preflight with 204 and the allow-methods/headers", async () => {
+    const { deps } = makeDeps();
+    const srv = makeInMemoryServer(deps);
+    try {
+      const res = await srv.dispatch("/v1/input/tap", {
+        method: "OPTIONS",
+        headers: {
+          origin: "http://localhost:5180",
+          "access-control-request-method": "POST",
+        },
+      });
+      expect(res.status).toBe(204);
+      expect(res.headers.get("access-control-allow-origin")).toBe("http://localhost:5180");
+      expect(res.headers.get("access-control-allow-methods")).toContain("POST");
+      expect(res.headers.get("access-control-allow-headers")).toContain("x-openmobile-secret");
+    } finally {
+      srv.stop();
+    }
+  });
+
+  it("stamps CORS on error responses too (422 validation)", async () => {
+    const { deps, state } = makeDeps();
+    state.devices = [{ serial: "emulator-5554", state: "device" }];
+    const srv = makeInMemoryServer(deps);
+    try {
+      const res = await srv.dispatch("/v1/input/tap", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin: "http://localhost:5180",
+        },
+        body: JSON.stringify({ y: 200 }),
+      });
+      expect(res.status).toBe(422);
+      expect(res.headers.get("access-control-allow-origin")).toBe("http://localhost:5180");
+    } finally {
+      srv.stop();
+    }
+  });
+});
