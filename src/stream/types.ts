@@ -99,6 +99,23 @@ export interface StreamViewer {
   close(): void;
 }
 
+/** Viewer registry with per-viewer drop-oldest queues + cap enforcement. */
+export interface FanoutRegistry {
+  /** Current connected viewer count. */
+  readonly count: number;
+  /**
+   * Register a viewer. Returns false (and closes the viewer) when the cap
+   * is reached; otherwise delivers future frames without blocking.
+   */
+  add(viewer: StreamViewer): boolean;
+  /** Remove a viewer by id; returns false when unknown. */
+  remove(id: string): boolean;
+  /** Queue the frame for every registered viewer (drop-oldest per viewer). */
+  broadcast(frame: Uint8Array): void;
+  /** Close and clear all viewers (session teardown). */
+  closeAll(): void;
+}
+
 // ─── WS /v1/stream/video contract (design D2) ───────────────────────────
 
 export interface VideoHandshake {
