@@ -188,7 +188,7 @@ describe("Timeout wiring — wrappers pass their per-op SPAWN_TIMEOUTS entry (D1
     await adb.inputKeyevent(serial, "back");
     expect(runner.optsLog[2]?.timeoutMs).toBe(SPAWN_TIMEOUTS.input);
 
-    runner.expect(["adb", "-s", serial, "logcat", "-v", "time"], { stdout: "" });
+    runner.expect(["adb", "-s", serial, "logcat", "-d", "-v", "time"], { stdout: "" });
     await adb.logcat(serial);
     expect(runner.optsLog[3]?.timeoutMs).toBe(SPAWN_TIMEOUTS.logcatDump);
 

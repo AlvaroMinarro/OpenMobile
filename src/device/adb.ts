@@ -22,7 +22,10 @@ const KEYCODES: Record<string, string> = {
 
 /** Extract a logcat priority token (V/D/I/W/E/F/S) from a `-v time` line. */
 function priorityOf(line: string): string | null {
-  const m = /\s([VDIWEFSW])\s/.exec(line);
+  // Real recorded lines: "MM-DD HH:MM:SS.mmm P/Tag(  pid): msg" — priority is
+  // followed by '/' (e.g. " I/AiAiEcho("), NOT a space as the legacy regex
+  // assumed.
+  const m = /\s([VDIWEFS])\//.exec(line);
   return m ? (m[1] as string) : null;
 }
 
@@ -100,25 +103,34 @@ export class AdbWrapper {
     await this.shell(serial, SPAWN_TIMEOUTS.input, "input", "keyevent", keycode);
   }
 
-  /** Read logcat scoped by pid, filtered by priority, bounded to `tail`. */
+  /** Read logcat scoped by pid, priority-filtered, bounded to `tail`.
+   *
+   * Bounded read: `-d` dumps and exits (never streams), `-t N` bounds the
+   * device-side buffer. When `tail` is set, the in-process bound slices to a
+   * MAXIMUM of `tail` lines (newest-first) and flags `truncated`.
+   */
   async logcat(serial: string, opts: LogcatOptions = {}): Promise<LogcatResult> {
-    const args = ["adb", "-s", serial, "logcat", "-v", "time"];
+    const args = ["adb", "-s", serial, "logcat", "-d"];
+    const tail = opts.tail ?? 0;
+    if (tail > 0) args.push("-t", String(tail));
+    args.push("-v", "time");
+    if (opts.priority !== undefined) args.push(`${opts.priority}:*`);
     if (opts.pid !== undefined) args.push("--pid", String(opts.pid));
     const stdout = await this.exec(args, SPAWN_TIMEOUTS.logcatDump);
 
-    let lines = stdout.split("\n").filter((l) => l.trim() !== "");
-    if (opts.priority) {
-      const target = opts.priority;
-      lines = lines.filter((l) => priorityOf(l) === target);
-    }
+    const all = stdout.split("\n").filter((l) => l.trim() !== "");
+    const lines = opts.priority ? all.filter((l) => priorityOf(l) === opts.priority) : all;
+    // Buffer headers ("--------- beginning of main") carry no priority token,
+    // so the priority filter above already drops them.
 
     let truncated = false;
-    const tail = opts.tail ?? 0;
     if (tail > 0 && lines.length > tail) {
-      lines = lines.slice(lines.length - tail).reverse();
       truncated = true;
     }
-    return { lines, truncated };
+    return {
+      lines: lines.slice(-tail || undefined).reverse(),
+      truncated,
+    };
   }
 
   /** `adb install -r <apk>` — fallback when the android CLI install is unavailable. */
