@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { parseFrameMeta } from "../src/stream/wire";
 import { AnnexBSplitter, classifyNal } from "../src/stream/client/annexb";
 import { DecoderSession, type EncodedChunkLike, type VideoDecoderConfigLike } from "../src/stream/client/decoder";
+import { isStreamSupported } from "../src/stream/client/support";
 import type { VideoHandshake } from "../src/stream/types";
 
 const FIX = join(import.meta.dir, "fixtures");
@@ -280,5 +281,47 @@ describe("client decoder (task 3.2)", () => {
     expect(seen).toEqual(["first"]);
     expect(frame.closed).toBe(true);
     await r.close();
+  });
+});
+
+// ─── 3.3 stream support detection ────────────────────────────────────────
+
+describe("client stream support (task 3.3)", () => {
+  const g = globalThis as { VideoDecoder?: unknown };
+
+  it("is false when the platform lacks VideoDecoder (Firefox → polling fallback)", () => {
+    const saved = g.VideoDecoder;
+    delete (g as Record<string, unknown>).VideoDecoder;
+    try {
+      expect(isStreamSupported()).toBe(false);
+    } finally {
+      g.VideoDecoder = saved;
+    }
+  });
+
+  it("is true when VideoDecoder exists and can be constructed", () => {
+    const saved = g.VideoDecoder;
+    g.VideoDecoder = class {
+      close(): void {}
+    };
+    try {
+      expect(isStreamSupported()).toBe(true);
+    } finally {
+      g.VideoDecoder = saved;
+    }
+  });
+
+  it("is false when the VideoDecoder constructor throws (blocklisted/unsupported)", () => {
+    const saved = g.VideoDecoder;
+    g.VideoDecoder = class {
+      constructor() {
+        throw new Error("VideoDecoder unavailable on this platform");
+      }
+    };
+    try {
+      expect(isStreamSupported()).toBe(false);
+    } finally {
+      g.VideoDecoder = saved;
+    }
   });
 });
