@@ -38,6 +38,8 @@ export interface StreamGatewayDeps {
   enabled: boolean;
   /** Watchdog source (defaults to live `adb devices -l`). */
   pollDevices?: () => Promise<import("../device/types").Device[]>;
+  /** Fixed session id (tests); default: fresh random scid per start. */
+  scid?: string;
 }
 
 /** Fresh scid per stream start: signed 32-bit hex (design §Live-validated facts). */
@@ -54,8 +56,10 @@ export class StreamGateway implements GatewayContract {
   /** id → socket-facing viewer registered through subscribeVideo. */
   private viewers = new Map<string, StreamViewer>();
   private videoInfo: StreamVideoInfo = { width: 0, height: 0 };
+  private readonly fixedScid: string | undefined;
 
   constructor(deps: StreamGatewayDeps, sessionFactory?: (scid: string) => StreamSession) {
+    this.fixedScid = deps.scid;
     this.sessionFactory =
       sessionFactory ??
       ((scid) =>
@@ -69,7 +73,7 @@ export class StreamGateway implements GatewayContract {
         start: async (serial) => {
           // One StreamSession per stream start; re-push+spawn every time
           // (the server self-deletes the jar — design §Live-validated facts).
-          this.session = this.sessionFactory(freshScid());
+          this.session = this.sessionFactory(this.fixedScid ?? freshScid());
           await this.session.start();
           // Surface the video size once the handshake arrives so /v1/state
           // and the control encoder see the real dimensions.
@@ -111,6 +115,11 @@ export class StreamGateway implements GatewayContract {
 
   get managerRef(): StreamManager {
     return this.manager;
+  }
+
+  /** Attached fanout viewer count (test/observability hook for the bridge). */
+  get attachedViewers(): number {
+    return this.session?.fanout.count ?? 0;
   }
 
   async subscribeVideo(viewer: StreamViewer): Promise<StreamSubscribeResult> {
