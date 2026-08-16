@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { createBridgeApp } from "../src/bridge/server";
 import type { BridgeDeps, StreamGateway, StreamStateView, StreamSubscribeResult } from "../src/bridge/server";
 import type { AVD, Device } from "../src/device/types";
@@ -7,6 +9,9 @@ import {
   WS_CLOSE_CODES,
   MAX_VIEWERS,
 } from "../src/stream/types";
+import { StreamGateway as RealGateway } from "../src/stream/gateway";
+import { StreamSession, type DaemonListener, type DaemonSocket, type SpawnHandle } from "../src/stream/daemon";
+import { MemoryRunner } from "./helpers/memoryRunner";
 
 /**
  * Bridge WS integration (task 2.1/2.6): in-memory Bun.serve on port 0 with a
@@ -192,6 +197,78 @@ function nextMessage(ws: WebSocket, pred?: (data: unknown) => boolean): Promise<
 
 function au(tag: number): Uint8Array {
   return Uint8Array.from([0, 0, 0, 1, tag, 0x11, 0x22, 0x33]);
+}
+
+// ─── REAL gateway through the bridge (spec scenario: Control injection failure) ─
+
+/** Minimal socket double for a REAL StreamSession (mirrors stream-daemon tests). */
+class FakeSock implements DaemonSocket {
+  destroyed = false;
+  private dataCbs: Array<(c: Uint8Array) => void> = [];
+  private closeCbs: Array<() => void> = [];
+  on(event: "data" | "close" | "error", cb: (...args: unknown[]) => void): void {
+    if (event === "data") this.dataCbs.push(cb as (c: Uint8Array) => void);
+    if (event === "close") this.closeCbs.push(cb as () => void);
+  }
+  write(): void {}
+  destroy(): void {
+    this.destroyed = true;
+  }
+  emitData(c: Uint8Array): void {
+    for (const cb of this.dataCbs) cb(c);
+  }
+  emitClose(): void {
+    for (const cb of this.closeCbs) cb();
+  }
+}
+
+class FakeL implements DaemonListener {
+  port = 47000;
+  private connCbs: Array<(s: DaemonSocket) => void> = [];
+  listen(): Promise<void> {
+    return Promise.resolve();
+  }
+  onConnection(cb: (s: DaemonSocket) => void): void {
+    this.connCbs.push(cb);
+  }
+  close(): Promise<void> {
+    return Promise.resolve();
+  }
+  connect(): FakeSock {
+    const s = new FakeSock();
+    for (const cb of this.connCbs) cb(s);
+    return s;
+  }
+}
+
+class FakeSpawnH implements SpawnHandle {
+  kill(): void {}
+  get exited(): Promise<number> {
+    return new Promise(() => {});
+  }
+}
+
+/** The REAL recorded wire: 80B header + [12B frame meta][Annex-B AU] pairs. */
+function realWire(): Buffer {
+  const meta = readFileSync(join(import.meta.dir, "fixtures", "stream-meta.bin"));
+  const frames = readFileSync(join(import.meta.dir, "fixtures", "stream-a-frames.bin"));
+  return Buffer.concat([meta.subarray(0, 80), frames]);
+}
+
+/** A REAL StreamSession bound to a fake listener + spawn (no adb sockets). */
+function realSessionFactory(runner: MemoryRunner): { factory: (scid: string) => StreamSession; listener: FakeL } {
+  const listener = new FakeL();
+  return {
+    listener,
+    factory: (scid: string) =>
+      new StreamSession({
+        runner,
+        serial: "emulator-5554",
+        scid,
+        listenerFactory: () => listener,
+        spawnFn: () => new FakeSpawnH(),
+      }),
+  };
 }
 
 describe("WS /v1/stream/video — handshake + binary AUs (design D2)", () => {
@@ -424,6 +501,53 @@ describe("WS /v1/stream/control — JSON inject → scrcpy bytes (design D3)", (
       const body = JSON.parse(String(err)) as { code: string };
       expect(body.code).toBe("OUT_OF_RANGE");
       ws.close();
+    } finally {
+      srv.stop();
+    }
+  });
+
+  it("returns INJECTION_FAILED (never an ack) when the control socket breaks mid-stream — REAL gateway path (Control injection failure)", async () => {
+    // The FULL production path: WS route → sendControlEvent → REAL
+    // StreamGateway → REAL StreamSession.sendControl over a dead conn2.
+    const runner = new MemoryRunner();
+    const SCID = "feed1234";
+    runner.expect(["adb", "-s", "emulator-5554", "push", join(import.meta.dir, "..", "assets", "scrcpy-server.jar"), "/data/local/tmp/scrcpy-server.jar"], {});
+    runner.expect(["adb", "-s", "emulator-5554", "reverse", `localabstract:scrcpy_${SCID}`, "tcp:47000"], {});
+    const { factory, listener } = realSessionFactory(runner);
+    const gw = new RealGateway(
+      {
+        runner,
+        serial: "emulator-5554",
+        enabled: true,
+        scid: SCID,
+        pollDevices: async () => [{ serial: "emulator-5554", state: "device" }] as Device[],
+      },
+      factory,
+    );
+    const srv = makeServer(makeDeps(gw));
+    try {
+      // A video viewer starts the stream (first-viewer-start, design D5).
+      const vws = await srv.ws("/v1/stream/video");
+      for (let i = 0; i < 50 && !gw.managerRef.snapshot().active; i++) await new Promise((r) => setTimeout(r, 10));
+      expect(gw.managerRef.snapshot().active).toBe(true);
+      // Feed the recorded wire so the handshake lands (control encoding needs
+      // the real video size, 430x960).
+      const video = listener.connect(); // conn1
+      video.emitData(realWire());
+      for (let i = 0; i < 50 && gw.snapshot().width !== 430; i++) await new Promise((r) => setTimeout(r, 10));
+      expect(gw.snapshot().width).toBe(430);
+      // Control socket connects... then BREAKS mid-stream.
+      const cws = await srv.ws("/v1/stream/control");
+      listener.connect().emitClose(); // conn2 died
+      cws.send(JSON.stringify({ type: "inject", event: "tap", x: 215, y: 480 }));
+      const err = await nextMessage(cws);
+      const body = JSON.parse(String(err)) as { type: string; code: string; message: string };
+      expect(body.type).toBe("error");
+      expect(body.code).toBe("INJECTION_FAILED");
+      expect(body.message).toMatch(/control socket is not connected/);
+      // The control WS itself stays open (error frame, not a close).
+      vws.close();
+      cws.close();
     } finally {
       srv.stop();
     }

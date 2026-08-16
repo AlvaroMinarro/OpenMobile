@@ -183,6 +183,9 @@ export class StreamSession {
   private readonly spawnFn: (argv: string[]) => SpawnHandle;
   private videoSocket: DaemonSocket | undefined;
   private controlSocket: DaemonSocket | undefined;
+  /** Track conn2 liveness: the control route must FAIL LOUD, never silently
+   *  skip writes into a dead socket (spec: Control injection failure). */
+  private controlAlive = false;
   private spawnProc: SpawnHandle | undefined;
   private lossCb: (() => void) | undefined;
   private stopped = false;
@@ -229,9 +232,23 @@ export class StreamSession {
     void this.watchSpawnExit();
   }
 
-  /** Write scrcpy control bytes into conn2 (from task 2.3 encoders). */
+  /**
+   * Write scrcpy control bytes into conn2 (from task 2.3 encoders).
+   * REJECTS when conn2 is missing or dead — the WS route maps the rejection
+   * onto `{type:"error", code:"INJECTION_FAILED"}` (spec: actionable error,
+   * never a silent drop).
+   */
   sendControl(bytes: Uint8Array): Promise<void> {
-    if (this.controlSocket) this.controlSocket.write(bytes);
+    if (!this.controlSocket || !this.controlAlive) {
+      return Promise.reject(new Error("control socket is not connected; injection failed"));
+    }
+    try {
+      this.controlSocket.write(bytes);
+    } catch (e) {
+      this.controlAlive = false;
+      const message = e instanceof Error ? e.message : "control socket write failed";
+      return Promise.reject(new Error(`control socket is not connected; injection failed (${message})`));
+    }
     return Promise.resolve();
   }
 
@@ -298,11 +315,17 @@ export class StreamSession {
   }
 
   private attachControl(sock: DaemonSocket): void {
+    this.controlSocket = sock;
+    this.controlAlive = true;
     sock.on("data", () => {
       // Device→host device messages (clipboard, etc.) — not consumed today.
     });
+    sock.on("close", () => {
+      this.controlAlive = false;
+    });
     sock.on("error", () => {
-      // control errors don't kill the video path
+      // control errors don't kill the video path, but the socket is dead
+      this.controlAlive = false;
     });
   }
 
