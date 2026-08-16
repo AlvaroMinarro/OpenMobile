@@ -16,7 +16,7 @@
  */
 
 import type { Device } from "../device/types";
-import type { ControlEvent } from "./types";
+import type { ControlEvent, FanoutRegistry, VideoHandshake } from "./types";
 
 /** Video size reported by the session, updated from handshake meta. */
 export interface StreamVideoInfo {
@@ -48,6 +48,12 @@ export interface AdapterSession {
   onLoss(cb: (() => void) | undefined): void;
   /** Full teardown: kill spawn, remove reverse, clean jar. */
   close(): void;
+  /** Session fan-out registry — the gateway attaches WS viewers (slice 2B). */
+  fanout?: FanoutRegistry;
+  /** Resolves with the handshake once the CONFIG frame is parsed (slice 2B). */
+  handshakeReady?: Promise<VideoHandshake>;
+  /** Resolves with the video size when the handshake lands (slice 2B). */
+  ready?: Promise<StreamVideoInfo>;
 }
 
 /** Dependency surface StreamManager needs from the scrcpy adapter. */
@@ -190,6 +196,14 @@ export class StreamManager {
         for (const b of bytes) await session.sendControl(b);
       },
     };
+  }
+
+  /**
+   * The ACTIVE adapter session (or null). The gateway uses it to attach
+   * fanout viewers, await the handshake, and observe the video size.
+   */
+  activeSession(): AdapterSession | null {
+    return this.active ? (this.sessions[0] ?? null) : null;
   }
 
   /** Design D6 snapshot for /v1/state and the WS state message. */
