@@ -22,6 +22,22 @@ export const META_FLAG_SESSION = 0x8000_0000;
 /** 12-byte frame meta header: ptsAndFlags u64 + len u32. */
 export const FRAME_META_LEN = 12;
 
+/**
+ * Max bytes a single frame may declare (frame-meta `len`). Real frames at
+ * 8 Mbps/30fps are ~35 KB — 16 MiB is ~450× headroom, so the bound only
+ * trips on corruption or a hostile peer. Guards the assembler against
+ * `len=0xFFFFFFFF` → unbounded Buffer.concat accumulation → OOM (the bridge
+ * daemon runs REST + streaming; one OOM kills everything).
+ */
+export const MAX_FRAME = 16 * 1024 * 1024;
+
+/**
+ * Hard cap on the StreamAssembler accumulator: one legal frame (< MAX_FRAME)
+ * plus one in-flight data burst, before concat. ~32 MiB bounds memory even
+ * when a hostile peer sends oversized chunks with legal declared lengths.
+ */
+export const MAX_ACCUMULATED = MAX_FRAME * 2 + FRAME_META_LEN;
+
 /** Frame-meta flag bits inside ptsAndFlags (upper 2 bits). */
 export const FLAG_CONFIG = 1n << 62n; // bit62 — SPS/PPS AU
 export const FLAG_KEY = 1n << 61n; // bit61 — keyframe (IDR)

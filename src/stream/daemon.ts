@@ -34,6 +34,8 @@ import {
   CODEC_ID_LEN,
   SESSION_META_LEN,
   FRAME_META_LEN,
+  MAX_FRAME,
+  MAX_ACCUMULATED,
   type FanoutRegistry,
   type SessionMeta,
   type StreamViewer,
@@ -78,7 +80,17 @@ export interface SpawnHandle {
  * a frame as soon as its payload bytes are fully received, tolerating ANY
  * TCP segmentation. The handshake is produced exactly once, from the first
  * CONFIG frame (SPS+PPS NALs).
+ *
+ * The device socket is UNTRUSTED: a frame meta `len` is attacker-controlled,
+ * so a hostile/broken peer must never be able to grow the accumulator
+ * without bound (an OOM here kills the whole bridge daemon). Two guards:
+ *  - `len > MAX_FRAME` → corrupt "frame_too_large" (rejects 0xFFFFFFFF),
+ *  - total accumulator > MAX_ACCUMULATED → corrupt "accumulator_overflow"
+ *    (checked BEFORE the concat so one oversized chunk cannot OOM).
+ * The session's caller fires the loss path + destroys the socket on corrupt.
  */
+export type CorruptReason = "frame_too_large" | "accumulator_overflow";
+
 export class StreamAssembler {
   private buf = Buffer.alloc(0);
   private headerParsed = false;
@@ -86,8 +98,13 @@ export class StreamAssembler {
   private handshakeDone = false;
   private pending: Array<{ au: Uint8Array; isConfig: boolean }> = [];
 
-  /** Returns frames emitted by THIS ingest + the handshake (if completed now). */
-  ingest(chunk: Uint8Array): { frames: Uint8Array[]; handshake: VideoHandshake | null } {
+  /** Returns frames emitted by THIS ingest + the handshake (if completed now).
+   *  `corrupt` is set when the stream exceeds the wire bounds — the caller
+   *  must treat the connection as dead (loss path + destroy the socket). */
+  ingest(chunk: Uint8Array): { frames: Uint8Array[]; handshake: VideoHandshake | null; corrupt?: CorruptReason } {
+    if (this.buf.length + chunk.length > MAX_ACCUMULATED) {
+      return { frames: [], handshake: null, corrupt: "accumulator_overflow" };
+    }
     this.buf = this.buf.length === 0 ? Buffer.from(chunk) : Buffer.concat([this.buf, Buffer.from(chunk)]);
     if (!this.headerParsed && this.buf.length >= DEVICE_META_LEN + CODEC_ID_LEN + SESSION_META_LEN) {
       const header = this.buf.subarray(0, DEVICE_META_LEN + CODEC_ID_LEN + SESSION_META_LEN);
@@ -99,6 +116,9 @@ export class StreamAssembler {
 
     while (this.buf.length >= FRAME_META_LEN) {
       const fm = parseFrameMeta(this.buf.subarray(0, FRAME_META_LEN));
+      if (fm.len > MAX_FRAME) {
+        return { frames: [], handshake: null, corrupt: "frame_too_large" };
+      }
       const need = FRAME_META_LEN + fm.len;
       if (this.buf.length < need) break; // payload still arriving
       const payload = this.buf.subarray(FRAME_META_LEN, need);
@@ -257,7 +277,15 @@ export class StreamSession {
     const asm = new StreamAssembler();
     sock.on("data", (c) => {
       if (this.stopped) return;
-      const { frames, handshake } = asm.ingest(c as Uint8Array);
+      const { frames, handshake, corrupt } = asm.ingest(c as Uint8Array);
+      if (corrupt) {
+        // Untrusted device bytes violated the wire bounds (len=0xFFFFFFFF or
+        // the accumulator cap) — do NOT keep buffering toward an OOM. Treat
+        // it as stream loss and kill the video socket.
+        this.lose("corrupt stream");
+        sock.destroy();
+        return;
+      }
       if (handshake) this.resolveHandshake(handshake);
       for (const f of frames) this.fanout.broadcast(f);
     });

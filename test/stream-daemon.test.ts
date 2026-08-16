@@ -12,6 +12,7 @@ import {
 } from "../src/stream/daemon";
 import { buildSpawnCmd } from "../src/stream/scrcpy";
 import { parseDeviceMeta, splitAnnexB } from "../src/stream/wire";
+import { FRAME_META_LEN, MAX_FRAME } from "../src/stream/types";
 import type { StreamViewer, VideoHandshake } from "../src/stream/types";
 
 const SERIAL = "emulator-5554";
@@ -30,6 +31,14 @@ function wireStream(): Buffer {
   // stream-meta.bin: 80B header + the 12B CONFIG frame-meta; frames.bin
   // starts with the SAME 12B frame-meta + the AU. Use only the 80B header.
   return Buffer.concat([meta.subarray(0, 80), frames]);
+}
+
+/** Build a 12B frame-meta: ptsAndFlags u64 BE + declared len u32 BE. */
+function frameMeta(len: number, flags: bigint = 0n): Buffer {
+  const b = Buffer.alloc(FRAME_META_LEN);
+  b.writeBigUInt64BE(flags, 0);
+  b.writeUInt32BE(len, 8);
+  return b;
 }
 
 /** Minimal viewer double (same shape as the fanout tests). */
@@ -183,6 +192,44 @@ describe("StreamAssembler — video socket byte accumulation (daemon read-loop c
     expect(handshake).toBeNull();
     expect(frames.length).toBeGreaterThanOrEqual(1); // IDR + slices still flow
   });
+
+  it("rejects a frame declaring len=0xFFFF_FFFF as corrupt — no unbounded accumulation", () => {
+    const asm = new StreamAssembler();
+    const wire = Buffer.concat([wireStream().subarray(0, 80), frameMeta(0xffff_ffff)]);
+    const { corrupt, frames } = asm.ingest(wire);
+    expect(corrupt).toBe("frame_too_large");
+    expect(frames).toEqual([]);
+  });
+
+  it("rejects any declared frame length above MAX_FRAME (16 MiB)", () => {
+    const asm = new StreamAssembler();
+    const wire = Buffer.concat([wireStream().subarray(0, 80), frameMeta(MAX_FRAME + 1)]);
+    const { corrupt, frames } = asm.ingest(wire);
+    expect(corrupt).toBe("frame_too_large");
+    expect(frames).toEqual([]);
+  });
+
+  it("buffers a partial frame declaring exactly MAX_FRAME — the boundary is legal", () => {
+    const asm = new StreamAssembler();
+    const wire = Buffer.concat([wireStream().subarray(0, 80), frameMeta(MAX_FRAME), Buffer.alloc(8, 0x11)]);
+    const { corrupt, frames } = asm.ingest(wire);
+    expect(corrupt).toBeUndefined();
+    expect(frames).toEqual([]);
+  });
+
+  it("caps the total accumulator at ~2×MAX_FRAME even when every declared length is legal", () => {
+    const asm = new StreamAssembler();
+    // One legal (huge) frame: meta + all but 1 payload byte — legit partial.
+    const partial = Buffer.concat([wireStream().subarray(0, 80), frameMeta(MAX_FRAME), Buffer.alloc(MAX_FRAME - 1, 0xaa)]);
+    const first = asm.ingest(partial);
+    expect(first.corrupt).toBeUndefined();
+    // One in-flight burst that would push the accumulator past the cap: the
+    // final payload byte + MAX_FRAME+1 more bytes in a single data event.
+    const burst = Buffer.concat([Buffer.from([0xab]), Buffer.alloc(MAX_FRAME + 1, 0xab)]);
+    const second = asm.ingest(burst);
+    expect(second.corrupt).toBe("accumulator_overflow");
+    expect(second.frames).toEqual([]);
+  });
 });
 
 describe("buildHandshake — SPS/PPS extraction (design D2)", () => {
@@ -329,6 +376,24 @@ describe("StreamSession — push→listen→reverse→spawn→read-loop→fan-ou
     sock.emitClose();
     expect(losses).toEqual(["lost"]);
     expect(session.stateReason).toBe("device_lost");
+    session.close();
+  });
+
+  it("fires loss + destroys the video socket when a frame declares an absurd length (corrupt stream, OOM guard)", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "-s", SERIAL, "push", expectJarPath(), "/data/local/tmp/scrcpy-server.jar"], {});
+    runner.expect(["adb", "-s", SERIAL, "reverse", `localabstract:scrcpy_${SCID}`, "tcp:47832"], {});
+    const { session, listener } = makeSession({ runner });
+    const losses: string[] = [];
+    session.onLoss(() => losses.push("lost"));
+    await session.start();
+    const sock = listener.connect(); // video
+    // Valid header, then a frame meta declaring len=0xFFFFFFFF.
+    const corrupt = Buffer.concat([wireStream().subarray(0, 80), frameMeta(0xffff_ffff)]);
+    sock.emitData(corrupt);
+    expect(losses).toEqual(["lost"]);
+    expect(session.stateReason).toBe("device_lost");
+    expect(sock.destroyed).toBe(true);
     session.close();
   });
 
