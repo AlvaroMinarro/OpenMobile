@@ -95,7 +95,7 @@ export interface StreamManagerOptions {
  */
 export class StreamManager {
   private readonly adapter: AdapterDeps;
-  private readonly serial: string;
+  private serial: string;
   private readonly pollDevices: () => Promise<Device[]>;
   private readonly watchdogMs: number;
   private _enabled: boolean;
@@ -152,6 +152,15 @@ export class StreamManager {
   /** Serial the manager streams (the watchdog guards it). */
   get targetSerial(): string {
     return this.serial;
+  }
+
+  /**
+   * Update the stream serial (used by the gateway when an "auto" target
+   * resolves to a real device AFTER construction). The watchdog guards the
+   * CURRENT serial; changing it mid-session is only safe pre-start.
+   */
+  updateTargetSerial(serial: string): void {
+    this.serial = serial;
   }
 
   /** Whether the manager is enabled (OPENMOBILE_STREAM kill-switch). */

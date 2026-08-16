@@ -173,7 +173,14 @@ export class StreamSession {
     this.serial = options.serial;
     this.scid = options.scid;
     this.listener = options.listenerFactory ? options.listenerFactory() : defaultListener();
-    this.spawnFn = options.spawnFn ?? spawnThroughAdapter;
+    this.spawnFn =
+      options.spawnFn ??
+      ((argv: string[]) => {
+        // Production: spawn `adb shell` WITHOUT waiting for it to exit (the
+        // scrcpy server runs for the life of the stream). Bun.spawn returns
+        // immediately; the handle's kill() stops the server on teardown.
+        return defaultSpawn(argv);
+      });
     let resolveHs!: (hs: VideoHandshake) => void;
     this.handshakeReady = new Promise<VideoHandshake>((r) => (resolveHs = r));
     this.resolveHandshake = resolveHs;
@@ -348,11 +355,19 @@ function buildSpawnShellCmd(scid: string): string {
   ].join(" ");
 }
 
-/** Default spawnFn: bind the scrcpy adapter's spawn to this session's bus. */
-const spawnThroughAdapter: (argv: string[]) => SpawnHandle = (argv) => {
-  // The adapter's spawnServer already runs `adb -s <serial> shell <cmd>`;
-  // the argv contract here is informational for tests. The handle is inert
-  // (no process access) — loss is driven by the video-socket-close path.
-  void argv;
-  return { kill: () => {}, exited: new Promise<number>(() => {}) };
-};
+/** Default spawnFn: production spawn of `adb shell` via Bun.spawn — returns
+ *  immediately (the scrcpy server runs for the life of the stream); the
+ *  handle's kill() stops it. Tests inject their own handle. */
+function defaultSpawn(argv: string[]): SpawnHandle {
+  const proc = Bun.spawn(argv, { stdout: "ignore", stderr: "pipe" });
+  return {
+    kill: () => {
+      try {
+        proc.kill();
+      } catch {
+        // already dead
+      }
+    },
+    exited: proc.exited,
+  };
+}

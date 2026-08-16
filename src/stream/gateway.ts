@@ -33,6 +33,7 @@ import { MAX_VIEWERS } from "./types";
 
 export interface StreamGatewayDeps {
   runner: CommandRunner;
+  /** Target serial; `"auto"` = resolve the single attached device on first start. */
   serial: string;
   /** Kill-switch: `OPENMOBILE_STREAM=off` disables streaming (design D6). */
   enabled: boolean;
@@ -57,24 +58,38 @@ export class StreamGateway implements GatewayContract {
   private viewers = new Map<string, StreamViewer>();
   private videoInfo: StreamVideoInfo = { width: 0, height: 0 };
   private readonly fixedScid: string | undefined;
+  private readonly runner: CommandRunner;
+  private resolvedSerial: string | null = null;
 
   constructor(deps: StreamGatewayDeps, sessionFactory?: (scid: string) => StreamSession) {
     this.fixedScid = deps.scid;
+    this.runner = deps.runner;
+    this.adapterSerial = deps.serial;
     this.sessionFactory =
       sessionFactory ??
       ((scid) =>
         new StreamSession({
           runner: deps.runner,
-          serial: deps.serial,
+          serial: this.serialForStream(),
           scid,
         }));
     this.manager = new StreamManager({
       adapter: {
         start: async (serial) => {
+          // Resolve "auto" to the single attached device ONCE (adb devices).
+          if (this.adapterSerial === "auto" && !this.resolvedSerial) {
+            this.resolvedSerial = await this.resolveAutoSerial();
+          }
+          const target = this.serialForStream();
           // One StreamSession per stream start; re-push+spawn every time
           // (the server self-deletes the jar — design §Live-validated facts).
           this.session = this.sessionFactory(this.fixedScid ?? freshScid());
-          await this.session.start();
+          try {
+            await this.session.start();
+          } catch (e) {
+            this.session = null;
+            throw e;
+          }
           // Surface the video size once the handshake arrives so /v1/state
           // and the control encoder see the real dimensions.
           void this.session.handshakeReady.then((hs) => {
@@ -85,6 +100,8 @@ export class StreamGateway implements GatewayContract {
             // path also fires loss. Either way the manager tears down, which
             // closes the fanout + viewers (bridge → 4409).
           });
+          void serial;
+          void target;
           return this.session;
         },
         stop: async () => {
@@ -99,6 +116,31 @@ export class StreamGateway implements GatewayContract {
     });
     // Keep the manager's snapshot video size live: it starts 0x0 and updates
     // from the session handshake (the manager reads AdapterSession.video).
+  }
+
+  private adapterSerial: string;
+
+  /** The serial the sessions actually use ("auto" → resolved). */
+  private serialForStream(): string {
+    if (this.adapterSerial !== "auto") return this.adapterSerial;
+    return this.resolvedSerial ?? "auto";
+  }
+
+  /** Auto-detect: the single `device`-state serial (mirrors REST resolveSerial). */
+  private async resolveAutoSerial(): Promise<string> {
+    const devices = await this.runner.run(["adb", "devices", "-l"]);
+    const lines = (devices.stdout ?? "").split("\n").slice(1);
+    const attached = lines
+      .map((l) => l.trim().split(/\s+/))
+      .filter((p) => p.length >= 2 && p[1] === "device")
+      .map((p) => p[0]!);
+    if (attached.length === 0) {
+      throw new Error("no Android device attached for streaming");
+    }
+    if (attached.length > 1) {
+      throw new Error(`multiple devices attached; set ANDROID_DEVICE (${attached.join(", ")})`);
+    }
+    return attached[0]!;
   }
 
   snapshot(): StreamStateView {
@@ -128,6 +170,21 @@ export class StreamGateway implements GatewayContract {
     }
     if (this.viewers.size >= MAX_VIEWERS) {
       return { ok: false, code: "CAP_REACHED", reason: "viewer cap reached (8)" };
+    }
+    // Resolve "auto" to the real serial BEFORE the manager starts — the
+    // manager's device-loss watchdog matches ITS serial against adb devices,
+    // so it must see the actual serial, never "auto".
+    if (this.adapterSerial === "auto" && !this.resolvedSerial) {
+      try {
+        this.resolvedSerial = await this.resolveAutoSerial();
+        this.manager.updateTargetSerial(this.resolvedSerial);
+      } catch (e) {
+        return {
+          ok: false,
+          code: "NO_DEVICE",
+          reason: e instanceof Error ? e.message : "no usable device for streaming",
+        };
+      }
     }
     const subscription = this.manager.subscribe();
     if (!subscription) {
