@@ -1,6 +1,16 @@
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { FIXTURE_VERSION, expectFixture, loadFixture, type FixtureEnvelope } from "./helpers/fixtures";
 import { MemoryRunner } from "./helpers/memoryRunner";
+
+/**
+ * sha256 of the pinned scrcpy-server jar under `assets/`. The parsers in
+ * `src/stream/` implement the wire protocol of THIS exact jar (design D1);
+ * bump only together with `assets/README.md` provenance + wire parsers.
+ */
+const SCRCPY_JAR_SHA256 = "deacb991ed2509715160ffdc7907e47b4160eb30d1566217e9047fd5b8850cae";
 
 describe("fixture helper — recorded real-output envelopes", () => {
   it("loads every recorded fixture and pins it to the CLI version", () => {
@@ -59,6 +69,20 @@ describe("fixture helper — recorded real-output envelopes", () => {
     // Version check happens at load time; simulate via the helper's re-record guard by asserting the pin constant
     expect(FIXTURE_VERSION).toBe("1.0.15985488");
     expect(stale.provenance?.version).not.toBe(FIXTURE_VERSION);
+  });
+
+  it("pins the bundled scrcpy-server.jar to its recorded sha256 (design D1)", () => {
+    const jar = readFileSync(join(import.meta.dir, "..", "assets", "scrcpy-server.jar"));
+    const digest = createHash("sha256").update(jar).digest("hex");
+    // The pinned hash comes from the official v4.1 release asset; a mismatch
+    // means the jar changed (upstream re-pin or accidental swap) and the
+    // wire parsers may no longer match. See assets/README.md re-pin steps.
+    expect(digest).toBe(SCRCPY_JAR_SHA256);
+    // A jar that passes sha256 but is an empty stub would break streaming —
+    // guards against accidental git-lfs pointer/zero-byte commits.
+    expect(jar.length).toBeGreaterThan(100_000);
+    // Must remain a valid ZIP (classes.dex inside), i.e. a real server jar.
+    expect(jar.subarray(0, 2).toString("latin1")).toBe("PK");
   });
 });
 

@@ -6,6 +6,35 @@ Real command output recorded from the Android SDK command-line tools on
 CLI/adb wrappers are verified against REAL tool output shapes — not
 hand-crafted doubles.
 
+## Stream fixtures
+
+`stream-meta.bin`, `stream-a-frames.bin`, and `stream-control.bin` are REAL
+bytes captured on **2026-08-16** from `emulator-5554` (Pixel 9 Pro AVD, API 36,
+model `sdk_gphone64_x86_64`) with the pinned `assets/scrcpy-server.jar` (v4.1,
+sha256 `deacb99…`, see `assets/README.md`):
+
+| File | What it holds |
+|------|---------------|
+| `stream-meta.bin` | 64B device meta + 4B codec id `h264` + 12B session meta (flags/430x960) + 12B frame-meta of the CONFIG AU |
+| `stream-a-frames.bin` | Frame-meta (12B) + Annex-B AU pairs: CONFIG (SPS+PPS) then IDR — the exact input `splitAnnexB()` consumes |
+| `stream-control.bin` | 32B `TYPE_INJECT_TOUCH_EVENT` tap at video-space (215, 480) |
+
+Each has a sibling `<name>.json` provenance envelope (same `fix-cli-real-output`
+style): `{ bytes, provenance: { tool: "scrcpy", version: "4.1", capturedAt,
+context, details: { serial, device, jarSha256, spawnCmd, videoSize } } }`.
+
+### Re-record procedure (stream fixtures)
+
+1. Boot an emulator (interactive home screen) and wait for boot completion.
+2. If the bundled jar changed, re-pin it first (`assets/README.md` steps) —
+   the wire layout is version-specific.
+3. `bun run record-stream-fixture` (uses `ANDROID_DEVICE` default
+   `emulator-5554`; overwrites the three `.bin` + `.json` pairs).
+4. Review the diff — a wire-shape change MUST land with matching parser
+   changes in `src/stream/wire.ts` in the SAME commit.
+
+## Envelopes
+
 Each envelope is `{ argv, stdout, stderr, exitCode, provenance: { tool,
 version, capturedAt, context } }`, where `argv` is the exact command that
 produced the output.
