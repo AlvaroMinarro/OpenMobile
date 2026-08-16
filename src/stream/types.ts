@@ -22,6 +22,22 @@ export const META_FLAG_SESSION = 0x8000_0000;
 /** 12-byte frame meta header: ptsAndFlags u64 + len u32. */
 export const FRAME_META_LEN = 12;
 
+/**
+ * Max bytes a single frame may declare (frame-meta `len`). Real frames at
+ * 8 Mbps/30fps are ~35 KB — 16 MiB is ~450× headroom, so the bound only
+ * trips on corruption or a hostile peer. Guards the assembler against
+ * `len=0xFFFFFFFF` → unbounded Buffer.concat accumulation → OOM (the bridge
+ * daemon runs REST + streaming; one OOM kills everything).
+ */
+export const MAX_FRAME = 16 * 1024 * 1024;
+
+/**
+ * Hard cap on the StreamAssembler accumulator: one legal frame (< MAX_FRAME)
+ * plus one in-flight data burst, before concat. ~32 MiB bounds memory even
+ * when a hostile peer sends oversized chunks with legal declared lengths.
+ */
+export const MAX_ACCUMULATED = MAX_FRAME * 2 + FRAME_META_LEN;
+
 /** Frame-meta flag bits inside ptsAndFlags (upper 2 bits). */
 export const FLAG_CONFIG = 1n << 62n; // bit62 — SPS/PPS AU
 export const FLAG_KEY = 1n << 61n; // bit61 — keyframe (IDR)
@@ -112,6 +128,8 @@ export interface FanoutRegistry {
   remove(id: string): boolean;
   /** Queue the frame for every registered viewer (drop-oldest per viewer). */
   broadcast(frame: Uint8Array): void;
+  /** Deliver a state message to every registered viewer (streaming/error). */
+  broadcastState(state: StreamStateMessage): void;
   /** Close and clear all viewers (session teardown). */
   closeAll(): void;
 }
@@ -158,3 +176,16 @@ export interface StreamSnapshot {
   reason?: string;
   viewers: number;
 }
+
+// ─── WS /v1/stream close codes (design §WS Contract) ────────────────────
+
+export const WS_CLOSE_CODES = {
+  /** Streaming unsupported: kill-switch off, gateway absent, degraded env. */
+  UNSUPPORTED: 4403,
+  /** No usable device (push/reverse/spawn failed — device gone at start). */
+  NO_DEVICE: 4404,
+  /** Viewer cap reached (design D4). */
+  VIEWER_CAP: 4429,
+  /** Device lost mid-stream (spec: Device lost mid-stream). */
+  DEVICE_LOST: 4409,
+} as const;

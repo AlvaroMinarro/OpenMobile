@@ -108,4 +108,28 @@ describe("stream fan-out — viewer registry (design D4)", () => {
     expect(a.open).toBe(false);
     expect(b.open).toBe(false);
   });
+
+  it("broadcastState delivers the state message to EVERY open viewer", () => {
+    const fan = new Fanout();
+    const a = new FakeViewer("a");
+    const b = new FakeViewer("b");
+    fan.add(a);
+    fan.add(b);
+    fan.broadcastState({ type: "state", state: "streaming" });
+    expect(a.states).toContainEqual({ type: "state", state: "streaming" });
+    expect(b.states).toContainEqual({ type: "state", state: "streaming" });
+  });
+
+  it("broadcastState removes closed viewers and skips them (no ghost delivery)", () => {
+    const fan = new Fanout();
+    const alive = new FakeViewer("alive");
+    const dead = new FakeViewer("dead");
+    fan.add(alive);
+    fan.add(dead);
+    dead.close();
+    fan.broadcastState({ type: "state", state: "error", reason: "device_lost" });
+    expect(alive.states).toHaveLength(1);
+    expect(dead.states).toHaveLength(0);
+    expect(fan.count).toBe(1); // the closed viewer was reaped
+  });
 });

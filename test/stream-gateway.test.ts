@@ -1,0 +1,343 @@
+import { describe, expect, it } from "bun:test";
+import { MemoryRunner } from "./helpers/memoryRunner";
+import { StreamGateway } from "../src/stream/gateway";
+import { StreamSession } from "../src/stream/daemon";
+import type { DaemonListener, DaemonSocket, SpawnHandle } from "../src/stream/daemon";
+import { MAX_VIEWERS } from "../src/stream/types";
+import type { StreamViewer, VideoHandshake } from "../src/stream/types";
+import type { StreamSubscribeResult } from "../src/bridge/server";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+const SERIAL = "emulator-5554";
+const FIX = join(import.meta.dir, "fixtures");
+
+class FakeSocket implements DaemonSocket {
+  destroyed = false;
+  private dataCbs: Array<(c: Uint8Array) => void> = [];
+  private closeCbs: Array<() => void> = [];
+  on(event: "data" | "close" | "error", cb: (...args: unknown[]) => void): void {
+    if (event === "data") this.dataCbs.push(cb as (c: Uint8Array) => void);
+    if (event === "close") this.closeCbs.push(cb as () => void);
+  }
+  write(_c: Uint8Array): void {
+    // replaced by tests that record writes
+  }
+  destroy(): void {
+    this.destroyed = true;
+  }
+  emitData(c: Uint8Array): void {
+    for (const cb of this.dataCbs) cb(c);
+  }
+  emitClose(): void {
+    for (const cb of this.closeCbs) cb();
+  }
+}
+
+class FakeListener implements DaemonListener {
+  port = 47000;
+  private connCbs: Array<(s: DaemonSocket) => void> = [];
+  listen(): Promise<void> {
+    return Promise.resolve();
+  }
+  onConnection(cb: (s: DaemonSocket) => void): void {
+    this.connCbs.push(cb);
+  }
+  close(): Promise<void> {
+    return Promise.resolve();
+  }
+  connect(): FakeSocket {
+    const s = new FakeSocket();
+    for (const cb of this.connCbs) cb(s);
+    return s;
+  }
+}
+
+class FakeSpawn implements SpawnHandle {
+  kill(): void {}
+  get exited(): Promise<number> {
+    return new Promise(() => {});
+  }
+}
+
+class Recorder implements StreamViewer {
+  frames: Uint8Array[] = [];
+  handshakes: unknown[] = [];
+  states: unknown[] = [];
+  /** Delivery order across kinds (handshake → state → close proving). */
+  log: string[] = [];
+  open = true;
+  closed = 0;
+  private readonly _id: string;
+  constructor(id: string) {
+    this._id = id;
+  }
+  get id(): string {
+    return this._id;
+  }
+  async sendHandshake(h: unknown): Promise<void> {
+    this.handshakes.push(h);
+    this.log.push("handshake");
+  }
+  async sendFrame(f: Uint8Array): Promise<void> {
+    this.frames.push(f);
+  }
+  async sendState(s: unknown): Promise<void> {
+    this.states.push(s);
+    this.log.push("state");
+  }
+  close(): void {
+    this.open = false;
+    this.closed++;
+    this.log.push("close");
+  }
+}
+
+function wireStream(): Buffer {
+  const meta = readFileSync(join(FIX, "stream-meta.bin"));
+  const frames = readFileSync(join(FIX, "stream-a-frames.bin"));
+  return Buffer.concat([meta.subarray(0, 80), frames]);
+}
+
+/** Session factory that uses the fake listener + spawn (no adb socket). */
+function sessionFactory(runner: MemoryRunner): { factory: (scid: string) => StreamSession; listener: FakeListener } {
+  const listener = new FakeListener();
+  return {
+    listener,
+    factory: (scid: string) =>
+      new StreamSession({
+        runner,
+        serial: SERIAL,
+        scid,
+        listenerFactory: () => listener,
+        spawnFn: () => new FakeSpawn(),
+      }),
+  };
+}
+
+function seedRunner(runner: MemoryRunner): void {
+  runner.expect(["adb", "-s", SERIAL, "push", join(import.meta.dir, "..", "assets", "scrcpy-server.jar"), "/data/local/tmp/scrcpy-server.jar"], {});
+  runner.expect(["adb", "-s", SERIAL, "reverse", `localabstract:scrcpy_`, "tcp:47000"], {}); // scid is random — match prefix
+}
+
+describe("StreamGateway — manager + session glue (design D5/D6)", () => {
+  it("starts the stream on first subscribe, delivers the handshake + AUs, and reports active", async () => {
+    const runner = new MemoryRunner();
+    const SCID = "feed1234";
+    runner.expect(["adb", "-s", SERIAL, "push", join(import.meta.dir, "..", "assets", "scrcpy-server.jar"), "/data/local/tmp/scrcpy-server.jar"], {});
+    runner.expect(["adb", "-s", SERIAL, "reverse", `localabstract:scrcpy_${SCID}`, "tcp:47000"], {});
+    const { factory, listener } = sessionFactory(runner);
+    const gw = new StreamGateway(
+      { runner, serial: SERIAL, enabled: true, scid: SCID, pollDevices: async () => [{ serial: SERIAL, state: "device" }] },
+      factory,
+    );
+    const v = new Recorder("v1");
+    const res = await gw.subscribeVideo(v);
+    expect(res.ok).toBe(true);
+    // Wait for the session to start (async adapter.start).
+    for (let i = 0; i < 50 && !gw.managerRef.snapshot().active; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(gw.managerRef.snapshot().active).toBe(true);
+    expect(runner.calls[0]).toEqual(["adb", "-s", SERIAL, "push", join(import.meta.dir, "..", "assets", "scrcpy-server.jar"), "/data/local/tmp/scrcpy-server.jar"]);
+    expect(runner.calls[1]).toEqual(["adb", "-s", SERIAL, "reverse", `localabstract:scrcpy_${SCID}`, "tcp:47000"]);
+    // Wait until the socket-facing viewer is attached to the session fanout
+    // (subscribe → attachToSession is async; frames before attach are dropped
+    // by design — client joins mid-GOP).
+    for (let i = 0; i < 50 && gw.attachedViewers < 1; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(gw.attachedViewers).toBe(1);
+    // The device connects its video socket → the daemon feeds the fanout.
+    const sock = listener.connect();
+    sock.emitData(wireStream());
+    // Handshake delivered once the CONFIG frame is parsed.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(v.handshakes).toHaveLength(1);
+    const hs = v.handshakes[0] as VideoHandshake;
+    expect(hs.width).toBe(430);
+    expect(hs.height).toBe(960);
+    // State message emitted AFTER the handshake (contract: handshake first,
+    // then state messages; the client configures its decoder from the
+    // handshake before acting on state).
+    for (let i = 0; i < 50 && v.states.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(v.states).toContainEqual({ type: "state", state: "streaming" });
+    expect(v.log.indexOf("state")).toBeGreaterThan(v.log.indexOf("handshake"));
+    // Frames broadcast (at least the SPS/PPS + some slices arrive).
+    expect(v.frames.length).toBeGreaterThanOrEqual(3);
+    // /v1/state snapshot reflects the active stream with the video size.
+    const snap = gw.snapshot();
+    expect(snap.active).toBe(true);
+    expect(snap.supported).toBe(true);
+    expect(snap.width).toBe(430);
+    expect(snap.height).toBe(960);
+    // Control writer is live.
+    const ctrl = gw.controlActive();
+    expect(ctrl).not.toBeNull();
+    const ctrlSock = listener.connect(); // conn2
+    const written: Uint8Array[] = [];
+    ctrlSock.write = (c: Uint8Array): void => {
+      written.push(c);
+    };
+    await ctrl!.write([Buffer.from([2, 0, 0, 0])]);
+    expect(written[0]![0]).toBe(2);
+    // Last unsubscribe tears the session down.
+    gw.unsubscribeVideo(v.id);
+    for (let i = 0; i < 50 && gw.managerRef.snapshot().active; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(gw.managerRef.snapshot().active).toBe(false);
+    expect(gw.snapshot().viewers).toBe(0);
+  });
+
+  it("reports UNSUPPORTED when the kill-switch is off", async () => {
+    const runner = new MemoryRunner();
+    const gw = new StreamGateway(
+      { runner, serial: SERIAL, enabled: false },
+      sessionFactory(runner).factory,
+    );
+    expect(gw.snapshot().supported).toBe(false);
+    const res = await gw.subscribeVideo(new Recorder("v2"));
+    expect(res).toEqual({ ok: false, code: "UNSUPPORTED", reason: "OPENMOBILE_STREAM=off" });
+  });
+
+it("sends an ERROR state to attached viewers on device loss, BEFORE the viewer sockets close (Device lost mid-stream)", async () => {
+    const runner = new MemoryRunner();
+    const SCID = "feed1234";
+    runner.expect(["adb", "-s", SERIAL, "push", join(import.meta.dir, "..", "assets", "scrcpy-server.jar"), "/data/local/tmp/scrcpy-server.jar"], {});
+    runner.expect(["adb", "-s", SERIAL, "reverse", `localabstract:scrcpy_${SCID}`, "tcp:47000"], {});
+    // Device present until the loss moment, then gone (watchdog tears down).
+    let devices: Array<{ serial: string; state: string }> = [{ serial: SERIAL, state: "device" }];
+    const { factory, listener } = sessionFactory(runner);
+    const gw = new StreamGateway(
+      {
+        runner,
+        serial: SERIAL,
+        enabled: true,
+        scid: SCID,
+        pollDevices: async () => devices as Array<{ serial: string; state: "device" }>,
+      },
+      factory,
+    );
+    const v = new Recorder("v1");
+    const res = await gw.subscribeVideo(v);
+    expect(res.ok).toBe(true);
+    for (let i = 0; i < 50 && !gw.managerRef.snapshot().active; i++) await new Promise((r) => setTimeout(r, 10));
+    for (let i = 0; i < 50 && gw.attachedViewers < 1; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(gw.attachedViewers).toBe(1);
+    // Stream is up: handshake + streaming state delivered.
+    const sock = listener.connect(); // conn1 = video
+    sock.emitData(wireStream());
+    for (let i = 0; i < 50 && v.handshakes.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(v.handshakes).toHaveLength(1);
+    expect(v.states).toContainEqual({ type: "state", state: "streaming" });
+    await new Promise((r) => setTimeout(r, 10));
+    const snapBefore = gw.snapshot();
+    expect(snapBefore.active).toBe(true);
+    // Device loss: the video socket drops → daemon fires loss → the gateway
+    // must emit the error state BEFORE anything closes the viewer.
+    sock.emitClose();
+    for (let i = 0; i < 50 && !v.states.some((s) => (s as { state?: string }).state === "error"); i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(v.states).toContainEqual({ type: "state", state: "error", reason: "device_lost" });
+    expect(v.open).toBe(true); // error state precedes the teardown close
+    expect(v.closed).toBe(0);
+    // Watchdog confirms the device is gone → teardown → viewers closed.
+    devices = [];
+    await gw.managerRef.poke();
+    expect(gw.snapshot().active).toBe(false);
+    expect(gw.snapshot().reason).toBe("device_lost");
+    expect(v.closed).toBe(1);
+    // Ordering proof: the error state was delivered before the close.
+    expect(v.log.indexOf("state")).toBeLessThan(v.log.indexOf("close"));
+    expect(v.log.lastIndexOf("state")).toBeGreaterThan(v.log.indexOf("handshake"));
+  });
+
+  it("does not register a viewer that closes while the auto serial is still resolving (connect race ghost)", async () => {
+    // Gate the `adb devices -l` run so subscribeVideo blocks mid-await.
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "devices", "-l"], { stdout: "List of devices attached\nemulator-5554\tdevice\n" });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const origRun = runner.run.bind(runner);
+    runner.run = async (argv, opts) => {
+      if (argv[1] === "devices") await gate;
+      return origRun(argv, opts);
+    }
+    const { factory } = sessionFactory(runner);
+    const gw = new StreamGateway(
+      { runner, serial: "auto", enabled: true, scid: "ghost-scid", pollDevices: async () => [] },
+      factory,
+    );
+    const v = new Recorder("racer");
+    const pending = gw.subscribeVideo(v); // blocked in resolveAutoSerial
+    v.close(); // the WS closes while the serial is still resolving
+    release();
+    const res = await pending;
+    expect(res.ok).toBe(false); // never registered
+    const snap = gw.managerRef.snapshot();
+    expect(snap.viewers).toBe(0); // manager refcount untouched — no ghost subscriber
+    expect(snap.active).toBe(false); // no session started for a ghost
+  });
+
+  it("rapid open/close cycles never consume viewer-cap slots (ghosts don't count toward the cap)", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "devices", "-l"], { stdout: "List of devices attached\nemulator-5554\tdevice\n" });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const origRun = runner.run.bind(runner);
+    runner.run = async (argv, opts) => {
+      if (argv[1] === "devices") await gate;
+      return origRun(argv, opts);
+    }
+    const { factory } = sessionFactory(runner);
+    const gw = new StreamGateway(
+      { runner, serial: "auto", enabled: true, scid: "ghost-scid", pollDevices: async () => [] },
+      factory,
+    );
+    // MAX_VIEWERS+1 rapid open/close cycles while the serial resolve is pending.
+    const pending: Array<Promise<StreamSubscribeResult>> = [];
+    for (let i = 0; i < MAX_VIEWERS + 1; i++) {
+      const v = new Recorder(`ghost-${i}`);
+      pending.push(gw.subscribeVideo(v));
+      v.close();
+    }
+    release();
+    const results = await Promise.all(pending);
+    for (const r of results) expect(r.ok).toBe(false);
+    expect(gw.managerRef.snapshot().viewers).toBe(0);
+    // A viewer that STAYS open still gets a slot — no cap was consumed.
+    const real = new Recorder("real");
+    const res = await gw.subscribeVideo(real);
+    expect(res.ok).toBe(true);
+    expect(gw.managerRef.snapshot().viewers).toBe(1);
+    gw.unsubscribeVideo(real.id);
+  });
+
+  it("never attaches a viewer whose WS closed while the session was still starting (late-close race)", async () => {
+    // Gate the session's push so adapter.start is in flight while the viewer
+    // closes; attachToSession polls for the session during that window.
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "-s", SERIAL, "push", join(import.meta.dir, "..", "assets", "scrcpy-server.jar"), "/data/local/tmp/scrcpy-server.jar"], {});
+    runner.expect(["adb", "-s", SERIAL, "reverse", "localabstract:scrcpy_late-scid", "tcp:47000"], {});
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const origRun = runner.run.bind(runner);
+    runner.run = async (argv, opts) => {
+      if (argv.includes("push")) await gate;
+      return origRun(argv, opts);
+    }
+    const { factory } = sessionFactory(runner);
+    const gw = new StreamGateway(
+      { runner, serial: SERIAL, enabled: true, scid: "late-scid", pollDevices: async () => [] },
+      factory,
+    );
+    const v = new Recorder("late-close");
+    const res = await gw.subscribeVideo(v);
+    expect(res.ok).toBe(true);
+    // The WS closes while the session is still starting (bridge would call
+    // unsubscribeVideo from its close handler).
+    v.close();
+    gw.unsubscribeVideo(v.id);
+    release();
+    // Let attachToSession run its full post-start attach attempt window
+    // (retry polls × 25ms) after the close landed.
+    await new Promise((r) => setTimeout(r, 700));
+    expect(gw.attachedViewers).toBe(0); // the dead viewer never reached the fanout
+  });
+});

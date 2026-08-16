@@ -154,6 +154,67 @@ describe("GET /v1/state", () => {
   });
 });
 
+describe("GET /v1/state — additive stream fields (design D6)", () => {
+  it("includes stream {supported, active, viewers} when a provider is wired", async () => {
+    const { deps } = makeDeps({
+      streamStatusProvider: () => ({ supported: true, active: true, viewers: 2, width: 430, height: 960 }),
+    });
+    const srv = makeInMemoryServer(deps);
+    try {
+      const res = await req(srv, "/v1/state");
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        stream?: {
+          supported: boolean;
+          active: boolean;
+          viewers: number;
+          width?: number;
+          height?: number;
+        };
+      };
+      expect(body.stream).toEqual({ supported: true, active: true, viewers: 2, width: 430, height: 960 });
+    } finally {
+      srv.stop();
+    }
+  });
+
+  it("reports stream.supported:false and active:false when the env kill-switch is off", async () => {
+    const { deps } = makeDeps({
+      streamStatusProvider: () => ({ supported: false, active: false, viewers: 0 }),
+    });
+    const srv = makeInMemoryServer(deps);
+    try {
+      const res = await req(srv, "/v1/state");
+      const body = (await res.json()) as { stream?: { supported: boolean; active: boolean; viewers: number } };
+      expect(body.stream).toEqual({ supported: false, active: false, viewers: 0 });
+    } finally {
+      srv.stop();
+    }
+  });
+
+  it("keeps all pre-existing state fields intact alongside stream", async () => {
+    const { deps, state } = makeDeps({
+      streamStatusProvider: () => ({ supported: true, active: false, viewers: 0 }),
+    });
+    state.devices = [{ serial: "emulator-5554", state: "device", model: "Pixel_9_Pro" }];
+    state.emulators = [{ name: "Pixel_9_Pro", running: true }];
+    const srv = makeInMemoryServer(deps);
+    try {
+      const res = await req(srv, "/v1/state");
+      const body = (await res.json()) as Record<string, unknown>;
+      // Locked contract fields must remain present and unchanged.
+      expect(body.schema).toBe("v1");
+      expect(body.bridge).toEqual({ version: "test", pid: 1234 });
+      expect(body.selected).toEqual({ serial: "emulator-5554", state: "device", model: "Pixel_9_Pro" });
+      expect(body.frame).toBeNull();
+      expect(body.devices).toHaveLength(1);
+      expect(body.emulators).toHaveLength(1);
+    } finally {
+      srv.stop();
+    }
+  });
+});
+
 describe("GET /v1/screenshot", () => {
   it("returns 200 PNG bytes", async () => {
     const { deps, state } = makeDeps();
