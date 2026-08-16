@@ -14,7 +14,7 @@ import { buildAllowlist, ALLOWLIST_PATTERNS } from "../src/stream/rtc/allowlist"
  */
 describe("allowlist generation — -grpc-allowlist golden (design D6)", () => {
   it("buildAllowlist() matches the LIVE-verified golden file byte-for-byte", () => {
-    const golden = readFileSync(join(import.meta.dir, "..", "fixtures", "om_allowlist.json"), "utf8");
+    const golden = readFileSync(join(import.meta.dir, "fixtures", "om_allowlist.json"), "utf8");
     expect(JSON.stringify(buildAllowlist(), null, 2)).toBe(golden);
   });
 
