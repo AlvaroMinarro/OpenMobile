@@ -12,6 +12,7 @@ import {
   MAX_VIEWERS,
   VIEWER_QUEUE_DEPTH,
   type FanoutRegistry,
+  type StreamStateMessage,
   type StreamViewer,
 } from "./types";
 
@@ -69,6 +70,25 @@ export class Fanout implements FanoutRegistry {
       }
     } finally {
       this.draining.delete(id);
+    }
+  }
+
+  /**
+   * Deliver a state message to every registered viewer. Advisory (design D2):
+   * a viewer that fails to accept it is reaped — the session teardown closes
+   * the socket anyway.
+   */
+  broadcastState(state: StreamStateMessage): void {
+    for (const [id, viewer] of [...this.viewers]) {
+      if (!viewer.open) {
+        this.remove(id);
+        continue;
+      }
+      try {
+        void viewer.sendState(state);
+      } catch {
+        // viewer write failure — closeAll() on teardown handles it
+      }
     }
   }
 
