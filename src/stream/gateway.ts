@@ -95,10 +95,12 @@ export class StreamGateway implements GatewayContract {
           void this.session.handshakeReady.then((hs) => {
             this.videoInfo = { width: hs.width, height: hs.height };
           }).catch(() => {});
-          this.session.onLoss(() => {
-            // The manager's watchdog polls adb; the session's socket-close
-            // path also fires loss. Either way the manager tears down, which
-            // closes the fanout + viewers (bridge → 4409).
+          // Device loss → tell the attached viewers BEFORE the session tears
+          // down (the teardown closes the fanout → bridge closes 4409; the
+          // error state must land first — spec: Device lost mid-stream).
+          const session = this.session;
+          session.onLoss(() => {
+            session.fanout.broadcastState({ type: "state", state: "error", reason: "device_lost" });
           });
           void serial;
           void target;
@@ -258,8 +260,16 @@ export class StreamGateway implements GatewayContract {
     void subscriptionId;
     // Handshake: deliver once available. If the session dies before the
     // handshake, the fanout closeAll (on teardown) closes the viewer anyway.
+    // The STREAMING state follows the handshake (contract order: handshake
+    // first, then state messages — the client configures its decoder from
+    // the handshake SPS/PPS before acting on state).
     if (session.handshakeReady) {
-      session.handshakeReady.then((hs) => viewer.sendHandshake(hs)).catch(() => {});
+      void session.handshakeReady
+        .then(async (hs) => {
+          await viewer.sendHandshake(hs);
+          await viewer.sendState({ type: "state", state: "streaming" });
+        })
+        .catch(() => {});
     }
   }
 }

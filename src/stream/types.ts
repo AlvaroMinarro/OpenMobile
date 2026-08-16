@@ -128,6 +128,8 @@ export interface FanoutRegistry {
   remove(id: string): boolean;
   /** Queue the frame for every registered viewer (drop-oldest per viewer). */
   broadcast(frame: Uint8Array): void;
+  /** Deliver a state message to every registered viewer (streaming/error). */
+  broadcastState(state: StreamStateMessage): void;
   /** Close and clear all viewers (session teardown). */
   closeAll(): void;
 }

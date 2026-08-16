@@ -308,6 +308,9 @@ export class StreamSession {
 
   private lose(reason: string): void {
     if (this.stopped) return;
+    // Loss fires from BOTH the video-socket close and the spawn exit — report
+    // it exactly once (the gateway emits ONE error state to viewers).
+    if (this.stateReason !== undefined) return;
     this.stateReason = "device_lost";
     this.lossCb?.();
   }

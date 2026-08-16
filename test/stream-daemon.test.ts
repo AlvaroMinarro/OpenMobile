@@ -347,6 +347,34 @@ describe("StreamSession — push→listen→reverse→spawn→read-loop→fan-ou
     session.close();
   });
 
+  it("sendControl REJECTS when the control socket closed mid-stream (Control injection failure)", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "-s", SERIAL, "push", expectJarPath(), "/data/local/tmp/scrcpy-server.jar"], {});
+    runner.expect(["adb", "-s", SERIAL, "reverse", `localabstract:scrcpy_${SCID}`, "tcp:47832"], {});
+    const { session, listener } = makeSession({ runner });
+    await session.start();
+    listener.connect(); // conn1 = video
+    const ctrl = listener.connect(); // conn2 = control
+    ctrl.emitClose(); // the control socket breaks mid-stream
+    await expect(session.sendControl(Buffer.from([2, 0, 0, 0]))).rejects.toThrow(
+      /control socket is not connected/,
+    );
+    session.close();
+  });
+
+  it("sendControl REJECTS when the control socket never connected", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "-s", SERIAL, "push", expectJarPath(), "/data/local/tmp/scrcpy-server.jar"], {});
+    runner.expect(["adb", "-s", SERIAL, "reverse", `localabstract:scrcpy_${SCID}`, "tcp:47832"], {});
+    const { session, listener } = makeSession({ runner });
+    await session.start();
+    listener.connect(); // conn1 = video only
+    await expect(session.sendControl(Buffer.from([2, 0, 0, 0]))).rejects.toThrow(
+      /control socket is not connected/,
+    );
+    session.close();
+  });
+
   it("reports device_lost via onLoss when the spawn exits non-zero (server crash)", async () => {
     const runner = new MemoryRunner();
     runner.expect(["adb", "-s", SERIAL, "push", expectJarPath(), "/data/local/tmp/scrcpy-server.jar"], {});
@@ -376,6 +404,26 @@ describe("StreamSession — push→listen→reverse→spawn→read-loop→fan-ou
     sock.emitClose();
     expect(losses).toEqual(["lost"]);
     expect(session.stateReason).toBe("device_lost");
+    session.close();
+  });
+
+it("fires onLoss ONCE when BOTH the spawn exit and the video socket close signal loss", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "-s", SERIAL, "push", expectJarPath(), "/data/local/tmp/scrcpy-server.jar"], {});
+    runner.expect(["adb", "-s", SERIAL, "reverse", `localabstract:scrcpy_${SCID}`, "tcp:47832"], {});
+    // Spawn exits non-zero (server crash) AND the video socket closes — the
+    // daemon must report device_lost exactly once (the gateway emits ONE
+    // error state; duplicate loss would double-emit).
+    const { session, listener } = makeSession({ runner, exitCode: 1 });
+    const losses: string[] = [];
+    session.onLoss(() => losses.push("lost"));
+    await session.start();
+    const sock = listener.connect(); // video
+    sock.emitClose(); // socket-close loss
+    await Promise.resolve(); // let the spawn-exit loss fire too
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(losses).toEqual(["lost"]);
     session.close();
   });
 

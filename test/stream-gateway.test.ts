@@ -64,6 +64,8 @@ class Recorder implements StreamViewer {
   frames: Uint8Array[] = [];
   handshakes: unknown[] = [];
   states: unknown[] = [];
+  /** Delivery order across kinds (handshake → state → close proving). */
+  log: string[] = [];
   open = true;
   closed = 0;
   private readonly _id: string;
@@ -75,16 +77,19 @@ class Recorder implements StreamViewer {
   }
   async sendHandshake(h: unknown): Promise<void> {
     this.handshakes.push(h);
+    this.log.push("handshake");
   }
   async sendFrame(f: Uint8Array): Promise<void> {
     this.frames.push(f);
   }
   async sendState(s: unknown): Promise<void> {
     this.states.push(s);
+    this.log.push("state");
   }
   close(): void {
     this.open = false;
     this.closed++;
+    this.log.push("close");
   }
 }
 
@@ -148,6 +153,12 @@ describe("StreamGateway — manager + session glue (design D5/D6)", () => {
     const hs = v.handshakes[0] as VideoHandshake;
     expect(hs.width).toBe(430);
     expect(hs.height).toBe(960);
+    // State message emitted AFTER the handshake (contract: handshake first,
+    // then state messages; the client configures its decoder from the
+    // handshake before acting on state).
+    for (let i = 0; i < 50 && v.states.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(v.states).toContainEqual({ type: "state", state: "streaming" });
+    expect(v.log.indexOf("state")).toBeGreaterThan(v.log.indexOf("handshake"));
     // Frames broadcast (at least the SPS/PPS + some slices arrive).
     expect(v.frames.length).toBeGreaterThanOrEqual(3);
     // /v1/state snapshot reflects the active stream with the video size.
@@ -182,6 +193,59 @@ describe("StreamGateway — manager + session glue (design D5/D6)", () => {
     expect(gw.snapshot().supported).toBe(false);
     const res = await gw.subscribeVideo(new Recorder("v2"));
     expect(res).toEqual({ ok: false, code: "UNSUPPORTED", reason: "OPENMOBILE_STREAM=off" });
+  });
+
+it("sends an ERROR state to attached viewers on device loss, BEFORE the viewer sockets close (Device lost mid-stream)", async () => {
+    const runner = new MemoryRunner();
+    const SCID = "feed1234";
+    runner.expect(["adb", "-s", SERIAL, "push", join(import.meta.dir, "..", "assets", "scrcpy-server.jar"), "/data/local/tmp/scrcpy-server.jar"], {});
+    runner.expect(["adb", "-s", SERIAL, "reverse", `localabstract:scrcpy_${SCID}`, "tcp:47000"], {});
+    // Device present until the loss moment, then gone (watchdog tears down).
+    let devices: Array<{ serial: string; state: string }> = [{ serial: SERIAL, state: "device" }];
+    const { factory, listener } = sessionFactory(runner);
+    const gw = new StreamGateway(
+      {
+        runner,
+        serial: SERIAL,
+        enabled: true,
+        scid: SCID,
+        pollDevices: async () => devices as Array<{ serial: string; state: "device" }>,
+      },
+      factory,
+    );
+    const v = new Recorder("v1");
+    const res = await gw.subscribeVideo(v);
+    expect(res.ok).toBe(true);
+    for (let i = 0; i < 50 && !gw.managerRef.snapshot().active; i++) await new Promise((r) => setTimeout(r, 10));
+    for (let i = 0; i < 50 && gw.attachedViewers < 1; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(gw.attachedViewers).toBe(1);
+    // Stream is up: handshake + streaming state delivered.
+    const sock = listener.connect(); // conn1 = video
+    sock.emitData(wireStream());
+    for (let i = 0; i < 50 && v.handshakes.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(v.handshakes).toHaveLength(1);
+    expect(v.states).toContainEqual({ type: "state", state: "streaming" });
+    await new Promise((r) => setTimeout(r, 10));
+    const snapBefore = gw.snapshot();
+    expect(snapBefore.active).toBe(true);
+    // Device loss: the video socket drops → daemon fires loss → the gateway
+    // must emit the error state BEFORE anything closes the viewer.
+    sock.emitClose();
+    for (let i = 0; i < 50 && !v.states.some((s) => (s as { state?: string }).state === "error"); i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(v.states).toContainEqual({ type: "state", state: "error", reason: "device_lost" });
+    expect(v.open).toBe(true); // error state precedes the teardown close
+    expect(v.closed).toBe(0);
+    // Watchdog confirms the device is gone → teardown → viewers closed.
+    devices = [];
+    await gw.managerRef.poke();
+    expect(gw.snapshot().active).toBe(false);
+    expect(gw.snapshot().reason).toBe("device_lost");
+    expect(v.closed).toBe(1);
+    // Ordering proof: the error state was delivered before the close.
+    expect(v.log.indexOf("state")).toBeLessThan(v.log.indexOf("close"));
+    expect(v.log.lastIndexOf("state")).toBeGreaterThan(v.log.indexOf("handshake"));
   });
 
   it("does not register a viewer that closes while the auto serial is still resolving (connect race ghost)", async () => {
