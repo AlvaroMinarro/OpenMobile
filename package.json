@@ -15,7 +15,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./plugin": "./src/plugin/index.ts",
-    "./bridge": "./src/bridge/main.ts"
+    "./bridge": "./src/bridge/main.ts",
+    "./stream-client": "./src/stream/client/index.ts"
   },
   "scripts": {
     "test": "bun test",

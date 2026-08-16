@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { parseFrameMeta } from "../src/stream/wire";
 import { AnnexBSplitter, classifyNal } from "../src/stream/client/annexb";
 import { DecoderSession, type EncodedChunkLike, type VideoDecoderConfigLike } from "../src/stream/client/decoder";
+import { createStreamClient, type StreamClientStatus, type VideoSocketLike } from "../src/stream/client/index";
 import { isStreamSupported } from "../src/stream/client/support";
 import type { VideoHandshake } from "../src/stream/types";
 
@@ -323,5 +324,192 @@ describe("client stream support (task 3.3)", () => {
     } finally {
       g.VideoDecoder = saved;
     }
+  });
+});
+
+// ─── 3.4 client end-to-end (mocked WS + recorded fixture AUs) ────────────
+
+/** Minimal WebSocket double with handler slots the test drives by hand. */
+class FakeSocket implements VideoSocketLike {
+  binaryType = "arraybuffer";
+  onopen: (() => void) | null = null;
+  onmessage: ((ev: { data: unknown }) => void) | null = null;
+  onclose: ((ev?: { code?: number }) => void) | null = null;
+  onerror: ((ev?: unknown) => void) | null = null;
+  sent: (string | ArrayBuffer | Uint8Array)[] = [];
+  closed: { code?: number; reason?: string } | null = null;
+  url: string;
+
+  constructor(url: string) {
+    this.url = url;
+  }
+
+  send(data: string | ArrayBuffer | Uint8Array): void {
+    this.sent.push(data);
+  }
+
+  close(code?: number, reason?: string): void {
+    this.closed = { code, reason };
+  }
+}
+
+/** All AUs of a raw fixture (frame-meta + AU pairs). */
+function collectAUs(raw: Uint8Array): Uint8Array[] {
+  const aus: Uint8Array[] = [];
+  let off = 0;
+  while (off + 12 <= raw.length) {
+    const fm = parseFrameMeta(raw.subarray(off, off + 12));
+    const end = off + 12 + fm.len;
+    aus.push(raw.subarray(off + 12, end));
+    off = end;
+  }
+  return aus;
+}
+
+/** NAL count inside one Annex-B AU (what the client emits per message). */
+function nalCount(au: Uint8Array): number {
+  const s = new AnnexBSplitter();
+  s.push(au);
+  return s.drain(true).length;
+}
+
+/** Simulate a WS text frame. */
+function fireText(sock: FakeSocket, data: string): void {
+  sock.onmessage?.({ data });
+}
+
+/** Simulate a WS binary frame (fresh ArrayBuffer — binaryType=arraybuffer). */
+function fireBinary(sock: FakeSocket, au: Uint8Array): void {
+  const copy = Uint8Array.from(au);
+  sock.onmessage?.({ data: copy.buffer });
+}
+
+/** Flush microtasks + pending setTimeout(0) chains. */
+const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+
+describe("client end-to-end (task 3.4)", () => {
+  it("connects, configures from handshake, decodes recorded AUs, draws and accepts input", async () => {
+    const video = new FakeSocket("ws://127.0.0.1:8765/v1/stream/video");
+    const control = new FakeSocket("");
+    const decoder = new FakeDecoder();
+    const canvas = new FakeCanvas();
+    const statuses: StreamClientStatus[] = [];
+    const client = createStreamClient({
+      url: "ws://127.0.0.1:8765/v1/stream/video",
+      canvas,
+      onStatus: (s) => statuses.push(s),
+      deps: {
+        createVideoSocket: () => video,
+        createControlSocket: (url) => {
+          control.url = url;
+          return control;
+        },
+        decoder,
+        support: () => true,
+      },
+    });
+    const msgs: unknown[] = [];
+    client.onMessage = (m) => msgs.push(m);
+
+    await client.open();
+    expect(statuses[0]).toEqual({ phase: "connecting" });
+    // Control URL derived from the video URL (/video → /control).
+    expect(control.url).toBe("ws://127.0.0.1:8765/v1/stream/control");
+    video.onopen?.();
+    control.onopen?.();
+
+    // AUs before the handshake are dropped (the server sends handshake first).
+    const aus = collectAUs(fixture("stream-a-frames.bin"));
+    fireBinary(video, aus[0]!);
+    expect(decoder.chunks).toHaveLength(0);
+
+    // Handshake → decoder configured from SPS/PPS; videoSize known.
+    fireText(video, JSON.stringify(HS));
+    await tick();
+    expect(decoder.configs).toHaveLength(1);
+    expect(decoder.configs[0]!.codec).toBe("avc1.42c029");
+    expect(client.videoSize).toEqual({ width: 430, height: 960 });
+    expect(statuses).toContainEqual({ phase: "handshake" });
+
+    // Every recorded AU reaches the decoder as NAL chunks (key for IDR).
+    let expectedNals = 0;
+    for (const au of aus) {
+      fireBinary(video, au);
+      expectedNals += nalCount(au);
+    }
+    expect(decoder.chunks.length).toBe(expectedNals);
+    expect(decoder.chunks.some((c) => c.type === "key")).toBe(true);
+
+    // A platform-emitted frame is drawn onto the canvas + freed; streaming.
+    const frame = FrameDouble.of(430, 960);
+    decoder.emit(frame);
+    expect(decoder.chunks.length).toBe(expectedNals); // chunks are not consumed by emit
+    expect(canvas.drawCalls.length).toBeGreaterThanOrEqual(1);
+    expect(frame.closed).toBe(true);
+    expect(statuses).toContainEqual({ phase: "streaming" });
+
+    // sendInput → JSON over the control socket; ack surfaces on onMessage.
+    expect(client.sendInput({ type: "inject", event: "tap", x: 215, y: 480 })).toBe(true);
+    expect(JSON.parse(control.sent[0] as string)).toEqual({ type: "inject", event: "tap", x: 215, y: 480 });
+    fireText(control, JSON.stringify({ type: "ack" }));
+    expect(msgs).toContainEqual({ type: "ack" });
+
+    // Server state messages surface on onMessage.
+    fireText(video, JSON.stringify({ type: "state", state: "streaming" }));
+    expect(msgs).toContainEqual({ type: "state", state: "streaming" });
+    expect(client.videoSize).toEqual({ width: 430, height: 960 });
+
+    // close() closes both sockets + the decoder and reports closed.
+    client.close();
+    await tick();
+    expect(video.closed).not.toBeNull();
+    expect(control.closed).not.toBeNull();
+    expect(decoder.state).toBe("closed");
+    expect(statuses[statuses.length - 1]).toEqual({ phase: "closed" });
+  });
+
+  it("reports unsupported before connecting so the caller falls back to polling", async () => {
+    const video = new FakeSocket("ws://127.0.0.1:8765/v1/stream/video");
+    const control = new FakeSocket("ws://127.0.0.1:8765/v1/stream/control");
+    const decoder = new FakeDecoder();
+    const statuses: StreamClientStatus[] = [];
+    const client = createStreamClient({
+      url: "ws://127.0.0.1:8765/v1/stream/video",
+      canvas: new FakeCanvas(),
+      onStatus: (s) => statuses.push(s),
+      deps: {
+        createVideoSocket: () => video,
+        createControlSocket: () => control,
+        decoder,
+        support: () => false,
+      },
+    });
+    await client.open();
+    expect((statuses[0] as { phase: "error"; message: string }).phase).toBe("error");
+    expect((statuses[0] as { phase: "error"; message: string }).message).toMatch(/polling/);
+    expect(decoder.configs).toHaveLength(0); // never configured
+    expect(video.sent).toHaveLength(0); // nothing sent
+    expect(client.sendInput({ type: "inject", event: "tap", x: 1, y: 2 })).toBe(false);
+  });
+
+  it("surfaces the server close code (device lost 4409) via onStatus", async () => {
+    const video = new FakeSocket("ws://127.0.0.1:8765/v1/stream/video");
+    const control = new FakeSocket("ws://127.0.0.1:8765/v1/stream/control");
+    const statuses: StreamClientStatus[] = [];
+    const client = createStreamClient({
+      url: "ws://127.0.0.1:8765/v1/stream/video",
+      canvas: new FakeCanvas(),
+      onStatus: (s) => statuses.push(s),
+      deps: {
+        createVideoSocket: () => video,
+        createControlSocket: () => control,
+        decoder: new FakeDecoder(),
+        support: () => true,
+      },
+    });
+    await client.open();
+    expect(statuses[0]).toEqual({ phase: "connecting" });
+    video.onclose?.({ code: 4409 });
+    expect(statuses[statuses.length - 1]).toEqual({ phase: "closed", code: 4409 });
   });
 });
