@@ -158,3 +158,16 @@ export interface StreamSnapshot {
   reason?: string;
   viewers: number;
 }
+
+// ─── WS /v1/stream close codes (design §WS Contract) ────────────────────
+
+export const WS_CLOSE_CODES = {
+  /** Streaming unsupported: kill-switch off, gateway absent, degraded env. */
+  UNSUPPORTED: 4403,
+  /** No usable device (push/reverse/spawn failed — device gone at start). */
+  NO_DEVICE: 4404,
+  /** Viewer cap reached (design D4). */
+  VIEWER_CAP: 4429,
+  /** Device lost mid-stream (spec: Device lost mid-stream). */
+  DEVICE_LOST: 4409,
+} as const;
