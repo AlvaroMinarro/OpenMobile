@@ -150,6 +150,46 @@ tears down when the last one disconnects or the device is lost (watchdog).
   control socket; otherwise `adb shell input` (REST) — same coordinate
   semantics and range validation in both modes.
 
+### Browser client (`./stream-client`)
+
+Framework-free browser helper implementing the contract above (design D7).
+Chromium-based browsers decode H.264 in real time with WebCodecs; Firefox and
+platforms without an H.264 decoder report `false` from `isStreamSupported()`
+and the surface falls back to polling (`/v1/screenshot` driven).
+
+```ts
+import { createStreamClient, isStreamSupported } from "@openmobile/android-device-bridge/stream-client";
+
+if (!isStreamSupported()) {
+  // polling fallback (REST screenshot + /v1/input/*)
+  return;
+}
+const client = createStreamClient({
+  url: "ws://127.0.0.1:8765/v1/stream/video", // control URL derived (/video → /control)
+  canvas, // caller-owned <canvas>
+  onStatus: (s) => { /* connecting | handshake | streaming | {error,message} | {closed,code?} */ },
+});
+await client.open();
+client.sendInput({ type: "inject", event: "tap", x: 215, y: 480 }); // video-space coords
+```
+
+- `open()` gates on the support probe and reports `{phase:"error"}` when
+  unsupported, so the caller can switch to polling before opening sockets.
+- `sendInput()` returns `false` when the control socket is not open (no
+  active stream) — route input through `POST /v1/input/*` in that case.
+- `onMessage` (optional, assignable) receives server contract messages:
+  `{type:"state",…}` on the video socket, `{type:"ack"}` / `{type:"error",…}`
+  on the control socket. `client.videoSize` exposes the handshake size once
+  the stream is configured.
+- Close codes surface through `onStatus` (`4403/4404/4429/4409`).
+- **Secret caveat**: browsers cannot attach the `X-OpenMobile-Secret` header
+  to WebSocket upgrades — keep `OPENMOBILE_BRIDGE_SECRET` unset (the default;
+  loopback is the trust boundary) when using the browser client.
+
+Demo page: `examples/stream.html` (open it in a browser while the bridge
+streams; tap the canvas to inject taps). The client bundle it imports is
+generated — regenerate with `bun run build:stream-demo`.
+
 ## License
 
 MIT

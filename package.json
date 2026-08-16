@@ -15,13 +15,15 @@
   "exports": {
     ".": "./src/index.ts",
     "./plugin": "./src/plugin/index.ts",
-    "./bridge": "./src/bridge/main.ts"
+    "./bridge": "./src/bridge/main.ts",
+    "./stream-client": "./src/stream/client/index.ts"
   },
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "record-fixtures": "bun scripts/record-fixtures.ts",
-    "record-stream-fixture": "bun scripts/record-stream-fixture.ts"
+    "record-stream-fixture": "bun scripts/record-stream-fixture.ts",
+    "build:stream-demo": "bun build src/stream/client/index.ts --outfile examples/stream-client.js --target browser"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
