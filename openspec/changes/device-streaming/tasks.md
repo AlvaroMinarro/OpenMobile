@@ -51,8 +51,8 @@ Chain strategy: feature-branch-chain
 
 ## Phase 3: Browser Client — PR 3 (D7)
 
-- [ ] 3.1 `src/stream/client/annexb.ts`: AU splitter with offset accumulation, `chunkStart/chunkOffset` surface
-- [ ] 3.2 `src/stream/client/renderer.ts`: WebCodecs `VideoDecoder`→canvas; SPS/PPS from handshake; config+first frame concat buffering
-- [ ] 3.3 `src/stream/client/index.ts`: `openVideoStream`/`sendControl`, `stream.supported` detection (Firefox → `false` → polling), dispatch API; package.json exports `./stream-client`
-- [ ] 3.4 RED→GREEN `test/stream-client.test.ts` (mocked WS/decoder): splitter unit, handshake ordering, error paths, fallback flag
-- [ ] 3.5 Docs: README streaming section (WS contract, env var, demo page); commit `feat(stream-client): WebCodecs browser helper`
+- [x] 3.1 `src/stream/client/annexb.ts`: Annex-B AU splitter (4/3-byte start codes, cross-message buffering, NAL classification SPS/PPS/IDR/slice)
+- [x] 3.2 `src/stream/client/decoder.ts`: WebCodecs `VideoDecoder`→canvas session; `avc1.PPCCLL` + Annex-B SPS/PPS config from handshake; start-code-prefixed chunks; defensive frame free
+- [x] 3.3 `src/stream/client/support.ts`: `isStreamSupported()` — WebCodecs H.264 probe (Firefox → `false` → polling fallback)
+- [x] 3.4 `src/stream/client/index.ts`: `createStreamClient({url,canvas,onStatus})` → `{open,close,sendInput,onMessage}` + control URL derivation; package.json exports `./stream-client`
+- [x] 3.5 RED→GREEN `test/stream-client.test.ts` (mocked WS/decoder): splitter fixture, handshake ordering, error paths, fallback flag, close codes; `examples/stream.html` demo + `examples/stream-client.js` bundle; README browser-client docs

@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenMobile — device-streaming demo</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        padding: 1.5rem;
+        font: 14px/1.5 system-ui, sans-serif;
+        background: #111;
+        color: #ddd;
+      }
+      h1 {
+        font-size: 1.1rem;
+        margin: 0 0 0.25rem;
+      }
+      p {
+        margin: 0.25rem 0;
+      }
+      #status {
+        font-family: ui-monospace, monospace;
+        font-size: 0.85rem;
+        color: #8be9fd;
+        min-height: 1.2em;
+      }
+      #status.error {
+        color: #ff6b6b;
+      }
+      #status.streaming {
+        color: #50fa7b;
+      }
+      .canvas-wrap {
+        margin-top: 0.75rem;
+        display: inline-block;
+        border: 1px solid #444;
+        border-radius: 8px;
+        overflow: hidden;
+        background: #000;
+      }
+      canvas {
+        display: block;
+        max-width: min(860px, 92vw);
+        width: auto;
+        height: auto;
+        cursor: crosshair;
+      }
+      .hint {
+        margin-top: 0.75rem;
+        font-size: 0.85rem;
+        color: #999;
+        max-width: 60ch;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>OpenMobile — live device stream</h1>
+    <p>WebCodecs H.264 decode of the bridge <code>/v1/stream/video</code> WebSocket.</p>
+    <p id="status" class="error">starting…</p>
+    <div class="canvas-wrap">
+      <canvas id="screen" width="430" height="960"></canvas>
+    </div>
+    <p class="hint">
+      Tap the canvas to inject a tap through the control socket. Query params:
+      <code>?url=</code> overrides the video WS URL (default
+      <code>ws://127.0.0.1:8765/v1/stream/video</code>). Requires a Chromium-based
+      browser (WebCodecs+AVC); Firefox shows the polling-fallback status. The
+      bridge must run with streaming enabled and NO
+      <code>OPENMOBILE_BRIDGE_SECRET</code> — browsers cannot attach the
+      <code>X-OpenMobile-Secret</code> header to WebSocket upgrades.
+    </p>
+    <script type="module">
+      import { createStreamClient, isStreamSupported } from "./stream-client.js";
+
+      const canvas = document.getElementById("screen");
+      const statusEl = document.getElementById("status");
+      const params = new URLSearchParams(location.search);
+      const url = params.get("url") ?? "ws://127.0.0.1:8765/v1/stream/video";
+
+      const setStatus = (text, kind) => {
+        statusEl.textContent = text;
+        statusEl.className = kind ?? "";
+      };
+
+      if (!isStreamSupported()) {
+        setStatus(
+          "WebCodecs H.264 decode unsupported in this browser — fall back to polling (REST /v1/screenshot).",
+          "error",
+        );
+      }
+
+      const client = createStreamClient({
+        url,
+        canvas,
+        onStatus: (s) => {
+          if (s.phase === "streaming") {
+            setStatus("streaming — tap the canvas to interact", "streaming");
+            if (client.videoSize) {
+              // Fit the canvas to the real video size once known (aspect-correct taps).
+              canvas.width = client.videoSize.width;
+              canvas.height = client.videoSize.height;
+            }
+          } else if (s.phase === "error") {
+            setStatus(`error: ${s.message}`, "error");
+          } else if (s.phase === "handshake") {
+            setStatus("handshake received — decoding…");
+          } else if (s.phase === "closed") {
+            setStatus(`closed${s.code ? ` (code ${s.code})` : ""}`, "error");
+          } else {
+            setStatus(String(s.phase));
+          }
+        },
+      });
+      client.onMessage = (m) => {
+        if (m.type === "ack") setStatus("tap acknowledged", "streaming");
+        if (m.type === "error") setStatus(`control error ${m.code}: ${m.message}`, "error");
+      };
+
+      await client.open();
+
+      // Tap: map pointer position to video coordinates (canvas == video pixels).
+      canvas.addEventListener("pointerdown", (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = Math.round((e.clientX - rect.left) * (canvas.width / rect.width));
+        const y = Math.round((e.clientY - rect.top) * (canvas.height / rect.height));
+        const ok = client.sendInput({ type: "inject", event: "tap", x, y });
+        if (!ok) {
+          setStatus("control socket not open — tap not sent (start the stream first)", "error");
+        }
+      });
+    </script>
+  </body>
+</html>
