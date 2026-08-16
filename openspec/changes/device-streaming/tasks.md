@@ -39,11 +39,13 @@ Chain strategy: feature-branch-chain
 
 ## Phase 2: Bridge Integration — PR 2 (D3, D5, D6)
 
-- [ ] 2.1 RED `test/stream-bridge.test.ts` (in-memory Bun.serve + MemoryRunner adb): handshake→AUs (spec: Stream connects), close codes 4403/4404/4429/4409 (Device unusable, Viewer cap), control ack (Tap during stream) + unknown-type error, `state.stream` (Active stream reports, Degraded), env-off reject (Env kill-switch), REST frozen (Fallback contract, Stills still captured)
+- [ ] 2.1 RED `test/stream-bridge.test.ts` (in-memory Bun.serve + MemoryRunner adb): handshake→AUs (spec: Stream connects), close codes 4403/4404/4429/4409 (Device unusable, Viewer cap), control ack (Tap during stream) + unknown-type error, `state.stream` (Active stream reports, Degraded), env-off reject (Env kill-switch), REST frozen (Fallback contract, Stills still captured) — slice 2B
 - [ ] 2.2 GREEN `src/stream/daemon.ts`: `StreamSession` (push→reverse→listen→spawn→read-loop→fan-out→control-reader) + `StreamManager` start-on-first-viewer / teardown-on-last (D5); device-loss watchdog → `stream.active:false` + reconnect session (Device lost mid-stream, Restart after disconnect)
-- [ ] 2.3 GREEN `src/stream/control.ts`: JSON inject→scrcpy bytes; video-space range validation (Out-of-range coordinates); unsupported-char error (Unsupported character while streaming); control closed when no stream (Control without stream)
-- [ ] 2.4 GREEN `src/stream/state.ts`: additive `stream {supported,active,reason,viewers}` (Unsupported environment when jar missing)
+  - [x] 2.2a `src/stream/manager.ts` (StreamManager) — lifecycle + watchdog + kill-switch (slice 2A); StreamSession/daemon = slice 2B
+- [x] 2.3 GREEN `src/stream/control.ts`: JSON inject→scrcpy bytes; video-space range validation (Out-of-range coordinates); unsupported-char error (Unsupported character while streaming); control closed when no stream (Control without stream)
+- [x] 2.4 GREEN additive `stream {supported,active,reason,viewers}` on /v1/state via `BridgeDeps.streamStatusProvider` (Unsupported environment when jar missing; implemented inline in server.ts, no separate state.ts)
 - [ ] 2.5 Modify `src/bridge/server.ts`: WS upgrade routes `/v1/stream/video`+`/v1/stream/control` (secret gate / CORS / error shape consistent); `src/bridge/main.ts`: wire `StreamManager` + `OPENMOBILE_STREAM`
+  - [x] 2.5a `BridgeDeps.streamStatusProvider` + additive `stream` in handleState (slice 2A); WS routes + main.ts wiring = slice 2B
 - [ ] 2.6 `package.json` files += `assets/`; commit `feat(bridge): stream WS routes + additive state`
 - [ ] 2.7 Live-verify emulator-5554 (push→spawn→WS→control tap, screencap diff pre/post — design §Live-validated facts); record result in PR body
 
