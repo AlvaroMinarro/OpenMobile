@@ -44,6 +44,23 @@ export interface BridgeDeps {
   readFile: (path: string) => Promise<Uint8Array>;
   /** Unique temp PNG path for a capture kind+serial (defaults to /tmp/om-<kind>-<serial>-<ts>-<rand6>.png). */
   tempPngPath: (kind: string, serial: string) => string;
+  /**
+   * Live stream status surfaced under `stream` in /v1/state (design D6).
+   * Absent → the bridge runs without streaming (backward compatible).
+   * Implementations must return `supported:false` when OPENMOBILE_STREAM=off.
+   */
+  streamStatusProvider?: () => StreamStateView;
+}
+
+/** Additive `stream` object in /v1/state (design D6; locked contract delta). */
+export interface StreamStateView {
+  supported: boolean;
+  active: boolean;
+  reason?: string;
+  viewers: number;
+  /** Video size of the active stream (present once the handshake landed). */
+  width?: number;
+  height?: number;
 }
 
 export interface BridgeOptions {
@@ -197,7 +214,18 @@ async function handleState(deps: BridgeDeps, explicit?: string): Promise<Respons
   }
   // `frame` is reserved for future annotated-screen content; always null today.
   // `bridge` self-describes the daemon (locked contract); `schema` pins the shape.
-  return json(200, { schema: "v1", bridge: deps.bridge, selected, frame: null, devices, emulators });
+  // `stream` is additive (design D6): present only when a provider is wired,
+  // so pre-streaming deployments stay byte-identical.
+  const stream = deps.streamStatusProvider ? deps.streamStatusProvider() : undefined;
+  return json(200, {
+    schema: "v1",
+    bridge: deps.bridge,
+    selected,
+    frame: null,
+    devices,
+    emulators,
+    ...(stream !== undefined ? { stream } : {}),
+  });
 }
 
 async function handleScreenshot(deps: BridgeDeps, explicit: string | undefined, url: URL): Promise<Response> {
