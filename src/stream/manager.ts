@@ -172,8 +172,8 @@ export class StreamManager {
     if (!session || !this.active) return;
     // Encoding is the control module's job (task 2.3); the manager only
     // routes the raw event to the session's control socket.
-    const bytes = encodeControlEvent(event, this._video);
-    await session.sendControl(bytes);
+    const messages = encodeControlEvent(event, this._video);
+    for (const bytes of messages) await session.sendControl(bytes);
   }
 
   /** Design D6 snapshot for /v1/state and the WS state message. */
@@ -296,43 +296,13 @@ async function defaultPollDevices(): Promise<Device[]> {
   return new AdbWrapper(new BunCommandRunner()).devices();
 }
 
-// ─── control-encoding bridge (task 2.3) ──────────────────────────────────
+// ─── control-encoding delegation (task 2.3) ───────────────────────────────
 
-import {
-  serializeKeycodeEvent,
-  serializeTextEvent,
-  serializeTouchEvent,
-} from "./wire";
-import { TOUCH_ACTION_DOWN, TOUCH_ACTION_UP } from "./types";
+import { encodeControlEvent } from "./control";
 
 /**
- * Encode a typed control event into scrcpy control bytes. Placeholder that
- * the control module (task 2.3) will own; here it keeps StreamManager
- * self-sufficient for lifecycle tests while the full encoder lands next.
+ * Encode a typed control event into scrcpy control bytes. Delegates to the
+ * control module (task 2.3), which owns validation + swipe stepping; the
+ * manager only routes raw events to the active session's control socket.
  */
-export function encodeControlEvent(event: ControlEvent, video: StreamVideoInfo): Uint8Array {
-  // Range/character validation + swipe stepping live in control.ts (2.3).
-  switch (event.event) {
-    case "tap": {
-      const down = serializeTouchEvent(TOUCH_ACTION_DOWN, event.x, event.y, {
-        screenWidth: video.width,
-        screenHeight: video.height,
-      });
-      const up = serializeTouchEvent(TOUCH_ACTION_UP, event.x, event.y, {
-        screenWidth: video.width,
-        screenHeight: video.height,
-      });
-      return Buffer.concat([down, up]);
-    }
-    case "key": {
-      const down = serializeKeycodeEvent(TOUCH_ACTION_DOWN, event.keycode);
-      const up = serializeKeycodeEvent(TOUCH_ACTION_UP, event.keycode);
-      return Buffer.concat([down, up]);
-    }
-    case "text": {
-      return serializeTextEvent(event.text);
-    }
-    default:
-      return new Uint8Array();
-  }
-}
+export { encodeControlEvent };
