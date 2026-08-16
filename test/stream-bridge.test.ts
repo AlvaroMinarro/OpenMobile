@@ -94,6 +94,21 @@ class FakeGateway implements StreamGateway {
   }
 }
 
+/**
+ * FakeGateway whose subscribeVideo blocks until the test releases it —
+ * reproduces the connect race: the WS closes while subscribe is pending.
+ * Mirrors the real gateway's post-await liveness re-check.
+ */
+class GatedGateway extends FakeGateway {
+  gate!: Promise<void>;
+  async subscribeVideo(viewer: StreamViewer): Promise<StreamSubscribeResult> {
+    this.subscribes++;
+    await this.gate;
+    if (!viewer.open) return { ok: false, code: "NO_DEVICE", reason: "viewer closed during subscribe" };
+    return super.subscribeVideo(viewer);
+  }
+}
+
 function makeDeps(gateway: StreamGateway | undefined, overrides: Partial<BridgeDeps> = {}): BridgeDeps {
   const state: {
     devices: Device[];
@@ -276,6 +291,30 @@ describe("WS /v1/stream/video — handshake + binary AUs (design D2)", () => {
       ws.addEventListener("close", (ev) => (code = ev.code));
       await new Promise((r) => setTimeout(r, 300));
       expect(code).toBe(WS_CLOSE_CODES.VIEWER_CAP);
+    } finally {
+      srv.stop();
+    }
+  });
+
+  it("unsubscribes a video viewer whose socket closes while subscribe is still pending (connect race ghost)", async () => {
+    const gw = new GatedGateway();
+    gw.active = true;
+    let release!: () => void;
+    gw.gate = new Promise((r) => (release = r));
+    const srv = makeServer(makeDeps(gw));
+    try {
+      const ws = await srv.ws("/v1/stream/video");
+      // Wait until the bridge is actually blocked inside subscribeVideo.
+      for (let i = 0; i < 100 && gw.subscribes === 0; i++) await new Promise((r) => setTimeout(r, 10));
+      expect(gw.subscribes).toBe(1);
+      ws.close(); // tab reload / rapid close while subscribe is pending
+      await new Promise((r) => setTimeout(r, 50)); // let the server process the close
+      release(); // subscribe resolves AFTER the close landed
+      await new Promise((r) => setTimeout(r, 100));
+      // viewerId must have been assigned BEFORE the await, so the close
+      // handler could unsubscribe; the gateway never registered the ghost.
+      expect(gw.unsubscribes).toBe(1);
+      expect(gw.viewers).toHaveLength(0);
     } finally {
       srv.stop();
     }

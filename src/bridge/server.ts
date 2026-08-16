@@ -506,6 +506,11 @@ export function createBridgeApp(deps: BridgeDeps, opts: BridgeOptions = {}): Bri
         if (ws.readyState === 1) ws.close(WS_CLOSE_CODES.DEVICE_LOST, "device lost");
       },
     };
+    // Track the viewer id on the connection BEFORE the (async) subscription:
+    // if the WS closes while subscribeVideo is in flight (tab reload, rapid
+    // connect-close), the close handler below must still unsubscribe it —
+    // otherwise a dead viewer holds a cap slot + manager refcount forever.
+    (ws.data as unknown as WsConn).viewerId = socketViewer.id;
     const result = await gw.subscribeVideo(socketViewer);
     if (!result.ok) {
       if (result.code === "CAP_REACHED") {
@@ -517,7 +522,6 @@ export function createBridgeApp(deps: BridgeDeps, opts: BridgeOptions = {}): Bri
       }
       return;
     }
-    (ws.data as unknown as WsConn).viewerId = result.viewerId;
     // The handshake + frames flow through sendHandshake/sendFrame once the
     // daemon's session is up. Nothing more to do here.
   }

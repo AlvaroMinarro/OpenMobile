@@ -186,6 +186,14 @@ export class StreamGateway implements GatewayContract {
         };
       }
     }
+    // Connect race: the WS may have closed while we were resolving the serial
+    // (tab reload / rapid connect-close). A dead viewer must NEVER be
+    // registered — it would hold a manager refcount + a viewer-cap slot and
+    // the session would run forever (the bridge close handler can only
+    // unsubscribe a viewer it knows about).
+    if (!viewer.open) {
+      return { ok: false, code: "NO_DEVICE", reason: "viewer closed before subscription completed" };
+    }
     const subscription = this.manager.subscribe();
     if (!subscription) {
       return { ok: false, code: "UNSUPPORTED", reason: "OPENMOBILE_STREAM=off" };
@@ -234,6 +242,11 @@ export class StreamGateway implements GatewayContract {
       viewer.close();
       return;
     }
+    // Connect race: the viewer's WS may have closed while the session was
+    // starting (attachToSession polls up to 1s). Re-check liveness right
+    // before attaching, or the unsubscribe that already removed the viewer
+    // would be undone — a ghost re-attached to the fanout forever.
+    if (!viewer.open) return;
     const fanout = session.fanout ?? undefined;
     if (fanout) {
       if (!fanout.add(viewer)) {

@@ -3,7 +3,9 @@ import { MemoryRunner } from "./helpers/memoryRunner";
 import { StreamGateway } from "../src/stream/gateway";
 import { StreamSession } from "../src/stream/daemon";
 import type { DaemonListener, DaemonSocket, SpawnHandle } from "../src/stream/daemon";
+import { MAX_VIEWERS } from "../src/stream/types";
 import type { StreamViewer, VideoHandshake } from "../src/stream/types";
+import type { StreamSubscribeResult } from "../src/bridge/server";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -180,5 +182,98 @@ describe("StreamGateway — manager + session glue (design D5/D6)", () => {
     expect(gw.snapshot().supported).toBe(false);
     const res = await gw.subscribeVideo(new Recorder("v2"));
     expect(res).toEqual({ ok: false, code: "UNSUPPORTED", reason: "OPENMOBILE_STREAM=off" });
+  });
+
+  it("does not register a viewer that closes while the auto serial is still resolving (connect race ghost)", async () => {
+    // Gate the `adb devices -l` run so subscribeVideo blocks mid-await.
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "devices", "-l"], { stdout: "List of devices attached\nemulator-5554\tdevice\n" });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const origRun = runner.run.bind(runner);
+    runner.run = async (argv, opts) => {
+      if (argv[1] === "devices") await gate;
+      return origRun(argv, opts);
+    }
+    const { factory } = sessionFactory(runner);
+    const gw = new StreamGateway(
+      { runner, serial: "auto", enabled: true, scid: "ghost-scid", pollDevices: async () => [] },
+      factory,
+    );
+    const v = new Recorder("racer");
+    const pending = gw.subscribeVideo(v); // blocked in resolveAutoSerial
+    v.close(); // the WS closes while the serial is still resolving
+    release();
+    const res = await pending;
+    expect(res.ok).toBe(false); // never registered
+    const snap = gw.managerRef.snapshot();
+    expect(snap.viewers).toBe(0); // manager refcount untouched — no ghost subscriber
+    expect(snap.active).toBe(false); // no session started for a ghost
+  });
+
+  it("rapid open/close cycles never consume viewer-cap slots (ghosts don't count toward the cap)", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "devices", "-l"], { stdout: "List of devices attached\nemulator-5554\tdevice\n" });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const origRun = runner.run.bind(runner);
+    runner.run = async (argv, opts) => {
+      if (argv[1] === "devices") await gate;
+      return origRun(argv, opts);
+    }
+    const { factory } = sessionFactory(runner);
+    const gw = new StreamGateway(
+      { runner, serial: "auto", enabled: true, scid: "ghost-scid", pollDevices: async () => [] },
+      factory,
+    );
+    // MAX_VIEWERS+1 rapid open/close cycles while the serial resolve is pending.
+    const pending: Array<Promise<StreamSubscribeResult>> = [];
+    for (let i = 0; i < MAX_VIEWERS + 1; i++) {
+      const v = new Recorder(`ghost-${i}`);
+      pending.push(gw.subscribeVideo(v));
+      v.close();
+    }
+    release();
+    const results = await Promise.all(pending);
+    for (const r of results) expect(r.ok).toBe(false);
+    expect(gw.managerRef.snapshot().viewers).toBe(0);
+    // A viewer that STAYS open still gets a slot — no cap was consumed.
+    const real = new Recorder("real");
+    const res = await gw.subscribeVideo(real);
+    expect(res.ok).toBe(true);
+    expect(gw.managerRef.snapshot().viewers).toBe(1);
+    gw.unsubscribeVideo(real.id);
+  });
+
+  it("never attaches a viewer whose WS closed while the session was still starting (late-close race)", async () => {
+    // Gate the session's push so adapter.start is in flight while the viewer
+    // closes; attachToSession polls for the session during that window.
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "-s", SERIAL, "push", join(import.meta.dir, "..", "assets", "scrcpy-server.jar"), "/data/local/tmp/scrcpy-server.jar"], {});
+    runner.expect(["adb", "-s", SERIAL, "reverse", "localabstract:scrcpy_late-scid", "tcp:47000"], {});
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const origRun = runner.run.bind(runner);
+    runner.run = async (argv, opts) => {
+      if (argv.includes("push")) await gate;
+      return origRun(argv, opts);
+    }
+    const { factory } = sessionFactory(runner);
+    const gw = new StreamGateway(
+      { runner, serial: SERIAL, enabled: true, scid: "late-scid", pollDevices: async () => [] },
+      factory,
+    );
+    const v = new Recorder("late-close");
+    const res = await gw.subscribeVideo(v);
+    expect(res.ok).toBe(true);
+    // The WS closes while the session is still starting (bridge would call
+    // unsubscribeVideo from its close handler).
+    v.close();
+    gw.unsubscribeVideo(v.id);
+    release();
+    // Let attachToSession run its full post-start attach attempt window
+    // (retry polls × 25ms) after the close landed.
+    await new Promise((r) => setTimeout(r, 700));
+    expect(gw.attachedViewers).toBe(0); // the dead viewer never reached the fanout
   });
 });
