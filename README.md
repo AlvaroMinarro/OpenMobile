@@ -107,7 +107,9 @@ errors, never silently skipped.
 The localhost bridge exposes (loopback `127.0.0.1`; bind host + port via env):
 
 - `GET /v1/state` → `200` always (empty lists when no device):
-  `{ "selected": {...}|null, "frame": {...}|null, "devices": [...], "emulators": [...] }`
+  `{ "selected": {...}|null, "frame": {...}|null, "devices": [...], "emulators": [...], "stream"?: {...} }`
+  The additive `stream` object (present when streaming is wired):
+  `{ supported, active, reason?, viewers, width?, height? }`.
 - `GET /v1/screenshot` → `200 image/png`, or an error body when no usable device.
 - `POST /v1/input/tap`   body `{"x","y"}` → `200`
 - `POST /v1/input/swipe` body `{"x1","y1","x2","y2","durationMs"?}` → `200`
@@ -115,8 +117,38 @@ The localhost bridge exposes (loopback `127.0.0.1`; bind host + port via env):
 
 Error body (all non-2xx): `{"error":{"code","message","details?"}}`.
 Status codes: `400 BAD_REQUEST`, `401 UNAUTHORIZED`, `404 NOT_FOUND`,
-`409 NO_DEVICE/DEVICE_OFFLINE/AMBIGUOUS_DEVICE`, `422 VALIDATION_ERROR`,
+`409 NO_DEVICE/DEVICE_OFFLINE/AMBIGUOUS_DEVICE/STREAM_OFF`, `422 VALIDATION_ERROR`,
 `500 INTERNAL_ERROR`. Contract is versioned: breaking changes land under `/v2`.
+
+### Streaming WebSockets (device streaming)
+
+Live H.264 streaming over loopback WebSockets, enabled by default; set
+`OPENMOBILE_STREAM=off` to disable (WS routes reject, `/v1/state` reports
+`stream.supported:false`). The stream starts on the FIRST video viewer and
+tears down when the last one disconnects or the device is lost (watchdog).
+
+- **`WS /v1/stream/video`** — server → client:
+  1. JSON handshake first: `{type:"handshake", codec:"h264", lengthSize:12,
+     width, height, sps, pps}` (SPS/PPS base64 after the Annex-B start code),
+  2. then ONE binary Annex-B access unit per message (SPS/PPS/IDR/slice),
+  3. JSON state messages: `{type:"state", state:"buffering"|"streaming"|"error",
+     reason?}`.
+  Per-viewer drop-oldest under backpressure (queue depth 4); max 8 viewers.
+- **`WS /v1/stream/control`** — client → server JSON:
+  `{type:"inject", event:"tap", x, y}` |
+  `{type:"inject", event:"swipe", x1, y1, x2, y2, durationMs?}` |
+  `{type:"inject", event:"text", text}` |
+  `{type:"inject", event:"key", keycode}`.
+  Server → client: `{type:"ack"}` | `{type:"error", code, message}`.
+  Coordinates are in VIDEO space (e.g. 430×960 with `max_size=960`), not
+  device pixels. Rejected with `409 STREAM_OFF` when no stream is active
+  (fall back to `POST /v1/input/*`).
+- **Close codes**: `4403` unsupported (kill-switch off), `4404` no usable
+  device, `4429` viewer cap, `4409` device lost mid-stream. The secret gate
+  and CORS apply to WS upgrades exactly like REST.
+- Input routing rule: while `stream.active:true`, input goes through the
+  control socket; otherwise `adb shell input` (REST) — same coordinate
+  semantics and range validation in both modes.
 
 ## License
 
