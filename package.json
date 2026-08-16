@@ -8,6 +8,10 @@
   "bin": {
     "mcp-server": "src/mcp-server.ts"
   },
+  "files": [
+    "src",
+    "assets"
+  ],
   "exports": {
     ".": "./src/index.ts",
     "./plugin": "./src/plugin/index.ts",
