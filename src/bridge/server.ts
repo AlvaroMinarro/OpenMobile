@@ -2,6 +2,17 @@ import { escapeForAdb, InputError } from "../device/input";
 import { tempPngPath } from "../device/temp";
 import { rm } from "node:fs/promises";
 import type { AVD, Device } from "../device/types";
+import {
+  WS_CLOSE_CODES,
+  type ControlErrorMessage,
+  type StreamStateMessage,
+  type StreamViewer,
+  type VideoHandshake,
+} from "../stream/types";
+import {
+  sendControlEvent,
+  ControlError,
+} from "../stream/control";
 
 /**
  * The `/v1` loopback HTTP bridge daemon (SDD Phase 4 — locked D2 contract).
@@ -50,6 +61,51 @@ export interface BridgeDeps {
    * Implementations must return `supported:false` when OPENMOBILE_STREAM=off.
    */
   streamStatusProvider?: () => StreamStateView;
+  /**
+   * Stream subsystem for the WS routes (design D2/D3/D5). When absent, the
+   * WS /v1/stream/* routes are rejected with 404 (no streaming deployed).
+   * The bridge only consumes this narrow contract:
+   *  - subscribeVideo → a StreamViewer the daemon will feed (handshake
+   *    first, then binary AUs; the viewer's close() means session ending),
+   *  - unsubscribeVideo → release the viewer,
+   *  - controlActive → the ACTIVE session's control writer (null = none),
+   *  - snapshot → additive /v1/state stream object (used when
+   *    streamStatusProvider is absent; provider wins when both present).
+   */
+  streamGateway?: StreamGateway;
+}
+
+/**
+ * Stream subsystem contract the WS routes consume (design D2/D3/D5).
+ * Implemented by the daemon wiring in main.ts (slice 2B).
+ */
+export type StreamSubscribeResult =
+  | { ok: true; viewerId: string }
+  | {
+      ok: false;
+      code: "UNSUPPORTED" | "CAP_REACHED" | "NO_DEVICE";
+      reason?: string;
+    };
+
+export interface StreamGateway {
+  /** Current additive /v1/state stream object. */
+  snapshot(): StreamStateView;
+  /**
+   * Register a video viewer. The bridge PASSES the socket-facing viewer; the
+   * gateway (via its fanout) broadcasts into it: sendHandshake (JSON) first,
+   * then sendFrame (binary AU) per access unit; when the session ends the
+   * gateway's teardown calls viewer.close() (the bridge closes 4409).
+   * Returns UNSUPPORTED (kill-switch off), CAP_REACHED (design D4, 8 max),
+   * or NO_DEVICE (start failed) — the bridge maps these onto close codes.
+   */
+  subscribeVideo(viewer: StreamViewer): Promise<StreamSubscribeResult>;
+  /** Release a video viewer (last release may tear the session down). */
+  unsubscribeVideo(viewerId: string): void;
+  /**
+   * The ACTIVE session's control writer, or null when no stream is up.
+   * The control route sends scrcpy bytes through `write` after validation.
+   */
+  controlActive(): { video: { width: number; height: number }; write: (bytes: Buffer[]) => Promise<void> } | null;
 }
 
 /** Additive `stream` object in /v1/state (design D6; locked contract delta). */
@@ -215,8 +271,11 @@ async function handleState(deps: BridgeDeps, explicit?: string): Promise<Respons
   // `frame` is reserved for future annotated-screen content; always null today.
   // `bridge` self-describes the daemon (locked contract); `schema` pins the shape.
   // `stream` is additive (design D6): present only when a provider is wired,
-  // so pre-streaming deployments stay byte-identical.
-  const stream = deps.streamStatusProvider ? deps.streamStatusProvider() : undefined;
+  // so pre-streaming deployments stay byte-identical. A streamGateway (slice
+  // 2B) also supplies the snapshot when no standalone provider is present.
+  const stream =
+    (deps.streamStatusProvider ? deps.streamStatusProvider() : undefined) ??
+    (deps.streamGateway ? deps.streamGateway.snapshot() : undefined);
   return json(200, {
     schema: "v1",
     bridge: deps.bridge,
@@ -338,38 +397,237 @@ async function handleText(deps: BridgeDeps, explicit: string | undefined, req: R
   return json(200, { ok: true, serial });
 }
 
-/** Build the HTTP handler. Testable directly; `main.ts` binds it to loopback. */
-export function createBridgeHandler(deps: BridgeDeps, opts: BridgeOptions = {}): (req: Request) => Promise<Response> {
-  return async (req) => {
-    // CORS: the bridge binds loopback (127.0.0.1), so granting cross-origin
-    // read/write to browsers/webviews on this same machine is safe — the
-    // surface UI (im-dot.webview / web PWA) fetches state+screenshot+input
-    // from a different origin. Fine-grained CORS would add nothing here:
-    // any process on this machine already owns the port. `*` keeps every
-    // runtime (Electron, web dev server, PWA) working without a config dance.
-    const requestOrigin = req.headers.get("origin");
-    const allowOrigin = requestOrigin || "*";
-    const corsHeaders = {
-      "access-control-allow-origin": allowOrigin,
-      "access-control-allow-methods": "GET, POST, OPTIONS",
-      "access-control-allow-headers": "content-type, x-openmobile-secret",
-    };
-    // Browser/webview preflight for non-simple requests (POST with
-    // application/json triggers it). Answer it immediately; the methods we
-    // expose are already GET/POST, and the allow-headers list matches what
-    // the surface sends.
-    if (req.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders });
-    }
-    // Optional shared-secret gate (OFF by default: loopback is the trust boundary).
-    if (opts.secret !== undefined && opts.secret !== "") {
-      const provided = req.headers.get("x-openmobile-secret");
-      if (provided !== opts.secret) {
-        const body = error(401, "UNAUTHORIZED", "missing or invalid X-OpenMobile-Secret header");
-        corsHeaders["access-control-allow-origin"] = allowOrigin;
-        return new Response(await body.text(), { status: 401, headers: { ...corsHeaders, "content-type": "application/json; charset=utf-8" } });
+/** Built bridge app: REST fetch handler + WS handler table for Bun.serve. */
+export interface BridgeApp {
+  fetch: (req: Request, server: Bun.Server<Record<string, unknown>>) => Promise<Response>;
+  websocket: Bun.WebSocketHandler<Record<string, unknown>>;
+}
+
+/** The per-connection state the WS handlers carry. */
+interface WsConn {
+  /** "video" or "control". */
+  kind: "video" | "control";
+  /** Gateway viewer id (video route) or the control writer (control route). */
+  viewerId?: string;
+}
+
+/** Reject an upgrade with a close code + a JSON error body (design §WS Contract). */
+function wsReject(ws: Bun.ServerWebSocket<Record<string, unknown>>, code: number, message: string): void {
+  const body = { error: { code: errorCodeForClose(code), message } };
+  ws.send(JSON.stringify(body));
+  ws.close(code, message);
+}
+
+function errorCodeForClose(code: number): string {
+  switch (code) {
+    case WS_CLOSE_CODES.UNSUPPORTED:
+      return "STREAM_UNSUPPORTED";
+    case WS_CLOSE_CODES.NO_DEVICE:
+      return "STREAM_NO_DEVICE";
+    case WS_CLOSE_CODES.VIEWER_CAP:
+      return "VIEWER_CAP";
+    case WS_CLOSE_CODES.DEVICE_LOST:
+      return "DEVICE_LOST";
+    default:
+      return "STREAM_ERROR";
+  }
+}
+
+/**
+ * Build the bridge app: REST fetch handler + WS upgrade handling on the
+ * /v1/stream/* routes. `main.ts` binds it to loopback via Bun.serve with an
+ * in-memory handler over the same port; tests call the fetch/upgrade paths
+ * through Bun.serve directly. Backward compatible: `createBridgeHandler`,
+ * the old name, is preserved as a thin wrapper delegating to the fetch half.
+ */
+export function createBridgeApp(deps: BridgeDeps, opts: BridgeOptions = {}): BridgeApp {
+  const corsHeaders = (allowOrigin: string) => ({
+    "access-control-allow-origin": allowOrigin,
+    "access-control-allow-methods": "GET, POST, OPTIONS",
+    "access-control-allow-headers": "content-type, x-openmobile-secret",
+  });
+
+  /** REST-only handler (no WS): the routing table for every non-upgrade req. */
+  const rest = buildRestHandler(deps);
+
+  const websocket: Bun.WebSocketHandler<Record<string, unknown>> = {
+    open(ws) {
+      const conn = ws.data as unknown as WsConn;
+      if (conn.kind === "video") void onVideoOpen(ws);
+      // control route does nothing on open (validated at upgrade)
+    },
+    message(ws, msg) {
+      const conn = ws.data as unknown as WsConn;
+      if (conn.kind === "control") void onControlMessage(ws, msg);
+    },
+    close(ws, code, reason) {
+      const conn = ws.data as unknown as WsConn;
+      if (conn.kind === "video" && conn.viewerId) {
+        deps.streamGateway?.unsubscribeVideo(conn.viewerId);
       }
+      void code;
+      void reason;
+    },
+  };
+
+  async function onVideoOpen(ws: Bun.ServerWebSocket<Record<string, unknown>>): Promise<void> {
+    const gw = deps.streamGateway;
+    if (!gw) {
+      ws.close(WS_CLOSE_CODES.UNSUPPORTED, "streaming not deployed");
+      return;
     }
+    const snap = gw.snapshot();
+    if (!snap.supported) {
+      wsReject(ws, WS_CLOSE_CODES.UNSUPPORTED, snap.reason ?? "streaming unsupported");
+      return;
+    }
+    // Socket-facing viewer: the gateway's fanout broadcasts INTO it. The
+    // bridge maps the viewer's close() (session teardown) onto 4409, and the
+    // sendHandshake/sendFrame/sendState calls onto WS text/binary frames.
+    const socketViewer: StreamViewer = {
+      id: crypto.randomUUID(),
+      sendHandshake: (h) => {
+        ws.send(JSON.stringify(h));
+        return Promise.resolve();
+      },
+      sendFrame: (f) => {
+        ws.send(f);
+        return Promise.resolve();
+      },
+      sendState: (s) => {
+        ws.send(JSON.stringify(s));
+        return Promise.resolve();
+      },
+      get open() {
+        return ws.readyState === 1; // OPEN
+      },
+      close: () => {
+        // Session ended (device lost / stream teardown) — tell the client.
+        if (ws.readyState === 1) ws.close(WS_CLOSE_CODES.DEVICE_LOST, "device lost");
+      },
+    };
+    const result = await gw.subscribeVideo(socketViewer);
+    if (!result.ok) {
+      if (result.code === "CAP_REACHED") {
+        wsReject(ws, WS_CLOSE_CODES.VIEWER_CAP, result.reason ?? "viewer cap reached (8)");
+      } else if (result.code === "UNSUPPORTED") {
+        wsReject(ws, WS_CLOSE_CODES.UNSUPPORTED, result.reason ?? "streaming unsupported");
+      } else {
+        wsReject(ws, WS_CLOSE_CODES.NO_DEVICE, result.reason ?? "no usable device for streaming");
+      }
+      return;
+    }
+    (ws.data as unknown as WsConn).viewerId = result.viewerId;
+    // The handshake + frames flow through sendHandshake/sendFrame once the
+    // daemon's session is up. Nothing more to do here.
+  }
+
+  async function onControlMessage(ws: Bun.ServerWebSocket<Record<string, unknown>>, raw: unknown): Promise<void> {
+    const text = typeof raw === "string" ? raw : Buffer.from(raw as Uint8Array).toString("utf8");
+    if (deps.streamGateway === undefined) {
+      wsReject(ws, WS_CLOSE_CODES.UNSUPPORTED, "streaming not deployed");
+      return;
+    }
+    const active = deps.streamGateway.controlActive();
+    try {
+      const result = await sendControlEvent(
+        active
+          ? { video: active.video, writer: (b: Buffer[]) => active.write(b) }
+          : undefined,
+        text,
+      );
+      if (result.ok) {
+        ws.send(JSON.stringify({ type: "ack" }));
+      } else {
+        wsReject(ws, WS_CLOSE_CODES.NO_DEVICE, result.reason);
+      }
+    } catch (e) {
+      // Validation failures (ControlError) are JSON errors, NOT closes.
+      if (e instanceof ControlError) {
+        const body: ControlErrorMessage = { type: "error", code: e.code, message: e.message };
+        ws.send(JSON.stringify(body));
+        return;
+      }
+      const message = e instanceof Error ? e.message : String(e);
+      ws.send(JSON.stringify({ type: "error", code: "INJECTION_FAILED", message }));
+    }
+  }
+
+  const app: BridgeApp = {
+    fetch: async (req, server) => {
+      const url = new URL(req.url);
+      const path = url.pathname;
+      // CORS preflight answers for BOTH REST and WS routes (browsers send
+      // OPTIONS before the upgrade as well).
+      const requestOrigin = req.headers.get("origin");
+      const allowOrigin = requestOrigin || "*";
+      if (req.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: corsHeaders(allowOrigin) });
+      }
+      // WS upgrades: /v1/stream/video + /v1/stream/control.
+      if (path === "/v1/stream/video" || path === "/v1/stream/control") {
+        // Secret gate for WS upgrades exactly like REST (loopback default off).
+        if (opts.secret !== undefined && opts.secret !== "") {
+          const provided = req.headers.get("x-openmobile-secret");
+          if (provided !== opts.secret) {
+            return error(401, "UNAUTHORIZED", "missing or invalid X-OpenMobile-Secret header");
+          }
+        }
+        // No gateway → 404 (streaming not deployed).
+        if (!deps.streamGateway) {
+          return notFound(req.method, path);
+        }
+        const kind: WsConn["kind"] = path === "/v1/stream/video" ? "video" : "control";
+        if (kind === "control") {
+          // Control-without-stream rejects at UPGRADE (spec: Control without
+          // stream → rejected and closed, never a silent hang).
+          const active = deps.streamGateway.controlActive();
+          if (!active) {
+            const res = error(
+              409,
+              "STREAM_OFF",
+              "no active stream; use /v1/input REST fallback",
+            );
+            const headers = new Headers(res.headers);
+            headers.set("access-control-allow-origin", allowOrigin);
+            return new Response(res.body, { status: res.status, headers });
+          }
+        }
+        const upgraded = server.upgrade(req, { data: { kind } as unknown as Record<string, unknown> });
+        if (!upgraded) {
+          const res = error(400, "BAD_REQUEST", "WebSocket upgrade failed");
+          const headers = new Headers(res.headers);
+          headers.set("access-control-allow-origin", allowOrigin);
+          return new Response(res.body, { status: res.status, headers });
+        }
+        return new Response(null, { status: 101 });
+      }
+      // Everything else → REST.
+      // Optional shared-secret gate (OFF by default: loopback is the trust
+      // boundary). Same rule as the old createBridgeHandler — REST requests
+      // carry X-OpenMobile-Secret when the secret is configured.
+      if (opts.secret !== undefined && opts.secret !== "") {
+        const provided = req.headers.get("x-openmobile-secret");
+        if (provided !== opts.secret) {
+          const res = error(401, "UNAUTHORIZED", "missing or invalid X-OpenMobile-Secret header");
+          const headers = new Headers(res.headers);
+          headers.set("access-control-allow-origin", allowOrigin);
+          return new Response(res.body, { status: res.status, headers });
+        }
+      }
+      const res = await rest(req);
+      const headers = new Headers(res.headers);
+      headers.set("access-control-allow-origin", allowOrigin);
+      return new Response(res.body, { status: res.status, headers });
+    },
+    websocket,
+  };
+  return app;
+}
+
+/** The REST routing table (no WS): /v1/state, screenshot, input/*. */
+function buildRestHandler(deps: BridgeDeps): (req: Request) => Promise<Response> {
+  return async (req) => {
     const url = new URL(req.url);
     const path = url.pathname;
     const explicit = url.searchParams.get("device") ?? undefined;
@@ -389,9 +647,12 @@ export function createBridgeHandler(deps: BridgeDeps, opts: BridgeOptions = {}):
         response = error(500, "INTERNAL_ERROR", message);
       }
     }
-    // Stamp CORS headers on every response (success, error, and 404 alike).
-    const headers = new Headers(response.headers);
-    headers.set("access-control-allow-origin", allowOrigin);
-    return new Response(response.body, { status: response.status, headers });
+    return response;
   };
+}
+
+/** Kept for backward compatibility (existing tests / docs reference it). */
+export function createBridgeHandler(deps: BridgeDeps, opts: BridgeOptions = {}): (req: Request) => Promise<Response> {
+  const app = createBridgeApp(deps, opts);
+  return (req) => app.fetch(req, { upgrade: () => false } as unknown as Bun.Server<Record<string, unknown>>);
 }

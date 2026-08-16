@@ -176,6 +176,22 @@ export class StreamManager {
     for (const bytes of messages) await session.sendControl(bytes);
   }
 
+  /**
+   * Bound control writer for the ACTIVE session (or null when no stream is
+   * up). The WS control route uses this with control.ts's sendControlEvent to
+   * return the typed STREAM_OFF result when nothing is streaming (task 2.3).
+   */
+  controlWriter(): StreamControlWriter | null {
+    const session = this.sessions[0];
+    if (!session || !this.active) return null;
+    return {
+      video: { ...this._video },
+      write: async (bytes: Buffer[]) => {
+        for (const b of bytes) await session.sendControl(b);
+      },
+    };
+  }
+
   /** Design D6 snapshot for /v1/state and the WS state message. */
   snapshot(): StreamSnapshot {
     return {
@@ -285,6 +301,14 @@ export class StreamManager {
 /** A viewer subscription token (opaque to the manager). */
 export interface StreamViewerSubscription {
   id: string;
+}
+
+/** A control writer bound to the ACTIVE session (design D3, slice 2B). */
+export interface StreamControlWriter {
+  /** Current video size (0x0 before the handshake). */
+  video: StreamVideoInfo;
+  /** Write the encoded scrcpy control bytes into the session's CONNECT socket. */
+  write(bytes: Buffer[]): Promise<void>;
 }
 
 /** Default watchdog source: live `adb devices -l`. */
