@@ -177,6 +177,29 @@ export interface StreamSnapshot {
   viewers: number;
 }
 
+// ─── Logcat live stream (bridge-surface-v2, design D5) ──────────────────
+
+/** Requested-backlog ceiling: clamp(backlog ?? default, 0, cap) per filter frame. */
+export const LOGCAT_BACKLOG_CAP = 1000;
+
+/** Default replay depth when the filter frame omits `backlog`. */
+export const LOGCAT_BACKLOG_DEFAULT = 100;
+
+/**
+ * Per-subscriber drop-oldest queue depth (Fanout drain precedent): a stalled
+ * reader discards its OLDEST undelivered lines so newest ones keep flowing
+ * without unbounded memory growth. Lines are tiny (~100B), so the bound is
+ * far more forgiving than the video frame queue.
+ */
+export const LOGCAT_QUEUE_DEPTH = 256;
+
+/**
+ * Hard cap on concurrent logcat subscribers per bridge daemon (design D5,
+ * MAX_VIEWERS alignment): the next subscribe attempt is closed 4429
+ * VIEWER_CAP instead of multiplying long-lived adb children unboundedly.
+ */
+export const LOGCAT_SUBSCRIBER_CAP = 8;
+
 // ─── WS /v1/stream close codes (design §WS Contract) ────────────────────
 
 export const WS_CLOSE_CODES = {
