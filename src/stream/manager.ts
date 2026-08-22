@@ -15,8 +15,10 @@
  * WS layer maps onto.
  */
 
+import { existsSync } from "node:fs";
 import type { Device } from "../device/types";
 import type { ControlEvent, FanoutRegistry, VideoHandshake } from "./types";
+import { JAR_LOCAL_PATH } from "./scrcpy";
 
 /** Video size reported by the session, updated from handshake meta. */
 export interface StreamVideoInfo {
@@ -84,6 +86,14 @@ export interface StreamManagerOptions {
   watchdogMs?: number;
   /** Resolution of the video stream reported in the snapshot. */
   video?: StreamVideoInfo;
+  /**
+   * Path of the scrcpy-server jar whose PRESENCE gates stream support.
+   * Defaults to the bundled asset (design D1). When the file is absent,
+   * the snapshot reports supported:false with reason "jar_missing" at
+   * STATE-READ time (spec: Unsupported environment) instead of surfacing
+   * the unusable stream only at WS connect time (close 4404).
+   */
+  jarPath?: string;
 }
 
 /**
@@ -104,6 +114,8 @@ export class StreamManager {
   private active = false;
   private reason?: string;
   private _video: StreamVideoInfo;
+  /** Cached jar-presence stat: ONE fs hit per manager, never per snapshot. */
+  private readonly jarPresent: boolean;
   private watchdogTimer: ReturnType<typeof setInterval> | undefined;
   private eventHandler?: (e: StreamManagerEvent) => void;
   /** In-flight start guard so a failed adapter.start isn't retried in a loop. */
@@ -116,6 +128,7 @@ export class StreamManager {
     this.pollDevices = options.pollDevices ?? defaultPollDevices;
     this.watchdogMs = options.watchdogMs ?? 3000;
     this._video = options.video ?? { width: 0, height: 0 };
+    this.jarPresent = existsSync(options.jarPath ?? JAR_LOCAL_PATH);
   }
 
   /** Video size reported by the active session (0x0 before the handshake). */
@@ -217,10 +230,19 @@ export class StreamManager {
 
   /** Design D6 snapshot for /v1/state and the WS state message. */
   snapshot(): StreamSnapshot {
+    // Support is enabled-driven AND environment-gated: a missing bundled
+    // jar means the stream cannot start, so /v1/state must say supported:
+    // false with a machine-readable cause (spec: Unsupported environment)
+    // rather than deferring the failure to connect time. The jar-missing
+    // reason is derived at read time so lifecycle transitions that clear
+    // this.reason (start/unsubscribe) can never mask it.
+    const supported = this._enabled && this.jarPresent;
+    const reason =
+      this.reason ?? (this._enabled && !this.jarPresent ? "jar_missing" : undefined);
     return {
-      supported: this._enabled,
+      supported,
       active: this.active,
-      ...(this.reason !== undefined ? { reason: this.reason } : {}),
+      ...(reason !== undefined ? { reason } : {}),
       viewers: this.viewerRefs,
     };
   }
