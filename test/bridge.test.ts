@@ -16,6 +16,7 @@ function makeDeps(overrides: Partial<BridgeDeps> = {}) {
     swipes: Array<{ s: string; x1: number; y1: number; x2: number; y2: number; d?: number }>;
     texts: Array<{ s: string; t: string }>;
     captures: Array<{ serial: string; outPath: string }>;
+    screencaps: Array<{ s: string; p: string }>;
   } = {
     devices: [],
     emulators: [],
@@ -23,6 +24,7 @@ function makeDeps(overrides: Partial<BridgeDeps> = {}) {
     swipes: [],
     texts: [],
     captures: [],
+    screencaps: [],
   };
   const deps: BridgeDeps = {
     bridge: { version: "test", pid: 1234 },
@@ -31,6 +33,7 @@ function makeDeps(overrides: Partial<BridgeDeps> = {}) {
       inputTap: async (s, x, y) => void state.taps.push({ s, x, y }),
       inputSwipe: async (s, x1, y1, x2, y2, d) => void state.swipes.push({ s, x1, y1, x2, y2, d }),
       inputText: async (s, t) => void state.texts.push({ s, t }),
+      screencap: async (s, p) => void state.screencaps.push({ s, p }),
     },
     cli: {
       emulatorList: async () => state.emulators,
@@ -291,11 +294,32 @@ describe("GET /v1/screenshot", () => {
     }
   });
 
-  it("returns 500 INTERNAL_ERROR when capture fails", async () => {
+  it("falls back to adb screencap when the CLI capture fails (200 PNG)", async () => {
+    const { deps, state } = makeDeps();
+    state.devices = [{ serial: "emulator-5554", state: "device" }];
+    deps.cli.capture = async () => {
+      throw new Error("CLI capture exploded");
+    };
+    const srv = makeInMemoryServer(deps);
+    try {
+      const res = await req(srv, "/v1/screenshot");
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/png");
+      expect(state.screencaps).toEqual([{ s: "emulator-5554", p: "/tmp/om-br-mock.png" }]);
+      expect(state.captures).toHaveLength(0); // the CLI path never completed
+    } finally {
+      srv.stop();
+    }
+  });
+
+  it("returns 500 INTERNAL_ERROR when BOTH the CLI capture and the adb fallback fail", async () => {
     const { deps, state } = makeDeps();
     state.devices = [{ serial: "emulator-5554", state: "device" }];
     deps.cli.capture = async () => {
       throw new Error("capture exploded");
+    };
+    deps.adb.screencap = async () => {
+      throw new Error("screencap exploded");
     };
     const srv = makeInMemoryServer(deps);
     try {

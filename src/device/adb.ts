@@ -30,9 +30,14 @@ export function deviceShotPath(): string {
   return `/sdcard/om_shot_${rand6}.png`;
 }
 
+/** Parse a `wm size|density` "Physical size|density: <value>" line. */
+function parsePhysical(out: string, kind: "size" | "density"): string | undefined {
+  const m = new RegExp(`Physical ${kind}:\\s*(.+)`).exec(out);
+  return m ? (m[1] as string).trim() : undefined;
+}
+
 /** Extract a logcat priority token (V/D/I/W/E/F/S) from a `-v time` line. */
-function priorityOf(line: string): string | null {
-  // Real recorded lines: "MM-DD HH:MM:SS.mmm P/Tag(  pid): msg" — priority is
+function priorityOf(line: string): string | null {  // Real recorded lines: "MM-DD HH:MM:SS.mmm P/Tag(  pid): msg" — priority is
   // followed by '/' (e.g. " I/AiAiEcho("), NOT a space as the legacy regex
   // assumed.
   const m = /\s([VDIWEFS])\//.exec(line);
@@ -160,18 +165,23 @@ export class AdbWrapper {
 
   /** Best-effort screen metrics via `wm size` / `wm density`; both may be missing on quirky devices. */
   async wm(serial: string): Promise<{ size?: string; density?: string }> {
-    const parsePhysical = (out: string): string | undefined => {
-      const m = /Physical (?:size|density):\s*(.+)/.exec(out);
-      return m ? (m[1] as string).trim() : undefined;
-    };
     const [sizeOut, densityOut] = await Promise.all([
       this.shell(serial, SPAWN_TIMEOUTS.devices, "wm", "size").catch(() => ""),
       this.shell(serial, SPAWN_TIMEOUTS.devices, "wm", "density").catch(() => ""),
     ]);
     return {
-      size: parsePhysical(sizeOut),
-      density: parsePhysical(densityOut),
+      size: parsePhysical(sizeOut, "size"),
+      density: parsePhysical(densityOut, "density"),
     };
+  }
+
+  /**
+   * Physical screen size only (`wm size`, e.g. "1080x2400") — the single
+   * cheap probe behind the tap range gate; undefined when unsupported.
+   */
+  async wmSize(serial: string): Promise<string | undefined> {
+    const out = await this.shell(serial, SPAWN_TIMEOUTS.devices, "wm", "size").catch(() => "");
+    return parsePhysical(out, "size");
   }
 
   /**

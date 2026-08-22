@@ -43,6 +43,8 @@ export interface BridgeDeps {
       duration?: number,
     ): Promise<void>;
     inputText(serial: string, text: string): Promise<void>;
+    /** adb screencap fallback for GET /v1/screenshot (Raw Screenshot spec). */
+    screencap?(serial: string, localPath: string): Promise<void>;
   };
   cli: {
     emulatorList(): Promise<AVD[]>;
@@ -291,7 +293,15 @@ async function handleScreenshot(deps: BridgeDeps, explicit: string | undefined, 
   const serial = await requireUsable(deps, explicit);
   const path = deps.tempPngPath("br", serial);
   try {
-    await deps.cli.capture({ serial, outPath: path });
+    try {
+      await deps.cli.capture({ serial, outPath: path });
+    } catch (e) {
+      // Raw Screenshot spec: the android CLI capture falls back to adb
+      // `screencap`. Without the fallback wired, the original error stands.
+      const fallback = deps.adb.screencap;
+      if (!fallback) throw e;
+      await fallback(serial, path);
+    }
     const bytes = await deps.readFile(path);
     // Optional downscale/JPEG params (V2 surface live mode). Defaults stay
     // PNG-full for contract compatibility; the surface asks for a compact
