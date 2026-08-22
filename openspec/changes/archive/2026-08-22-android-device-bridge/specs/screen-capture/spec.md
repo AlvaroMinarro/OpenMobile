@@ -24,13 +24,13 @@ The `take_screenshot` tool MUST return PNG bytes of the selected device's screen
 
 ### Requirement: Annotated Screenshot
 
-The `get_annotated_screen` tool MUST return a PNG with numbered label overlays (`#N`) plus the label-to-element mapping when the CLI provides it.
+The `get_annotated_screen` tool MUST return a PNG with numbered label overlays (`#N`) when the screen has tappable content; the label-to-element mapping in the response is deferred while no consumable CLI annotate payload exists.
 
 #### Scenario: Annotated capture
 
 - GIVEN a screen with tappable elements
 - WHEN `get_annotated_screen` is called
-- THEN it returns the annotated PNG and a mapping of labels to elements
+- THEN it returns the annotated PNG with numbered labels
 
 ### Requirement: Resolve Screen Labels
 
@@ -58,3 +58,4 @@ The `resolve_screen_labels` tool MUST accept one or more `#N` labels and return 
 
 - Annotated capture when the device has no tappable content — the tool MAY return the raw PNG instead
 - Label persistence across screens (labels are per-capture)
+- Label→element mapping in the annotated-capture response — the external CLI exposes no consumable annotate payload (no documented format, no recorded fixture); owned by future bridge work once upstream support exists. Per-label resolution stays available via `resolve_screen_labels`.

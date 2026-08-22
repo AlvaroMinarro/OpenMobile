@@ -24,13 +24,13 @@ The `take_screenshot` tool MUST return PNG bytes of the selected device's screen
 
 ### Requirement: Annotated Screenshot
 
-The `get_annotated_screen` tool MUST return a PNG with numbered label overlays (`#N`) plus the label-to-element mapping when the CLI provides it.
+The `get_annotated_screen` tool MUST return a PNG with numbered label overlays (`#N`) when the screen has tappable content; the label-to-element mapping in the response is deferred while no consumable CLI annotate payload exists.
 
 #### Scenario: Annotated capture
 
 - GIVEN a screen with tappable elements
 - WHEN `get_annotated_screen` is called
-- THEN it returns the annotated PNG and a mapping of labels to elements
+- THEN it returns the annotated PNG with numbered labels
 
 ### Requirement: Resolve Screen Labels
 
@@ -80,13 +80,56 @@ When streaming is active, live interaction MUST use the WS stream rather than th
 - WHEN the agent requests an annotated screenshot
 - THEN `GET /v1/screenshot` still returns the PNG (stills are unaffected by streaming)
 
+### Requirement: Unique Temp PNG Names
+
+Every temporary PNG written to disk for capture MUST use a unique name (never a fixed path), so concurrent or same-millisecond captures cannot collide and overwrite each other.
+
+#### Scenario: Same-ms collision avoided
+
+- GIVEN two captures issued within the same millisecond
+- WHEN both write temp PNG files
+- THEN the two paths differ and each capture reads its own bytes
+
+#### Scenario: Concurrent captures
+
+- GIVEN two concurrent screenshot requests
+- WHEN both are handled
+- THEN each request reads its own unique temp file
+
+### Requirement: Temp PNG Cleanup
+
+The system MUST delete temporary capture PNGs after their bytes have been read, so temp files do not accumulate between calls.
+
+#### Scenario: Cleanup after read
+
+- GIVEN a screenshot request completes
+- WHEN the PNG bytes are returned
+- THEN the temp file is removed from disk
+
+#### Scenario: Cleanup on failure
+
+- GIVEN a screenshot request that fails after writing the temp file
+- WHEN the failure is surfaced
+- THEN the temp file is still removed
+
+### Requirement: Spawn Timeout
+
+The capture subprocesses (`android screen capture`, `adb shell screencap`, `adb pull`) MUST be guarded by a timeout so a stuck spawn never blocks the tool indefinitely.
+
+#### Scenario: Stuck capture spawn
+
+- GIVEN a capture spawn that does not exit
+- WHEN `take_screenshot` is called
+- THEN it returns an actionable error within the configured timeout instead of blocking
+
 ## Non-Goals
 
 - No video or streaming capture through the screenshot endpoint (streaming lives on the WS surface)
 - No OCR or image analysis
-- No server-side screenshot persistence
+- No server-side screenshot persistence (returned bytes are transmitted, temp files are ephemeral)
 
 ## Out of Scope
 
 - Annotated capture when the device has no tappable content — the tool MAY return the raw PNG instead
 - Label persistence across screens (labels are per-capture)
+- Label→element mapping in the annotated-capture response — the external CLI exposes no consumable annotate payload (no documented format, no recorded fixture); owned by future bridge work once upstream support exists. Per-label resolution stays available via `resolve_screen_labels`.

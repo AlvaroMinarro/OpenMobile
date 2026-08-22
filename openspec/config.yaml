@@ -1,10 +1,10 @@
 schema: spec-driven
 
 context: |
-  Tech stack: greenfield (TypeScript/Bun planned, not yet scaffolded)
-  Architecture: TBD (to be decided during sdd-explore)
-  Testing: bun test (planned; no runner scaffolded yet)
-  Style: TBD
+  Tech stack: TypeScript strict (ESNext, verbatimModuleSyntax) on Bun 1.x — private package @openmobile/android-device-bridge v0.1.0 (MIT)
+  Architecture: modular TS library — src/{device,bridge,stream,tools,plugin}; MCP server bin (src/mcp-server.ts); gRPC emulator protos in protos/
+  Testing: bun test — 21 test files, golden fixtures + in-memory CLI/adb runners (test/helpers); fixture recorders in scripts/
+  Style: ESM only ("type": "module"), allowImportingTsExtensions, typecheck via tsc --noEmit; no linter/formatter configured
 
 testing:
   strict_tdd: true

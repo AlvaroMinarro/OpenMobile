@@ -44,12 +44,6 @@ Stream the selected device's screen as raw H.264 over a localhost WebSocket, wit
 - WHEN a client opens `WS /v1/stream/video`
 - THEN the connection is rejected with a JSON error and closed (never a silent hang)
 
-#### Scenario: Early keyframe
-
-- GIVEN a client joins mid-GOP
-- WHEN the stream starts
-- THEN the server MUST deliver the next intra-frame as early as the encoder allows so the client can begin rendering
-
 ### Requirement: Drop-Oldest Backpressure
 
 The stream MUST decouple viewer consumption from the scrcpy read loop; when a viewer's socket backpressures, the server MUST drop the oldest undelivered frame for that viewer rather than blocking the encoder, up to a viewer cap.
@@ -119,3 +113,4 @@ The stream MUST be torn down when the last viewer disconnects or the device is l
 - No WebRTC, audio, or per-viewer bitrate negotiation
 - No keyframe-request protocol from clients
 - No multi-touch gestures beyond tap/swipe/text
+- No early-keyframe delivery guarantee: intra-frame timing is encoder-controlled ("as early as the encoder allows"); verified manually on live devices, not deterministically automatable

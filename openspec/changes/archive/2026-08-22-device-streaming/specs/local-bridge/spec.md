@@ -58,23 +58,6 @@ The daemon MUST bind to localhost only, MUST version the contract under the `/v1
 - GIVEN the bridge started
 - THEN it listens on a loopback address only and serves only `/v1/*` routes (REST and WebSocket)
 
-#### Scenario: Contract evolution
-
-- GIVEN a future breaking change to the contract
-- WHEN the route shape changes
-- THEN the change lands under a new path version (`/v2`), leaving `/v1` intact
-
-### Requirement: Contract Stability
-
-The `/v1` contract MUST be documented with this change so the `openchamber-emulator-surface` change can implement against it without coupling to this repo's internals.
-(Previously: the contract documented only REST endpoints; the streaming WS protocol shape and the `stream` state object are now part of that documented contract.)
-
-#### Scenario: Downstream implementation
-
-- GIVEN the documented `/v1` contract shipped
-- WHEN the OpenChamber surface change is built
-- THEN it implements against the contract endpoints (REST and WS) without changes to this repo
-
 ## REMOVED Requirements
 
 ### Requirement: No WebSocket/streaming endpoints (polling only)
@@ -86,6 +69,8 @@ The `/v1` contract MUST be documented with this change so the `openchamber-emula
 - No authentication beyond the localhost trust boundary
 - No proxying of MCP tools over HTTP
 - No WebRTC, audio, or per-viewer bitrate negotiation (deferred production path)
+- No `/v2` versioning policy: routing future breaking changes under `/v2` is future policy, exercisable only when an actual breaking change lands — no runtime test is constructible today (`/v1` versioning remains normative in the Binding requirement)
+- No downstream implementation of the documented contract: consuming the shipped `/v1` WS/stream-state contract (documented in README) is owned by the external `openchamber-emulator-surface` change (OpenChamber fork PR, explicit proposal Out-of-Scope)
 
 ## Out of Scope
 

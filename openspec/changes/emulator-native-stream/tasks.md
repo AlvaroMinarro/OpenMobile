@@ -19,10 +19,10 @@ Chain strategy: feature-branch-chain
 
 ## Phase 1: PR1, Native control, scrcpy removed
 
-- [ ] 1.1 Vendor `emulator_controller.proto`, `rtc_service{,_v2}.proto`, `ice_config.proto` → `protos/` + README pin (from /tmp/opencode/protos)
-- [ ] 1.2 `package.json`: add `@grpc/grpc-js` + `@grpc/proto-loader`
-- [ ] 1.3 `src/device/grpc.ts` RED→GREEN: token from pid ini, version gate ≥36.5.11, bounds, sendTouch/sendKey unary, ControlError incl. 4401 (probe-d)
-- [ ] 1.4 `src/stream/rtc/allowlist.ts`: android-studio issuer + Rtc/reflection entries, golden vs om_allowlist.json
+- [x] 1.1 Vendor `emulator_controller.proto`, `rtc_service{,_v2}.proto`, `ice_config.proto` → `protos/` + README pin (from /tmp/opencode/protos)
+- [x] 1.2 `package.json`: add `@grpc/grpc-js` + `@grpc/proto-loader`
+- [x] 1.3 `src/device/grpc.ts` RED→GREEN: token from pid ini, version gate ≥36.5.11, bounds, sendTouch/sendKey unary, ControlError incl. 4401 (probe-d)
+- [x] 1.4 `src/stream/rtc/allowlist.ts`: android-studio issuer + Rtc/reflection entries, golden vs om_allowlist.json
 - [ ] 1.5 `src/device/androidCli.ts`: `emulatorStart` direct spawn `emulator @avd -grpc-allowlist <gen>`; `-rtcfps` ≥36.6; tests
 - [ ] 1.6 `src/tools/{handlers,schemas}.ts`: tap/swipe/text/key gRPC-first, adb fallback, physical-px bounds validation
 - [ ] 1.7 `src/stream/control.ts`: delete scrcpy encoder; gRPC injector; keep parseControlJson/ControlError/ack
