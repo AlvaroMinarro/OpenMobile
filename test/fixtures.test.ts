@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { FIXTURE_VERSION, expectFixture, loadFixture, type FixtureEnvelope } from "./helpers/fixtures";
 import { MemoryRunner } from "./helpers/memoryRunner";
@@ -58,17 +59,62 @@ describe("fixture helper — recorded real-output envelopes", () => {
     runner.assertSatisfied();
   });
 
-  it("throws on an envelope with a mismatched version pin", () => {
-    const stale: FixtureEnvelope = {
-      argv: ["android", "layout"],
-      stdout: "[]",
-      stderr: "",
-      exitCode: 0,
-      provenance: { tool: "android-cli", version: "0.0.1", capturedAt: "2026-01-01T00:00:00Z", context: "x" },
-    };
-    // Version check happens at load time; simulate via the helper's re-record guard by asserting the pin constant
-    expect(FIXTURE_VERSION).toBe("1.0.15985488");
-    expect(stale.provenance?.version).not.toBe(FIXTURE_VERSION);
+  it("rejects a fixture pinned to a different CLI version via the production loader", () => {
+    const dir = mkdtempSync(join(tmpdir(), "om-fixture-stale-"));
+    try {
+      writeFileSync(
+        join(dir, "stale-app.json"),
+        JSON.stringify({
+          argv: ["android", "layout"],
+          stdout: "[]",
+          stderr: "",
+          exitCode: 0,
+          provenance: {
+            tool: "android-cli",
+            version: "0.9.9",
+            capturedAt: "2026-01-01T00:00:00Z",
+            context: "recorded by an older CLI",
+          },
+        } satisfies FixtureEnvelope),
+      );
+      // The production pin guard must reject the stale envelope AT LOAD TIME,
+      // naming both the recorded version and the re-record escape hatch.
+      expect(() => loadFixture("stale-app", dir)).toThrow(
+        /pinned to CLI 0\.9\.9[\s\S]*FIXTURE_VERSION is 1\.0\.15985488[\s\S]*re-record/,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("loadFixture(dir) rejects missing provenance and accepts fresh envelopes from the same directory", () => {
+    const dir = mkdtempSync(join(tmpdir(), "om-fixture-prov-"));
+    try {
+      writeFileSync(
+        join(dir, "no-prov.json"),
+        JSON.stringify({ argv: ["adb"], stdout: "", stderr: "", exitCode: 0 }),
+      );
+      expect(() => loadFixture("no-prov", dir)).toThrow(/missing provenance/);
+
+      writeFileSync(
+        join(dir, "fresh.json"),
+        JSON.stringify({
+          argv: ["adb", "devices"],
+          stdout: "ok",
+          stderr: "",
+          exitCode: 0,
+          provenance: {
+            tool: "android-cli",
+            version: FIXTURE_VERSION,
+            capturedAt: "2026-01-01T00:00:00Z",
+            context: "valid re-record",
+          },
+        } satisfies FixtureEnvelope),
+      );
+      expect(loadFixture("fresh", dir).stdout).toBe("ok");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("pins the bundled scrcpy-server.jar to its recorded sha256 (design D1)", () => {
@@ -85,14 +131,3 @@ describe("fixture helper — recorded real-output envelopes", () => {
     expect(jar.subarray(0, 2).toString("latin1")).toBe("PK");
   });
 });
-
-// Small local helper: keep the layout fixture read once for the replay test above.
-const _layoutCache = new Map<string, FixtureEnvelope>();
-function loadLayoutFixture(): FixtureEnvelope {
-  const key = "adb-getprop";
-  const hit = _layoutCache.get(key);
-  if (hit) return hit;
-  const env = loadFixture(key);
-  _layoutCache.set(key, env);
-  return env;
-}
