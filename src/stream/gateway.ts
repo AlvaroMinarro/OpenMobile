@@ -1,7 +1,7 @@
 /**
  * StreamGateway — the bridge's stream subsystem (design D2/D3/D5).
  *
- * PR1 (native gRPC control): the in-guest scrcpy daemon transport is DELETED
+ * PR1 (native gRPC control): the in-guest encoder daemon transport is DELETED
  * and the emulator-native RTC session (RtcService v1) is not wired yet, so
  * video is UNSUPPORTED everywhere:
  *  - /v1/state reports `supported:false` with reason `rtc_streaming_not_deployed`

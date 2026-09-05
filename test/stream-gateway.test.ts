@@ -3,7 +3,7 @@ import { StreamGateway } from "../src/stream/gateway";
 import type { StreamViewer } from "../src/stream/types";
 
 /**
- * StreamGateway in PR1 (native gRPC control): the scrcpy daemon transport is
+ * StreamGateway in PR1 (native gRPC control): the legacy daemon transport is
  * deleted and the emulator-native RTC session is not wired yet, so video is
  * UNSUPPORTED everywhere while the manager lifecycle skeleton stays intact
  * for the PR2 RtcSession retarget (task 2.5).

@@ -4,7 +4,7 @@
  * The /v1/stream/control WS route and the /v1/input REST routes receive JSON
  * like `{type:"inject", event:"tap", x,y}` and inject through the emulator's
  * EmulatorController gRPC surface (device PHYSICAL pixels — design D5; the
- * scrcpy video-space mapping is gone with the scrcpy transport). This module
+ * legacy video-space mapping is gone with the in-guest encoder transport). This module
  * owns:
  *  - `parseControlJson`: validate the frozen WS contract shapes,
  *  - `grpcControlInjector`: route a parsed event onto the gRPC control
@@ -144,7 +144,7 @@ export function grpcControlInjector(control: EmulatorControl): ControlInjector {
             return;
           case "text":
             // No sendText RPC exists — text rides sendKey(KeyboardEvent{text})
-            // (probe D, design D3). Full UTF-8: no scrcpy ASCII restriction.
+            // (probe D, design D3). Full UTF-8: no legacy ASCII-only restriction.
             await control.text(event.text);
             return;
           case "key":

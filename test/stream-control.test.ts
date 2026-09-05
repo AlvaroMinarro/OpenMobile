@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { WS_CLOSE_CODES } from "../src/stream/types";
 import {
   ControlError,
   grpcControlInjector,
@@ -11,7 +12,7 @@ import type { EmulatorControl } from "../src/device/grpc";
 
 /**
  * Control backend = gRPC unary (design D3/D5, input-channel delta). The
- * scrcpy control-socket encoder is GONE: `parseControlJson` still validates
+ * in-guest control-socket encoder is GONE: `parseControlJson` still validates
  * the frozen WS JSON contract, and `grpcControlInjector` routes the parsed
  * event onto EmulatorController in DEVICE PHYSICAL pixels. Coordinates are
  * no longer video-space — validation against the physical display happens
@@ -42,6 +43,16 @@ function fakeControl(opts: { failWith?: GrpcControlError } = {}): EmulatorContro
     refreshDisplay: async () => ({ width: 1080, height: 2400 }),
   };
 }
+
+describe("WS close codes — RTC error-state contract (spec: Error States)", () => {
+  it("carries PERMISSION_DENIED (4401) for token/allowlist blocks alongside the legacy codes", () => {
+    expect(WS_CLOSE_CODES.PERMISSION_DENIED).toBe(4401);
+    expect(WS_CLOSE_CODES.NO_DEVICE).toBe(4404);
+    expect(WS_CLOSE_CODES.DEVICE_LOST).toBe(4409);
+    expect(WS_CLOSE_CODES.VIEWER_CAP).toBe(4429);
+    expect(WS_CLOSE_CODES.UNSUPPORTED).toBe(4403);
+  });
+});
 
 describe("grpcControlInjector — JSON inject → gRPC unary (design D3/D5)", () => {
   it("injects a tap via sendTouch in physical px (no video-space mapping)", async () => {

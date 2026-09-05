@@ -9,7 +9,7 @@
  *    `reason: "device_lost"` (spec: Device lost mid-stream, Restart after
  *    disconnect — re-subscribing restarts a fresh session).
  *
- * PR1 (native gRPC control, scrcpy deleted): the in-guest scrcpy transport
+ * PR1 (native gRPC control, legacy encoder deleted): the in-guest transport
  * is GONE and the emulator-native RTC session (RtcService v1) is not wired
  * yet, so no adapter session ever starts. The lifecycle skeleton (refcount,
  * watchdog, kill-switch, events) is KEPT — the PR2 RtcSession retarget plugs

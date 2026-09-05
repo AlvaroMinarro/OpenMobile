@@ -24,7 +24,6 @@ import {
   type ControlErrorMessage,
   type StreamStateMessage,
   type StreamViewer,
-  type VideoHandshake,
 } from "../stream/types";
 import {
   sendControlEvent,
