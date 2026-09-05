@@ -61,16 +61,16 @@ export const readLogcatSchema = z.object({
 });
 
 export const tapSchema = z.object({
-  x: z.number().int(),
-  y: z.number().int(),
+  x: z.number().int().describe("Device PHYSICAL pixel column (gRPC path validates against the display config)"),
+  y: z.number().int().describe("Device PHYSICAL pixel row (gRPC path validates against the display config)"),
   ...deviceOption,
 });
 
 export const swipeSchema = z.object({
-  x1: z.number().int(),
-  y1: z.number().int(),
-  x2: z.number().int(),
-  y2: z.number().int(),
+  x1: z.number().int().describe("Start PHYSICAL pixel column"),
+  y1: z.number().int().describe("Start PHYSICAL pixel row"),
+  x2: z.number().int().describe("End PHYSICAL pixel column"),
+  y2: z.number().int().describe("End PHYSICAL pixel row"),
   durationMs: z.number().int().nonnegative().optional(),
   ...deviceOption,
 });

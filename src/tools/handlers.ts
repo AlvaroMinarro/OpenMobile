@@ -1,6 +1,7 @@
 import type { DeviceContext, ResolvedTarget } from "./context";
 import { resolveTarget, safe, ToolError } from "./context";
 import { xmlToTree, uiElementToJson } from "../device/serialize";
+import type { EmulatorControl } from "../device/grpc";
 import { tempPngPath } from "../device/temp";
 import { rm } from "node:fs/promises";
 
@@ -395,18 +396,58 @@ export const readLogcat = (
   });
 
 // ---------------------------------------------------------------------------
-// input-channel
+// input-channel (gRPC-first, design D3/D5; input-channel delta)
 // ---------------------------------------------------------------------------
+
+/**
+ * Tool-vocabulary key → W3C KeyboardEvent.key name (probe D verified GoHome).
+ * Keys outside this map keep the adb keyevent path (the emulator's W3C
+ * translation is only confirmed for these names).
+ */
+const GRPC_KEY_NAMES: Record<string, string> = {
+  home: "GoHome",
+  back: "GoBack",
+};
+
+/**
+ * Route one input gesture gRPC-first (input-channel delta): when the selected
+ * emulator exposes a usable EmulatorController the gesture goes through gRPC
+ * unary in DEVICE PHYSICAL pixels; `adb shell input` is the fallback when no
+ * gRPC surface exists. A failing gRPC call is an actionable error — NEVER a
+ * silent adb fallback (Injection-failure scenario).
+ */
+async function injectGesture(
+  ctx: DeviceContext,
+  serial: string,
+  grpc: (control: EmulatorControl) => Promise<void>,
+  adbFallback: () => Promise<void>,
+): Promise<"grpc" | "adb"> {
+  const control = ctx.grpcControl ? await ctx.grpcControl(serial) : null;
+  if (control) {
+    await grpc(control);
+    return "grpc";
+  }
+  await adbFallback();
+  return "adb";
+}
 
 export const tap = (ctx: DeviceContext, args: { x: number; y: number; device?: string }) =>
   safe(async () => {
     const target = await requireTarget(ctx, args.device);
     if (!target.ok) return errText(target.error);
-    // Tap spec: reject out-of-range coordinates when the screen size is known
-    // (best-effort `wm size` probe; unknown size never blocks the tap).
-    const oob = tapRangeError(args.x, args.y, await ctx.adb.wmSize(target.serial));
-    if (oob) throw new ToolError(oob);
-    await retryOnce(() => ctx.adb.inputTap(target.serial, args.x, args.y));
+    const control = ctx.grpcControl ? await ctx.grpcControl(target.serial) : null;
+    if (control) {
+      // gRPC path: bounds are validated client-side against the PHYSICAL
+      // display configuration (design D5) inside the control client.
+      await control.tap(args.x, args.y);
+    } else {
+      // adb fallback: best-effort `wm size` gate in screen-physical space.
+      // The gate is OUTSIDE retryOnce — a validation refusal is terminal,
+      // never retried as if it were a transient adb failure.
+      const oob = tapRangeError(args.x, args.y, await ctx.adb.wmSize(target.serial));
+      if (oob) throw new ToolError(oob);
+      await retryOnce(() => ctx.adb.inputTap(target.serial, args.x, args.y));
+    }
     return { injected: "tap", x: args.x, y: args.y, serial: target.serial };
   });
 
@@ -417,8 +458,11 @@ export const swipe = (
   safe(async () => {
     const target = await requireTarget(ctx, args.device);
     if (!target.ok) return errText(target.error);
-    await retryOnce(() =>
-      ctx.adb.inputSwipe(target.serial, args.x1, args.y1, args.x2, args.y2, args.durationMs),
+    await injectGesture(
+      ctx,
+      target.serial,
+      (control) => control.swipe(args.x1, args.y1, args.x2, args.y2, args.durationMs),
+      () => retryOnce(() => ctx.adb.inputSwipe(target.serial, args.x1, args.y1, args.x2, args.y2, args.durationMs)),
     );
     return { injected: "swipe", serial: target.serial };
   });
@@ -427,17 +471,33 @@ export const inputText = (ctx: DeviceContext, args: { text: string; device?: str
   safe(async () => {
     const target = await requireTarget(ctx, args.device);
     if (!target.ok) return errText(target.error);
-    await retryOnce(() => ctx.adb.inputText(target.serial, args.text));
+    await injectGesture(
+      ctx,
+      target.serial,
+      // No sendText RPC exists — text rides sendKey(KeyboardEvent{text}) (D3).
+      (control) => control.text(args.text),
+      () => retryOnce(() => ctx.adb.inputText(target.serial, args.text)),
+    );
     return { injected: "text", serial: target.serial };
   });
 
+/** Extra key name → keycode mappings the AdbWrapper table lacks. */
 const KEYCODES: Record<string, string> = { app_switch: "187" };
 
 export const pressKey = (ctx: DeviceContext, args: { key: string; device?: string }) =>
   safe(async () => {
     const target = await requireTarget(ctx, args.device);
     if (!target.ok) return errText(target.error);
-    const keycode = KEYCODES[args.key] ?? args.key;
-    await retryOnce(() => ctx.adb.inputKeyevent(target.serial, keycode));
+    // Mode selection includes key mappability: only keys with a confirmed W3C
+    // gRPC name (probe D) ride the gRPC channel; anything else keeps the adb
+    // keyevent path where the wrapper resolves the full keycode table.
+    const grpcKey = GRPC_KEY_NAMES[args.key];
+    const control = grpcKey !== undefined && ctx.grpcControl ? await ctx.grpcControl(target.serial) : null;
+    if (control) {
+      await control.keyPress(grpcKey!);
+    } else {
+      const keycode = KEYCODES[args.key] ?? args.key;
+      await retryOnce(() => ctx.adb.inputKeyevent(target.serial, keycode));
+    }
     return { injected: "key", key: args.key, serial: target.serial };
   });
