@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createBridgeHandler } from "../src/bridge/server";
 import type { BridgeDeps } from "../src/bridge/server";
+import { GrpcControlError } from "../src/device/grpc";
 import type { AVD, Device } from "../src/device/types";
 
 /** In-memory device stubs recording calls so route behavior is observable. */
@@ -520,6 +521,126 @@ describe("POST /v1/input/text", () => {
       });
       expect(res.status).toBe(422);
       expect(state.texts).toHaveLength(0);
+    } finally {
+      srv.stop();
+    }
+  });
+});
+
+describe("POST /v1/input/* — gRPC-first injection (input-channel delta, D3/D5)", () => {
+  /** Recording EmulatorControl double wired into the bridge deps. */
+  function fakeControl(opts: { failWith?: Error } = {}) {
+    const calls: string[] = [];
+    const wrap = async (name: string, fn: () => Promise<void>): Promise<void> => {
+      if (opts.failWith) throw opts.failWith;
+      calls.push(name);
+    };
+    return {
+      calls,
+      tap: (x: number, y: number) => wrap(`tap(${x},${y})`, async () => {}),
+      swipe: (x1: number, y1: number, x2: number, y2: number, durationMs?: number) =>
+        wrap(`swipe(${x1},${y1},${x2},${y2},${durationMs})`, async () => {}),
+      text: (t: string) => wrap(`text(${t})`, async () => {}),
+      keyPress: (k: string) => wrap(`key(${k})`, async () => {}),
+      keyCode: (c: number, t?: number) => wrap(`keyCode(${c},${t})`, async () => {}),
+      reportDisplaySize: () => undefined,
+      refreshDisplay: async () => ({ width: 1080, height: 2400 }),
+    };
+  }
+
+  it("routes POST /v1/input/tap through gRPC unary when the emulator exposes the control surface", async () => {
+    const control = fakeControl();
+    const { deps, state } = makeDeps({
+      grpcControl: async () => control,
+    } as Partial<BridgeDeps>);
+    state.devices = [{ serial: "emulator-5554", state: "device" }];
+    const srv = makeInMemoryServer(deps);
+    try {
+      const res = await req(srv, "/v1/input/tap", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ x: 540, y: 1200 }),
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { ok: boolean; serial: string };
+      expect(body.ok).toBe(true);
+      // Physical px verbatim — NO video→device mapping, NO adb round-trip.
+      expect(control.calls).toEqual(["tap(540,1200)"]);
+      expect(state.taps).toEqual([]);
+    } finally {
+      srv.stop();
+    }
+  });
+
+  it("routes swipe and text through gRPC too, preserving duration and UTF-8", async () => {
+    const control = fakeControl();
+    const { deps, state } = makeDeps({
+      grpcControl: async () => control,
+    } as Partial<BridgeDeps>);
+    state.devices = [{ serial: "emulator-5554", state: "device" }];
+    const srv = makeInMemoryServer(deps);
+    try {
+      const swipe = await req(srv, "/v1/input/swipe", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ x1: 540, y1: 1800, x2: 540, y2: 400, durationMs: 300 }),
+      });
+      expect(swipe.status).toBe(200);
+      expect(control.calls).toContain("swipe(540,1800,540,400,300)");
+      const text = await req(srv, "/v1/input/text", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "hola ñ" }),
+      });
+      expect(text.status).toBe(200);
+      expect(control.calls).toContain("text(hola ñ)");
+      expect(state.swipes).toEqual([]);
+      expect(state.texts).toEqual([]);
+    } finally {
+      srv.stop();
+    }
+  });
+
+  it("falls back to adb when there is no gRPC surface (capability-based mode selection)", async () => {
+    const control = fakeControl();
+    const { deps, state } = makeDeps({
+      grpcControl: async () => null,
+    } as Partial<BridgeDeps>);
+    state.devices = [{ serial: "emulator-5554", state: "device" }];
+    const srv = makeInMemoryServer(deps);
+    try {
+      const res = await req(srv, "/v1/input/tap", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ x: 100, y: 200 }),
+      });
+      expect(res.status).toBe(200);
+      expect(state.taps).toEqual([{ s: "emulator-5554", x: 100, y: 200 }]);
+      expect(control.calls).toEqual([]);
+    } finally {
+      srv.stop();
+    }
+  });
+
+  it("returns an actionable error when gRPC injection fails — never a silent drop", async () => {
+    const control = fakeControl({
+      failWith: new GrpcControlError("DEVICE_OFFLINE", "emulator gRPC unreachable: connection refused"),
+    });
+    const { deps, state } = makeDeps({
+      grpcControl: async () => control,
+    } as Partial<BridgeDeps>);
+    state.devices = [{ serial: "emulator-5554", state: "device" }];
+    const srv = makeInMemoryServer(deps);
+    try {
+      const res = await req(srv, "/v1/input/tap", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ x: 10, y: 20 }),
+      });
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      const body = (await res.json()) as { error: { message: string } };
+      expect(body.error.message).toContain("gRPC unreachable");
+      expect(state.taps).toEqual([]); // no silent adb retry after a gRPC failure
     } finally {
       srv.stop();
     }

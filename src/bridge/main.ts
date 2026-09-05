@@ -4,6 +4,7 @@ import { AdbWrapper } from "../device/adb";
 import { BunCommandRunner } from "../device/runner";
 import { createBridgeApp } from "./server";
 import { tempPngPath } from "../device/temp";
+import { resolveGrpcControl } from "../tools/context";
 import type { BridgeApp, BridgeDeps } from "./server";
 import { StreamGateway } from "../stream/gateway";
 import { parseAuthConfig } from "./auth";
@@ -70,6 +71,9 @@ export function createBridgeDeps(env: Record<string, string> = process.env as Re
     tempPngPath,
     // Runtime selection override (design D7): fresh per wiring ⇒ restart clears.
     selectionOverride: createSelectionOverride(),
+    // gRPC-first input (input-channel delta): resolve the serial → pid-ini
+    // token/port; null (external launch, physical device) ⇒ adb fallback.
+    grpcControl: resolveGrpcControl,
   };
   if (streamEnabled(env)) {
     // The gateway serial follows the same resolution as REST: ANDROID_DEVICE

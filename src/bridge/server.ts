@@ -31,6 +31,8 @@ import {
   ControlError,
   type ControlInjector,
 } from "../stream/control";
+import type { EmulatorControl } from "../device/grpc";
+import { GrpcControlError } from "../device/grpc";
 import {
   authenticateRequest,
   bearerCredential,
@@ -132,13 +134,21 @@ export interface BridgeDeps {
    */
   streamStatusProvider?: () => StreamStateView;
   /**
+   * gRPC-first input surface (input-channel delta, design D3/D5): resolves a
+   * serial to the emulator's EmulatorController when the running instance has
+   * a per-instance pid ini; null ⇒ `adb shell input` fallback. Optional so
+   * legacy minimal test deps stay valid (adb-only).
+   */
+  grpcControl?: (serial: string) => Promise<EmulatorControl | null>;
+  /**
    * Stream subsystem for the WS routes (design D2/D3/D5). When absent, the
    * WS /v1/stream/* routes are rejected with 404 (no streaming deployed).
    * The bridge only consumes this narrow contract:
    *  - subscribeVideo → a StreamViewer the daemon will feed (handshake
    *    first, then binary AUs; the viewer's close() means session ending),
    *  - unsubscribeVideo → release the viewer,
-   *  - controlActive → the ACTIVE session's control writer (null = none),
+   *  - controlActive → the ACTIVE stream's gRPC control injector (null =
+   *    none; the bridge sends validated JSON injects through it),
    *  - snapshot → additive /v1/state stream object (used when
    *    streamStatusProvider is absent; provider wins when both present).
    */
@@ -476,12 +486,44 @@ function readOptionalBoundedInt(raw: string | null, min: number, max: number, fa
   return Number.isInteger(n) && n >= min && n <= max ? n : fallback;
 }
 
+/**
+ * gRPC-first input mode selection (input-channel delta): when the selected
+ * emulator exposes a usable EmulatorController the gesture goes through gRPC
+ * unary in DEVICE PHYSICAL pixels (bounds validated client-side inside the
+ * control client); `adb shell input` is the fallback when no gRPC surface
+ * exists. A failing gRPC call propagates as an actionable error — NEVER a
+ * silent adb fallback (Injection-failure scenario).
+ */
+async function injectGrpcFirst(
+  deps: BridgeDeps,
+  serial: string,
+  grpc: (control: EmulatorControl) => Promise<void>,
+  adbFallback: () => Promise<void>,
+): Promise<void> {
+  const control = deps.grpcControl ? await deps.grpcControl(serial) : null;
+  if (control) {
+    try {
+      await grpc(control);
+      return;
+    } catch (e) {
+      if (e instanceof GrpcControlError) throw new HttpError(502, e.code, e.message, e.details);
+      throw e;
+    }
+  }
+  await adbFallback();
+}
+
 async function handleTap(deps: BridgeDeps, explicit: string | undefined, req: Request): Promise<Response> {
   const body = await requireJson(req);
   const x = needNumber(body, "x");
   const y = needNumber(body, "y");
   const serial = await requireUsable(deps, explicit);
-  await deps.adb.inputTap(serial, x, y);
+  await injectGrpcFirst(
+    deps,
+    serial,
+    (control) => control.tap(x, y),
+    () => deps.adb.inputTap(serial, x, y),
+  );
   return json(200, { ok: true, x, y, serial });
 }
 
@@ -497,7 +539,12 @@ async function handleSwipe(
   const y2 = needNumber(body, "y2");
   const durationMs = readOptionalNumber(body, "durationMs");
   const serial = await requireUsable(deps, explicit);
-  await deps.adb.inputSwipe(serial, x1, y1, x2, y2, durationMs);
+  await injectGrpcFirst(
+    deps,
+    serial,
+    (control) => control.swipe(x1, y1, x2, y2, durationMs),
+    () => deps.adb.inputSwipe(serial, x1, y1, x2, y2, durationMs),
+  );
   return json(200, { ok: true, serial });
 }
 
@@ -507,16 +554,24 @@ async function handleText(deps: BridgeDeps, explicit: string | undefined, req: R
   if (typeof raw !== "string" || raw.length === 0) {
     throw new HttpError(422, "VALIDATION_ERROR", "field 'text' must be a non-empty string", "text");
   }
-  // Validate injectability through the device-core rule before dispatching.
-  let serial: string;
-  try {
-    escapeForAdb(raw);
-  } catch (e) {
-    const message = e instanceof InputError ? e.message : "text cannot be injected";
-    throw new HttpError(422, "VALIDATION_ERROR", message);
-  }
-  serial = await requireUsable(deps, explicit);
-  await deps.adb.inputText(serial, raw);
+  const serial = await requireUsable(deps, explicit);
+  await injectGrpcFirst(
+    deps,
+    serial,
+    // gRPC path: full UTF-8 rides sendKey(KeyboardEvent{text}) — probe D;
+    // there is no sendText RPC and no adb ASCII restriction.
+    (control) => control.text(raw),
+    async () => {
+      // adb path only: validate injectability through the device-core rule.
+      try {
+        escapeForAdb(raw);
+      } catch (e) {
+        const message = e instanceof InputError ? e.message : "text cannot be injected";
+        throw new HttpError(422, "VALIDATION_ERROR", message);
+      }
+      await deps.adb.inputText(serial, raw);
+    },
+  );
   return json(200, { ok: true, serial });
 }
 
