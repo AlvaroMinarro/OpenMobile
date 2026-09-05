@@ -1,98 +1,158 @@
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import {
   ControlError,
-  encodeControlEvent,
+  grpcControlInjector,
   parseControlJson,
-  type VideoSize,
+  sendControlEvent,
+  type ControlInjector,
 } from "../src/stream/control";
-import { TOUCH_ACTION_DOWN, TOUCH_ACTION_UP } from "../src/stream/types";
+import { GrpcControlError } from "../src/device/grpc";
+import type { EmulatorControl } from "../src/device/grpc";
 
-const FIX = join(import.meta.dir, "fixtures");
-const VIDEO: VideoSize = { width: 430, height: 960 };
+/**
+ * Control backend = gRPC unary (design D3/D5, input-channel delta). The
+ * scrcpy control-socket encoder is GONE: `parseControlJson` still validates
+ * the frozen WS JSON contract, and `grpcControlInjector` routes the parsed
+ * event onto EmulatorController in DEVICE PHYSICAL pixels. Coordinates are
+ * no longer video-space — validation against the physical display happens
+ * inside the gRPC control client (OUT_OF_RANGE maps back to ControlError).
+ */
 
-function recorded(name: string): Buffer {
-  return readFileSync(join(FIX, name));
+const VIDEO_SPACE_ERROR = new GrpcControlError(
+  "OUT_OF_RANGE",
+  "coordinates out of physical display space (0..1079, 0..2339)",
+  { x: 430, y: 100 },
+);
+
+/** Recording EmulatorControl double; `failWith` makes every gesture throw. */
+function fakeControl(opts: { failWith?: GrpcControlError } = {}): EmulatorControl & { calls: string[] } {
+  const calls: string[] = [];
+  const wrap = async (name: string, fn: () => Promise<void>): Promise<void> => {
+    if (opts.failWith) throw opts.failWith;
+    calls.push(name);
+  };
+  return {
+    calls,
+    tap: (x, y) => wrap(`tap(${x},${y})`, async () => {}),
+    swipe: (x1, y1, x2, y2, durationMs) => wrap(`swipe(${x1},${y1},${x2},${y2},${durationMs})`, async () => {}),
+    text: (t) => wrap(`text(${t})`, async () => {}),
+    keyPress: (k) => wrap(`key(${k})`, async () => {}),
+    keyCode: (c, t) => wrap(`keyCode(${c},${t})`, async () => {}),
+    reportDisplaySize: () => undefined,
+    refreshDisplay: async () => ({ width: 1080, height: 2400 }),
+  };
 }
 
-/** Assert the thrown error is a ControlError with the expected code. */
-function expectCode(fn: () => unknown, code: ControlError["code"]): void {
-  try {
-    fn();
-    throw new Error(`expected ControlError(${code}) to be thrown`);
-  } catch (e) {
-    expect(e).toBeInstanceOf(ControlError);
-    expect((e as ControlError).code).toBe(code);
-  }
-}
-
-describe("stream control encoder — JSON inject → scrcpy control bytes (design D3)", () => {
-  it("encodes a tap as DOWN+UP touch events; the DOWN bytes match the recorded 32B fixture", () => {
-    const msgs = encodeControlEvent({ type: "inject", event: "tap", x: 215, y: 480 }, VIDEO);
-    expect(msgs).toHaveLength(2);
-    const down = msgs[0]!;
-    expect(down.length).toBe(32);
-    // Byte-for-byte equality with the LIVE-recorded tap (design §control socket).
-    expect(down.toString("hex")).toBe(recorded("stream-control.bin").toString("hex"));
-    expect(msgs[0]![1]).toBe(TOUCH_ACTION_DOWN);
-    expect(msgs[1]![1]).toBe(TOUCH_ACTION_UP);
+describe("grpcControlInjector — JSON inject → gRPC unary (design D3/D5)", () => {
+  it("injects a tap via sendTouch in physical px (no video-space mapping)", async () => {
+    const control = fakeControl();
+    const injector = grpcControlInjector(control);
+    await injector.inject({ type: "inject", event: "tap", x: 540, y: 1200 });
+    expect(control.calls).toEqual(["tap(540,1200)"]);
   });
 
-  it("encodes a swipe as DOWN → MOVE steps → UP, all inside the video bounds", () => {
-    const msgs = encodeControlEvent(
-      { type: "inject", event: "swipe", x1: 10, y1: 20, x2: 100, y2: 200, durationMs: 100 },
-      VIDEO,
+  it("injects a swipe with the duration preserved", async () => {
+    const control = fakeControl();
+    const injector = grpcControlInjector(control);
+    await injector.inject({ type: "inject", event: "swipe", x1: 540, y1: 1800, x2: 540, y2: 400, durationMs: 300 });
+    expect(control.calls).toEqual(["swipe(540,1800,540,400,300)"]);
+  });
+
+  it("injects text via sendKey(KeyboardEvent{text}) — full UTF-8, no sendText RPC (probe D)", async () => {
+    const control = fakeControl();
+    const injector = grpcControlInjector(control);
+    await injector.inject({ type: "inject", event: "text", text: "hola ñ" });
+    expect(control.calls).toEqual(["text(hola ñ)"]);
+  });
+
+  it("injects a key keycode via sendKey", async () => {
+    const control = fakeControl();
+    const injector = grpcControlInjector(control);
+    await injector.inject({ type: "inject", event: "key", keycode: 4 });
+    expect(control.calls).toEqual(["keyCode(4,0)"]);
+  });
+
+  it("maps gRPC OUT_OF_RANGE onto a ControlError with the same code", async () => {
+    const control = fakeControl({ failWith: VIDEO_SPACE_ERROR });
+    const injector = grpcControlInjector(control);
+    const err = await injector.inject({ type: "inject", event: "tap", x: 430, y: 100 }).then(
+      () => null,
+      (e: unknown) => e,
     );
-    expect(msgs.length).toBeGreaterThanOrEqual(3);
-    expect(msgs[0]![1]).toBe(TOUCH_ACTION_DOWN);
-    expect(msgs[msgs.length - 1]![1]).toBe(TOUCH_ACTION_UP);
-    for (const m of msgs) {
-      expect(m.length).toBe(32); // every message is a full touch event
-      const x = m.readInt32BE(10);
-      const y = m.readInt32BE(14);
-      expect(x).toBeGreaterThanOrEqual(0);
-      expect(x).toBeLessThan(VIDEO.width);
-      expect(y).toBeGreaterThanOrEqual(0);
-      expect(y).toBeLessThan(VIDEO.height);
-    }
-    // Middle messages are MOVE action 2.
-    expect(msgs[1]![1]).toBe(2);
+    expect(err).toBeInstanceOf(ControlError);
+    expect((err as ControlError).code).toBe("OUT_OF_RANGE");
+    expect((err as ControlError).message).toContain("(0..1079, 0..2339)");
   });
 
-  it("encodes text as one TYPE_INJECT_TEXT message (4-byte length + UTF-8 payload)", () => {
-    const msgs = encodeControlEvent({ type: "inject", event: "text", text: "hello world" }, VIDEO);
-    expect(msgs).toHaveLength(1);
-    expect(msgs[0]![0]).toBe(1); // TYPE_INJECT_TEXT
-    expect(msgs[0]!.readUInt32BE(1)).toBe(11);
-    expect(msgs[0]!.subarray(5).toString("utf8")).toBe("hello world");
-  });
-
-  it("encodes a key press as DOWN+UP keycode events (BACK=4)", () => {
-    const msgs = encodeControlEvent({ type: "inject", event: "key", keycode: 4 }, VIDEO);
-    expect(msgs).toHaveLength(2);
-    expect(msgs[0]![0]).toBe(0); // TYPE_INJECT_KEYCODE
-    expect(msgs[0]!.readInt32BE(2)).toBe(4);
-    expect(msgs[1]![1]).toBe(1); // ACTION_UP
-  });
-
-  it("rejects coordinates outside the video-space bounds (Out-of-range coordinates)", () => {
-    // x === width is already out of range; negative too.
-    expectCode(() => encodeControlEvent({ type: "inject", event: "tap", x: 430, y: 100 }, VIDEO), "OUT_OF_RANGE");
-    expectCode(() => encodeControlEvent({ type: "inject", event: "tap", x: -1, y: 100 }, VIDEO), "OUT_OF_RANGE");
-    expectCode(
-      () => encodeControlEvent({ type: "inject", event: "swipe", x1: 0, y1: 0, x2: 100, y2: 2000 }, VIDEO),
-      "OUT_OF_RANGE",
+  it("maps a gRPC device-offline failure onto an actionable ControlError (never a silent drop)", async () => {
+    const control = fakeControl({
+      failWith: new GrpcControlError("DEVICE_OFFLINE", "emulator gRPC unreachable: connection refused"),
+    });
+    const injector = grpcControlInjector(control);
+    const err = await injector.inject({ type: "inject", event: "tap", x: 1, y: 2 }).then(
+      () => null,
+      (e: unknown) => e,
     );
+    expect(err).toBeInstanceOf(ControlError);
+    expect((err as ControlError).code).toBe("DEVICE_OFFLINE");
   });
 
-  it("rejects characters the control socket cannot inject (Unsupported character while streaming)", () => {
-    expectCode(() => encodeControlEvent({ type: "inject", event: "text", text: "hola ñ" }, VIDEO), "UNSUPPORTED_CHAR");
-    expectCode(() => encodeControlEvent({ type: "inject", event: "text", text: "tab\there" }, VIDEO), "UNSUPPORTED_CHAR");
+  it("rejects an unknown event type with UNSUPPORTED_EVENT", async () => {
+    const injector = grpcControlInjector(fakeControl());
+    const err = await injector.inject({ event: "poke" } as never).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ControlError);
+    expect((err as ControlError).code).toBe("UNSUPPORTED_EVENT");
   });
 });
 
-describe("parseControlJson — WS /v1/stream/control contract shapes", () => {
+describe("sendControlEvent — WS control route entrypoint (injector-backed)", () => {
+  it("parses, injects through the active injector, and acknowledges", async () => {
+    const control = fakeControl();
+    const injector: ControlInjector = grpcControlInjector(control);
+    const result = await sendControlEvent(
+      injector,
+      JSON.stringify({ type: "inject", event: "tap", x: 10, y: 20 }),
+    );
+    expect(result.ok).toBe(true);
+    expect(control.calls).toEqual(["tap(10,20)"]);
+  });
+
+  it("returns the typed STREAM_OFF result when no injector is active", async () => {
+    const result = await sendControlEvent(undefined, JSON.stringify({ type: "inject", event: "tap", x: 1, y: 2 }));
+    expect(result).toEqual({
+      ok: false,
+      code: "STREAM_OFF",
+      reason: "no active stream; use /v1/input REST fallback",
+    });
+  });
+
+  it("throws ControlError on a malformed message (validation failures are NOT closes)", async () => {
+    const err = await sendControlEvent(grpcControlInjector(fakeControl()), "not json").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ControlError);
+    expect((err as ControlError).code).toBe("INVALID_JSON");
+  });
+
+  it("propagates injector failures as ControlError (injection failure scenario)", async () => {
+    const control = fakeControl({ failWith: new GrpcControlError("PERMISSION_DENIED", "denied", undefined, 4401) });
+    const err = await sendControlEvent(
+      grpcControlInjector(control),
+      JSON.stringify({ type: "inject", event: "tap", x: 1, y: 2 }),
+    ).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ControlError);
+    expect((err as ControlError).code).toBe("PERMISSION_DENIED");
+  });
+});
+
+describe("parseControlJson — WS /v1/stream/control contract shapes (frozen)", () => {
   it("accepts the documented inject shapes (tap, swipe, text, key)", () => {
     const tap = parseControlJson(JSON.stringify({ type: "inject", event: "tap", x: 215, y: 480 }));
     expect(tap.ok).toBe(true);

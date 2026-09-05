@@ -1,41 +1,25 @@
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { createBridgeApp } from "../src/bridge/server";
 import type { BridgeDeps, StreamGateway, StreamStateView, StreamSubscribeResult } from "../src/bridge/server";
 import type { AVD, Device } from "../src/device/types";
-import type { ControlEvent, StreamViewer, VideoHandshake } from "../src/stream/types";
-import {
-  WS_CLOSE_CODES,
-  MAX_VIEWERS,
-} from "../src/stream/types";
-import { StreamGateway as RealGateway } from "../src/stream/gateway";
-import { StreamSession, type DaemonListener, type DaemonSocket, type SpawnHandle } from "../src/stream/daemon";
-import { MemoryRunner } from "./helpers/memoryRunner";
+import type { ControlEvent, StreamViewer } from "../src/stream/types";
+import { WS_CLOSE_CODES } from "../src/stream/types";
+import { grpcControlInjector, type ControlInjector } from "../src/stream/control";
+import { GrpcControlError } from "../src/device/grpc";
+import type { EmulatorControl } from "../src/device/grpc";
 
 /**
  * Bridge WS integration (task 2.1/2.6): in-memory Bun.serve on port 0 with a
- * REAL Bun WebSocket client, against a FAKE StreamGateway (no adb, no scrcpy —
- * the gateway contract is all the bridge cares about). The gateway double
- * produces a REAL handshake + AU frames for the video route and a REAL
- * control writer for the control route — the WS framing, close codes, CORS,
- * secret gate, and REST freezing are exercised end-to-end through sockets.
+ * REAL Bun WebSocket client, against a FAKE StreamGateway (no adb, no
+ * emulator — the gateway contract is all the bridge cares about). In PR1 the
+ * real gateway reports streaming UNSUPPORTED, so the video route always
+ * rejects 4403 and the control route rejects at upgrade unless the (fake)
+ * gateway reports an active injector.
  */
 
 // ─── Fake gateway / viewer / deps ────────────────────────────────────────
 
-const HANDSHAKE: VideoHandshake = {
-  type: "handshake",
-  codec: "h264",
-  lengthSize: 12,
-  width: 430,
-  height: 960,
-  sps: "Z0LAKY1oGweeuQgICAg8IhGo",
-  pps: "aM4BqDXI",
-};
-
 class FakeViewer implements StreamViewer {
-  frames: Uint8Array[] = [];
   states: unknown[] = [];
   open = true;
   closed = 0;
@@ -47,9 +31,7 @@ class FakeViewer implements StreamViewer {
     return this._id;
   }
   async sendHandshake(): Promise<void> {}
-  async sendFrame(f: Uint8Array): Promise<void> {
-    this.frames.push(f);
-  }
+  async sendFrame(): Promise<void> {}
   async sendState(s: unknown): Promise<void> {
     this.states.push(s);
   }
@@ -59,14 +41,33 @@ class FakeViewer implements StreamViewer {
   }
 }
 
+/** Recording EmulatorControl double backing the fake gateway's injector. */
+function fakeControl(opts: { failWith?: GrpcControlError } = {}): EmulatorControl & { calls: string[] } {
+  const calls: string[] = [];
+  const wrap = async (name: string, fn: () => Promise<void>): Promise<void> => {
+    if (opts.failWith) throw opts.failWith;
+    calls.push(name);
+  };
+  return {
+    calls,
+    tap: (x, y) => wrap(`tap(${x},${y})`, async () => {}),
+    swipe: (x1, y1, x2, y2, durationMs) => wrap(`swipe(${x1},${y1},${x2},${y2},${durationMs})`, async () => {}),
+    text: (t) => wrap(`text(${t})`, async () => {}),
+    keyPress: (k) => wrap(`key(${k})`, async () => {}),
+    keyCode: (c, t) => wrap(`keyCode(${c},${t})`, async () => {}),
+    reportDisplaySize: () => undefined,
+    refreshDisplay: async () => ({ width: 1080, height: 2400 }),
+  };
+}
+
 class FakeGateway implements StreamGateway {
-  supported = true;
+  supported = false;
   active = false;
   reason: string | undefined;
   /** The socket-facing viewers the bridge registered with us. */
   viewers: StreamViewer[] = [];
-  ctrlEvents: Array<{ e: ControlEvent; bytes: Buffer[] }> = [];
-  lastWriter: { video: { width: number; height: number }; write: (b: Buffer[]) => Promise<void> } | null = null;
+  /** Active control injector; null = no stream (upgrade → 409 STREAM_OFF). */
+  injector: ControlInjector | null = null;
   subscribes = 0;
   unsubscribes = 0;
 
@@ -81,9 +82,8 @@ class FakeGateway implements StreamGateway {
 
   async subscribeVideo(viewer: StreamViewer): Promise<StreamSubscribeResult> {
     this.subscribes++;
-    if (!this.supported) return { ok: false, code: "UNSUPPORTED", reason: this.reason ?? "OPENMOBILE_STREAM=off" };
-    if (!this.active) return { ok: false, code: "NO_DEVICE", reason: this.reason ?? "no usable device for streaming" };
-    if (this.viewers.length >= MAX_VIEWERS) return { ok: false, code: "CAP_REACHED", reason: "viewer cap reached (8)" };
+    if (!this.supported) return { ok: false, code: "UNSUPPORTED", reason: this.reason ?? "unsupported" };
+    if (this.viewers.length >= 8) return { ok: false, code: "CAP_REACHED", reason: "viewer cap reached (8)" };
     this.viewers.push(viewer);
     return { ok: true, viewerId: viewer.id };
   }
@@ -94,24 +94,18 @@ class FakeGateway implements StreamGateway {
     if (i !== -1) this.viewers.splice(i, 1);
   }
 
-  controlActive(): { video: { width: number; height: number }; write: (b: Buffer[]) => Promise<void> } | null {
-    return this.active ? this.lastWriter : null;
+  controlActive(): ControlInjector | null {
+    return this.active ? this.injector : null;
   }
 }
 
-/**
- * FakeGateway whose subscribeVideo blocks until the test releases it —
- * reproduces the connect race: the WS closes while subscribe is pending.
- * Mirrors the real gateway's post-await liveness re-check.
- */
-class GatedGateway extends FakeGateway {
-  gate!: Promise<void>;
-  async subscribeVideo(viewer: StreamViewer): Promise<StreamSubscribeResult> {
-    this.subscribes++;
-    await this.gate;
-    if (!viewer.open) return { ok: false, code: "NO_DEVICE", reason: "viewer closed during subscribe" };
-    return super.subscribeVideo(viewer);
-  }
+/** Recording injector fake (no gRPC client involved). */
+function recordingInjector(calls: string[]): ControlInjector {
+  return {
+    async inject(event: ControlEvent): Promise<void> {
+      calls.push(JSON.stringify(event));
+    },
+  };
 }
 
 function makeDeps(gateway: StreamGateway | undefined, overrides: Partial<BridgeDeps> = {}): BridgeDeps {
@@ -195,158 +189,43 @@ function nextMessage(ws: WebSocket, pred?: (data: unknown) => boolean): Promise<
   });
 }
 
-function au(tag: number): Uint8Array {
-  return Uint8Array.from([0, 0, 0, 1, tag, 0x11, 0x22, 0x33]);
-}
-
-// ─── REAL gateway through the bridge (spec scenario: Control injection failure) ─
-
-/** Minimal socket double for a REAL StreamSession (mirrors stream-daemon tests). */
-class FakeSock implements DaemonSocket {
-  destroyed = false;
-  private dataCbs: Array<(c: Uint8Array) => void> = [];
-  private closeCbs: Array<() => void> = [];
-  on(event: "data" | "close" | "error", cb: (...args: unknown[]) => void): void {
-    if (event === "data") this.dataCbs.push(cb as (c: Uint8Array) => void);
-    if (event === "close") this.closeCbs.push(cb as () => void);
-  }
-  write(): void {}
-  destroy(): void {
-    this.destroyed = true;
-  }
-  emitData(c: Uint8Array): void {
-    for (const cb of this.dataCbs) cb(c);
-  }
-  emitClose(): void {
-    for (const cb of this.closeCbs) cb();
-  }
-}
-
-class FakeL implements DaemonListener {
-  port = 47000;
-  private connCbs: Array<(s: DaemonSocket) => void> = [];
-  listen(): Promise<void> {
-    return Promise.resolve();
-  }
-  onConnection(cb: (s: DaemonSocket) => void): void {
-    this.connCbs.push(cb);
-  }
-  close(): Promise<void> {
-    return Promise.resolve();
-  }
-  connect(): FakeSock {
-    const s = new FakeSock();
-    for (const cb of this.connCbs) cb(s);
-    return s;
-  }
-}
-
-class FakeSpawnH implements SpawnHandle {
-  kill(): void {}
-  get exited(): Promise<number> {
-    return new Promise(() => {});
-  }
-}
-
-/** The REAL recorded wire: 80B header + [12B frame meta][Annex-B AU] pairs. */
-function realWire(): Buffer {
-  const meta = readFileSync(join(import.meta.dir, "fixtures", "stream-meta.bin"));
-  const frames = readFileSync(join(import.meta.dir, "fixtures", "stream-a-frames.bin"));
-  return Buffer.concat([meta.subarray(0, 80), frames]);
-}
-
-/** A REAL StreamSession bound to a fake listener + spawn (no adb sockets). */
-function realSessionFactory(runner: MemoryRunner): { factory: (scid: string) => StreamSession; listener: FakeL } {
-  const listener = new FakeL();
-  return {
-    listener,
-    factory: (scid: string) =>
-      new StreamSession({
-        runner,
-        serial: "emulator-5554",
-        scid,
-        listenerFactory: () => listener,
-        spawnFn: () => new FakeSpawnH(),
-      }),
-  };
-}
-
-describe("WS /v1/stream/video — handshake + binary AUs (design D2)", () => {
-  it("upgrades, sends the JSON handshake first, then streams binary Annex-B AUs (Stream connects)", async () => {
-    const gw = new FakeGateway();
-    gw.active = true;
-    gw.lastWriter = {
-      video: { width: 430, height: 960 },
-      write: async () => {},
-    };
-    const deps = makeDeps(gw);
-    const srv = makeServer(deps);
-    try {
-      const ws = await srv.ws("/v1/stream/video");
-      // 1) The gateway got the socket-facing viewer.
-      expect(gw.viewers).toHaveLength(1);
-      const viewer = gw.viewers[0]!;
-      // 2) The daemon's handshake → JSON handshake over the socket.
-      await viewer.sendHandshake(HANDSHAKE);
-      const first = await nextMessage(ws);
-      const hs = JSON.parse(String(first)) as VideoHandshake;
-      expect(hs.type).toBe("handshake");
-      expect(hs.codec).toBe("h264");
-      expect(hs.lengthSize).toBe(12);
-      expect(hs.width).toBe(430);
-      expect(hs.height).toBe(960);
-      expect(hs.sps).toBe("Z0LAKY1oGweeuQgICAg8IhGo");
-      expect(hs.pps).toBe("aM4BqDXI");
-      // 3) Push an AU through the gateway → binary frame over the socket.
-      await viewer.sendFrame(au(0x65)); // IDR
-      const second = await nextMessage(ws);
-      const bin = second instanceof Uint8Array ? second : typeof second === "string" ? Buffer.from(second, "binary") : new Uint8Array(second as ArrayBuffer);
-      expect(Buffer.from(bin.subarray(0, 4)).toString("hex")).toBe("00000001");
-      expect(bin[4]).toBe(0x65);
-      // 4) State message flows too.
-      await viewer.sendState({ type: "state", state: "streaming" });
-      const st = await nextMessage(ws);
-      expect(JSON.parse(String(st))).toEqual({ type: "state", state: "streaming" });
-      ws.close();
-      await new Promise((r) => setTimeout(r, 50));
-      expect(gw.viewers).toHaveLength(0); // close → unsubscribe
-    } finally {
-      srv.stop();
-    }
-  });
-
-  it("rejects with close code 4403 (unsupported) when the kill-switch is off", async () => {
+describe("WS /v1/stream/video — unsupported until native RTC (PR1)", () => {
+  it("rejects with close code 4403 (unsupported) and a JSON error body naming the reason", async () => {
     const gw = new FakeGateway();
     gw.supported = false;
-    gw.reason = "OPENMOBILE_STREAM=off";
+    gw.reason = "rtc_streaming_not_deployed";
     const srv = makeServer(makeDeps(gw));
     try {
       let closeCode: number | undefined;
+      let body = "";
       const ws = await srv.ws("/v1/stream/video");
       ws.addEventListener("close", (ev) => {
         closeCode = ev.code;
       });
+      ws.addEventListener("message", (ev) => {
+        body = String(ev.data);
+      });
       await new Promise((r) => setTimeout(r, 300));
       expect(closeCode).toBe(WS_CLOSE_CODES.UNSUPPORTED);
+      expect(body).toContain("rtc_streaming_not_deployed");
     } finally {
       srv.stop();
     }
   });
 
-  it("rejects with close code 4404 (no device) when the gateway cannot start", async () => {
+  it("maps a NO_DEVICE subscription failure onto close 4404 with a JSON error", async () => {
     const gw = new FakeGateway();
-    gw.active = false;
-    gw.reason = "push failed: adb: device offline";
+    gw.supported = true;
+    gw.reason = "no usable device for streaming";
+    gw.subscribeVideo = async () => ({ ok: false, code: "NO_DEVICE", reason: gw.reason });
     const srv = makeServer(makeDeps(gw));
     try {
-      const ws = await srv.ws("/v1/stream/video");
-      // The daemon's push failed → the bridge rejects with 4404.
       let code: number | undefined;
+      const ws = await srv.ws("/v1/stream/video");
       ws.addEventListener("close", (ev) => (code = ev.code));
       const err = await nextMessage(ws);
       const body = JSON.parse(String(err)) as { error: { code: string; message: string } };
       expect(body.error.code).toBe("STREAM_NO_DEVICE");
-      expect(body.error.message).toContain("push failed");
       await new Promise((r) => setTimeout(r, 300));
       expect(code).toBe(WS_CLOSE_CODES.NO_DEVICE);
     } finally {
@@ -354,10 +233,11 @@ describe("WS /v1/stream/video — handshake + binary AUs (design D2)", () => {
     }
   });
 
-  it("rejects an 9th viewer with close code 4429 (viewer cap)", async () => {
+  it("rejects a 9th viewer with close code 4429 (viewer cap)", async () => {
     const gw = new FakeGateway();
+    gw.supported = true;
     gw.active = true;
-    for (let i = 0; i < MAX_VIEWERS; i++) {
+    for (let i = 0; i < 8; i++) {
       const v = new FakeViewer(`pre-${i}`);
       gw.viewers.push(v);
     }
@@ -374,10 +254,18 @@ describe("WS /v1/stream/video — handshake + binary AUs (design D2)", () => {
   });
 
   it("unsubscribes a video viewer whose socket closes while subscribe is still pending (connect race ghost)", async () => {
-    const gw = new GatedGateway();
+    const gw = new FakeGateway();
+    gw.supported = true;
     gw.active = true;
     let release!: () => void;
-    gw.gate = new Promise((r) => (release = r));
+    const gate = new Promise<void>((r) => (release = r));
+    const orig = gw.subscribeVideo.bind(gw);
+    gw.subscribeVideo = async (viewer) => {
+      gw.subscribes++;
+      await gate;
+      if (!viewer.open) return { ok: false, code: "NO_DEVICE", reason: "viewer closed during subscribe" };
+      return orig(viewer);
+    };
     const srv = makeServer(makeDeps(gw));
     try {
       const ws = await srv.ws("/v1/stream/video");
@@ -396,55 +284,22 @@ describe("WS /v1/stream/video — handshake + binary AUs (design D2)", () => {
       srv.stop();
     }
   });
-
-  it("sends a state message with reason device_lost and closes 4409 when the stream dies", async () => {
-    const gw = new FakeGateway();
-    gw.active = true;
-    const srv = makeServer(makeDeps(gw));
-    try {
-      const ws = await srv.ws("/v1/stream/video");
-      await new Promise((r) => setTimeout(r, 50));
-      const viewer = gw.viewers[0]!;
-      // Send the handshake so the client is decoding, then the daemon →
-      // gateway layer emits a device_lost state and closes the viewer.
-      await viewer.sendHandshake(HANDSHAKE);
-      const first = await nextMessage(ws);
-      expect(JSON.parse(String(first)).type).toBe("handshake");
-      await viewer.sendState({ type: "state", state: "error", reason: "device_lost" });
-      const st = await nextMessage(ws);
-      expect(JSON.parse(String(st))).toEqual({ type: "state", state: "error", reason: "device_lost" });
-      let code: number | undefined;
-      ws.addEventListener("close", (ev) => (code = ev.code));
-      viewer.close(); // gateway closes the socket → bridge closes with 4409
-      await new Promise((r) => setTimeout(r, 300));
-      expect(code).toBe(WS_CLOSE_CODES.DEVICE_LOST);
-    } finally {
-      srv.stop();
-    }
-  });
 });
 
-describe("WS /v1/stream/control — JSON inject → scrcpy bytes (design D3)", () => {
-  it("acks a tap during an active stream and writes the scrcpy touch bytes", async () => {
+describe("WS /v1/stream/control — JSON inject → gRPC unary injector (design D3/D5)", () => {
+  it("acks a tap during an active stream and routes it through the injector", async () => {
     const gw = new FakeGateway();
     gw.active = true;
-    const written: Buffer[] = [];
-    gw.lastWriter = {
-      video: { width: 430, height: 960 },
-      write: async (b: Buffer[]) => {
-        written.push(...b);
-      },
-    };
+    const control = fakeControl();
+    gw.injector = grpcControlInjector(control);
     const srv = makeServer(makeDeps(gw));
     try {
       const ws = await srv.ws("/v1/stream/control");
-      ws.send(JSON.stringify({ type: "inject", event: "tap", x: 215, y: 480 }));
+      ws.send(JSON.stringify({ type: "inject", event: "tap", x: 540, y: 1200 }));
       const ack = await nextMessage(ws);
       expect(JSON.parse(String(ack))).toEqual({ type: "ack" });
-      // The gateway's control writer got the scrcpy bytes: touch DOWN + UP.
-      expect(written.length).toBe(2);
-      expect(written[0]![0]).toBe(2); // TYPE_INJECT_TOUCH_EVENT
-      expect(written[1]![0]).toBe(2);
+      // The injector delivered the tap in device physical px.
+      expect(control.calls).toEqual(["tap(540,1200)"]);
     } finally {
       srv.stop();
     }
@@ -453,7 +308,7 @@ describe("WS /v1/stream/control — JSON inject → scrcpy bytes (design D3)", (
   it("returns a JSON error for an unknown inject type and KEEPS the connection open", async () => {
     const gw = new FakeGateway();
     gw.active = true;
-    gw.lastWriter = { video: { width: 430, height: 960 }, write: async () => {} };
+    gw.injector = grpcControlInjector(fakeControl());
     const srv = makeServer(makeDeps(gw));
     try {
       const ws = await srv.ws("/v1/stream/control");
@@ -492,7 +347,15 @@ describe("WS /v1/stream/control — JSON inject → scrcpy bytes (design D3)", (
   it("returns a JSON error for out-of-range tap coordinates (Out-of-range coordinates)", async () => {
     const gw = new FakeGateway();
     gw.active = true;
-    gw.lastWriter = { video: { width: 430, height: 960 }, write: async () => {} };
+    gw.injector = grpcControlInjector(
+      fakeControl({
+        failWith: new GrpcControlError(
+          "OUT_OF_RANGE",
+          "coordinates out of physical display space (0..1079, 0..2339)",
+          { x: 9999, y: 9999 },
+        ),
+      }),
+    );
     const srv = makeServer(makeDeps(gw));
     try {
       const ws = await srv.ws("/v1/stream/control");
@@ -506,58 +369,40 @@ describe("WS /v1/stream/control — JSON inject → scrcpy bytes (design D3)", (
     }
   });
 
-  it("returns INJECTION_FAILED (never an ack) when the control socket breaks mid-stream — REAL gateway path (Control injection failure)", async () => {
-    // The FULL production path: WS route → sendControlEvent → REAL
-    // StreamGateway → REAL StreamSession.sendControl over a dead conn2.
-    const runner = new MemoryRunner();
-    const SCID = "feed1234";
-    runner.expect(["adb", "-s", "emulator-5554", "push", join(import.meta.dir, "..", "assets", "scrcpy-server.jar"), "/data/local/tmp/scrcpy-server.jar"], {});
-    runner.expect(["adb", "-s", "emulator-5554", "reverse", `localabstract:scrcpy_${SCID}`, "tcp:47000"], {});
-    const { factory, listener } = realSessionFactory(runner);
-    const gw = new RealGateway(
-      {
-        runner,
-        serial: "emulator-5554",
-        enabled: true,
-        scid: SCID,
-        pollDevices: async () => [{ serial: "emulator-5554", state: "device" }] as Device[],
+  it("returns INJECTION_FAILED (never an ack) when the injector fails mid-stream (Control injection failure)", async () => {
+    const gw = new FakeGateway();
+    gw.active = true;
+    const injected: string[] = [];
+    gw.injector = {
+      async inject(): Promise<void> {
+        injected.length = 0;
+        throw new Error("control socket broke");
       },
-      factory,
-    );
+    };
+    void recordingInjector;
     const srv = makeServer(makeDeps(gw));
     try {
-      // A video viewer starts the stream (first-viewer-start, design D5).
-      const vws = await srv.ws("/v1/stream/video");
-      for (let i = 0; i < 50 && !gw.managerRef.snapshot().active; i++) await new Promise((r) => setTimeout(r, 10));
-      expect(gw.managerRef.snapshot().active).toBe(true);
-      // Feed the recorded wire so the handshake lands (control encoding needs
-      // the real video size, 430x960).
-      const video = listener.connect(); // conn1
-      video.emitData(realWire());
-      for (let i = 0; i < 50 && gw.snapshot().width !== 430; i++) await new Promise((r) => setTimeout(r, 10));
-      expect(gw.snapshot().width).toBe(430);
-      // Control socket connects... then BREAKS mid-stream.
-      const cws = await srv.ws("/v1/stream/control");
-      listener.connect().emitClose(); // conn2 died
-      cws.send(JSON.stringify({ type: "inject", event: "tap", x: 215, y: 480 }));
-      const err = await nextMessage(cws);
+      const ws = await srv.ws("/v1/stream/control");
+      ws.send(JSON.stringify({ type: "inject", event: "tap", x: 215, y: 480 }));
+      const err = await nextMessage(ws);
       const body = JSON.parse(String(err)) as { type: string; code: string; message: string };
       expect(body.type).toBe("error");
       expect(body.code).toBe("INJECTION_FAILED");
-      expect(body.message).toMatch(/control socket is not connected/);
       // The control WS itself stays open (error frame, not a close).
-      vws.close();
-      cws.close();
+      await new Promise((r) => setTimeout(r, 100));
+      expect(ws.readyState).toBe(WebSocket.OPEN);
+      ws.close();
     } finally {
       srv.stop();
     }
   });
 });
 
-describe("Bridge WS gating — secret + CORS + kill-switch (design §Stream Configuration)", () => {
+describe("Bridge WS gating — secret + CORS (design §Stream Configuration)", () => {
   it("requires the shared secret on WS upgrades when the secret gate is on", async () => {
     const gw = new FakeGateway();
-    gw.active = true;
+    gw.supported = false;
+    gw.reason = "rtc_streaming_not_deployed";
     const srv = makeServer(makeDeps(gw), { secret: "s3cret" });
     try {
       // No secret header → upgrade rejected (HTTP 401, not a WS).
@@ -565,13 +410,15 @@ describe("Bridge WS gating — secret + CORS + kill-switch (design §Stream Conf
         headers: { connection: "upgrade", upgrade: "websocket" },
       });
       expect(res.status).toBe(401);
-      // With the secret header → WS connects.
+      // With the secret header → WS connects, and only THEN hits the
+      // unsupported gateway reject — proving the AUTH seam ran FIRST.
+      let code: number | undefined;
       const ws = await srv.ws("/v1/stream/video", "s3cret");
-      await new Promise((r) => setTimeout(r, 50)); // let subscribeVideo settle
-      await gw.viewers[0]!.sendHandshake(HANDSHAKE);
-      const first = await nextMessage(ws);
-      expect(JSON.parse(String(first)).type).toBe("handshake");
-      ws.close();
+      ws.addEventListener("close", (ev) => (code = ev.code));
+      const first = await nextMessage(ws); // the unsupported JSON error body
+      expect(String(first)).toContain("rtc_streaming_not_deployed");
+      await new Promise((r) => setTimeout(r, 300));
+      expect(code).toBe(WS_CLOSE_CODES.UNSUPPORTED);
     } finally {
       srv.stop();
     }
@@ -595,16 +442,11 @@ describe("Bridge WS gating — secret + CORS + kill-switch (design §Stream Conf
   });
 });
 
-describe("REST fallback — streaming on/off leaves /v1 frozen (Fallback contract)", () => {
+describe("REST fallback — streaming state leaves /v1 frozen (Fallback contract)", () => {
   it("still injects taps through adb when NO stream is active (polling picks adb)", async () => {
-    const { deps, state } = (() => {
-      const gw = new FakeGateway();
-      gw.active = false;
-      const d = makeDeps(gw);
-      return { deps: d, state: (d.adb as unknown as { __state?: never }) ?? null };
-    })();
-    void state;
-    const srv = makeServer(deps);
+    const gw = new FakeGateway();
+    gw.active = false;
+    const srv = makeServer(makeDeps(gw));
     try {
       const res = await srv.http("/v1/input/tap", {
         method: "POST",
@@ -620,7 +462,7 @@ describe("REST fallback — streaming on/off leaves /v1 frozen (Fallback contrac
     }
   });
 
-  it("still captures screenshots when streaming is active (stills still captured)", async () => {
+  it("still captures screenshots regardless of stream state (stills still captured)", async () => {
     const gw = new FakeGateway();
     gw.active = true;
     const srv = makeServer(makeDeps(gw));
@@ -633,14 +475,19 @@ describe("REST fallback — streaming on/off leaves /v1 frozen (Fallback contrac
     }
   });
 
-  it("reports stream state on /v1/state via the gateway snapshot (Active stream reports)", async () => {
+  it("reports stream state on /v1/state via the gateway snapshot (unsupported + reason)", async () => {
     const gw = new FakeGateway();
-    gw.active = true;
+    gw.reason = "rtc_streaming_not_deployed";
     const srv = makeServer(makeDeps(gw));
     try {
       const res = await srv.http("/v1/state");
-      const body = (await res.json()) as { stream?: { supported: boolean; active: boolean; viewers: number } };
-      expect(body.stream).toEqual({ supported: true, active: true, viewers: 0 });
+      const body = (await res.json()) as { stream?: { supported: boolean; active: boolean; viewers: number; reason?: string } };
+      expect(body.stream).toEqual({
+        supported: false,
+        active: false,
+        reason: "rtc_streaming_not_deployed",
+        viewers: 0,
+      });
     } finally {
       srv.stop();
     }

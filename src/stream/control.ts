@@ -1,39 +1,28 @@
 /**
- * Control bridge — JSON control events → scrcpy control bytes (design D3).
+ * Control bridge — JSON control events → gRPC unary injection (design D3/D5).
  *
- * The /v1/stream/control WS route (slice 2B) receives JSON like
- * `{type:"inject", event:"tap", x,y}` and injects scrcpy bytes into the
- * device's CONTROL socket. This module owns:
- *  - `parseControlJson`: validate the documented WS contract shapes,
- *  - `encodeControlEvent`: convert a typed event into the scrcpy byte
- *    messages the socket expects (touch DOWN/UP, keycode DOWN/UP, text),
+ * The /v1/stream/control WS route and the /v1/input REST routes receive JSON
+ * like `{type:"inject", event:"tap", x,y}` and inject through the emulator's
+ * EmulatorController gRPC surface (device PHYSICAL pixels — design D5; the
+ * scrcpy video-space mapping is gone with the scrcpy transport). This module
+ * owns:
+ *  - `parseControlJson`: validate the frozen WS contract shapes,
+ *  - `grpcControlInjector`: route a parsed event onto the gRPC control
+ *    client (tap/swipe → sendTouch, text/key → sendKey; there is NO sendText
+ *    RPC — text rides KeyboardEvent{text}, probe D),
  *  - typed errors so the WS layer can map them onto error frames,
  *  - `sendControlEvent`: the bridge entrypoint that returns a typed
- *    "stream-off" result when no stream is active, so the caller decides
- *    whether to fall back to the /v1/input REST routes.
+ *    "stream-off" result when no injector is active.
  *
- * Position space is the VIDEO size (430x960 with max_size=960), NOT the
- * device size — the surface maps device→video before sending (design
- * §Live-validated facts).
+ * Coordinates are validated CLIENT-SIDE against the physical display
+ * configuration inside `GrpcEmulatorControl` (out-of-range input is silently
+ * accepted by the emulator — probe-verified); the resulting OUT_OF_RANGE
+ * surfaces here as a ControlError.
  */
 
 import type { ControlEvent } from "./types";
-import {
-  serializeKeycodeEvent,
-  serializeTextEvent,
-  serializeTouchEvent,
-} from "./wire";
-import {
-  TOUCH_ACTION_DOWN,
-  TOUCH_ACTION_MOVE,
-  TOUCH_ACTION_UP,
-} from "./types";
-
-/** Video space the control coordinates live in (from the stream handshake). */
-export interface VideoSize {
-  width: number;
-  height: number;
-}
+import type { EmulatorControl } from "../device/grpc";
+import { GrpcControlError } from "../device/grpc";
 
 /** Typed control error codes (mapped onto WS error frames by the route). */
 export type ControlErrorCode =
@@ -41,7 +30,10 @@ export type ControlErrorCode =
   | "UNSUPPORTED_CHAR"
   | "UNSUPPORTED_EVENT"
   | "INVALID_JSON"
-  | "STREAM_OFF";
+  | "STREAM_OFF"
+  | "INJECTION_FAILED"
+  | "PERMISSION_DENIED"
+  | "DEVICE_OFFLINE";
 
 export class ControlError extends Error {
   readonly code: ControlErrorCode;
@@ -55,81 +47,7 @@ export class ControlError extends Error {
   }
 }
 
-/** ASCII+space only — scrcpy's text injector cannot send arbitrary UTF-8. */
-const INJECTABLE_ASCII = /^[\x20-\x7E]*$/;
-
-function assertInBounds(video: VideoSize, ...pts: Array<{ x: number; y: number }>): void {
-  for (const p of pts) {
-    if (
-      !Number.isInteger(p.x) ||
-      !Number.isInteger(p.y) ||
-      p.x < 0 ||
-      p.y < 0 ||
-      p.x >= video.width ||
-      p.y >= video.height
-    ) {
-      throw new ControlError("OUT_OF_RANGE", `coordinates out of video space (0..${video.width - 1}, 0..${video.height - 1})`, p);
-    }
-  }
-}
-
-/**
- * Encode a typed control event into the scrcpy control messages.
- * Returns one-or-more byte buffers to write to the CONTROL socket, in order.
- */
-export function encodeControlEvent(event: ControlEvent, video: VideoSize): Buffer[] {
-  const w = video.width;
-  const h = video.height;
-
-  switch (event.event) {
-    case "tap": {
-      assertInBounds(video, { x: event.x, y: event.y });
-      const down = serializeTouchEvent(TOUCH_ACTION_DOWN, event.x, event.y, { screenWidth: w, screenHeight: h });
-      const up = serializeTouchEvent(TOUCH_ACTION_UP, event.x, event.y, { screenWidth: w, screenHeight: h });
-      return [down, up];
-    }
-
-    case "swipe": {
-      assertInBounds(
-        video,
-        { x: event.x1, y: event.y1 },
-        { x: event.x2, y: event.y2 },
-      );
-      // Split the gesture into DOWN → MOVE steps → UP (design §control socket).
-      const steps = Math.max(1, Math.min(20, Math.round((event.durationMs ?? 100) / 16)));
-      const msgs: Buffer[] = [serializeTouchEvent(TOUCH_ACTION_DOWN, event.x1, event.y1, { screenWidth: w, screenHeight: h })];
-      for (let i = 1; i < steps; i++) {
-        const t = i / steps;
-        const x = Math.round(event.x1 + (event.x2 - event.x1) * t);
-        const y = Math.round(event.y1 + (event.y2 - event.y1) * t);
-        msgs.push(serializeTouchEvent(TOUCH_ACTION_MOVE, x, y, { screenWidth: w, screenHeight: h }));
-      }
-      msgs.push(serializeTouchEvent(TOUCH_ACTION_UP, event.x2, event.y2, { screenWidth: w, screenHeight: h }));
-      return msgs;
-    }
-
-    case "text": {
-      if (!INJECTABLE_ASCII.test(event.text)) {
-        throw new ControlError("UNSUPPORTED_CHAR", "scrcpy text injector supports ASCII+space only");
-      }
-      return [serializeTextEvent(event.text)];
-    }
-
-    case "key": {
-      if (!Number.isInteger(event.keycode) || event.keycode < 0) {
-        throw new ControlError("OUT_OF_RANGE", "keycode must be a non-negative integer", event.keycode);
-      }
-      const down = serializeKeycodeEvent(TOUCH_ACTION_DOWN, event.keycode);
-      const up = serializeKeycodeEvent(TOUCH_ACTION_UP, event.keycode);
-      return [down, up];
-    }
-
-    default:
-      throw new ControlError("UNSUPPORTED_EVENT", `unsupported control event: ${(event as { event?: string }).event}`);
-  }
-}
-
-// ─── JSON contract parsing ───────────────────────────────────────────────
+// ─── JSON contract parsing (frozen WS contract) ──────────────────────────
 
 export type ParseControlResult =
   | { ok: true; event: ControlEvent }
@@ -191,28 +109,83 @@ export function parseControlJson(raw: string): ParseControlResult {
   return { ok: false, code: "UNSUPPORTED_EVENT", message: `unknown control event: ${String(event)}` };
 }
 
+// ─── gRPC-backed injector (design D3/D5) ─────────────────────────────────
+
+/** One injectable control surface (the bridge's control channel entrypoint). */
+export interface ControlInjector {
+  /** Inject ONE parsed control event. Throws ControlError on failure. */
+  inject(event: ControlEvent): Promise<void>;
+}
+
+/** Map a gRPC control failure onto the typed ControlError the WS layer knows. */
+function toControlError(e: unknown): ControlError {
+  if (e instanceof ControlError) return e;
+  if (e instanceof GrpcControlError) {
+    return new ControlError(e.code, e.message, e.details);
+  }
+  const message = e instanceof Error ? e.message : String(e);
+  return new ControlError("INJECTION_FAILED", `control injection failed: ${message}`);
+}
+
+/**
+ * Build the gRPC-backed injector over an EmulatorController client
+ * (device physical px; probe-verified 12ms unary round-trips).
+ */
+export function grpcControlInjector(control: EmulatorControl): ControlInjector {
+  return {
+    async inject(event: ControlEvent): Promise<void> {
+      try {
+        switch (event.event) {
+          case "tap":
+            await control.tap(event.x, event.y);
+            return;
+          case "swipe":
+            await control.swipe(event.x1, event.y1, event.x2, event.y2, event.durationMs);
+            return;
+          case "text":
+            // No sendText RPC exists — text rides sendKey(KeyboardEvent{text})
+            // (probe D, design D3). Full UTF-8: no scrcpy ASCII restriction.
+            await control.text(event.text);
+            return;
+          case "key":
+            // codeType Usb=0: the WS keycode space is the emulator's raw
+            // input code (translated via the emulator's chromium tables).
+            await control.keyCode(event.keycode, 0);
+            return;
+          default:
+            throw new ControlError(
+              "UNSUPPORTED_EVENT",
+              `unsupported control event: ${(event as { event?: string }).event}`,
+            );
+        }
+      } catch (e) {
+        throw toControlError(e);
+      }
+    },
+  };
+}
+
 // ─── Bridge entrypoint ───────────────────────────────────────────────────
 
-/** Result of sending a control event when NO stream is active. */
+/** Result of sending a control event when NO injector is active. */
 export type StreamOffResult =
-  | { ok: true; messages: Buffer[] }
+  | { ok: true }
   | { ok: false; code: "STREAM_OFF"; reason: string };
 
 /**
- * Send a control event through an ACTIVE stream's control writer.
- * When no stream is active, returns the typed STREAM_OFF result — the
- * caller (WS route or fallback) decides whether to use /v1/input REST.
+ * Parse and inject a control event through the ACTIVE injector. When no
+ * injector is active, returns the typed STREAM_OFF result — the caller
+ * (WS route or fallback) decides whether to use /v1/input REST.
  */
 export async function sendControlEvent(
-  activeStream: { video: VideoSize; writer: (bytes: Buffer[]) => Promise<void> } | null | undefined,
+  injector: ControlInjector | null | undefined,
   raw: string,
 ): Promise<StreamOffResult> {
   const parsed = parseControlJson(raw);
   if (!parsed.ok) throw new ControlError(parsed.code, parsed.message);
-  if (!activeStream) {
+  if (!injector) {
     return { ok: false, code: "STREAM_OFF", reason: "no active stream; use /v1/input REST fallback" };
   }
-  const messages = encodeControlEvent(parsed.event, activeStream.video);
-  await activeStream.writer(messages);
-  return { ok: true, messages };
+  await injector.inject(parsed.event);
+  return { ok: true };
 }

@@ -74,13 +74,12 @@ export function createBridgeDeps(env: Record<string, string> = process.env as Re
   if (streamEnabled(env)) {
     // The gateway serial follows the same resolution as REST: ANDROID_DEVICE
     // env beats the single attached device. autodetect-ing here is deferred
-    // to the gateway's own device read via the watchdog source.
+    // to when a stream actually starts (first viewer) — keeps /v1/state
+    // honest before any viewer is attached.
     const serial = env["ANDROID_DEVICE"] ?? "";
     deps.streamGateway = new StreamGateway({
-      runner,
-      // Empty serial: the gateway falls back to resolving the device when a
-      // stream actually starts (first viewer) — keeps /v1/state honest before
-      // any viewer is attached.
+      // Empty serial: the gateway resolves the device when a stream actually
+      // starts (first viewer).
       serial: serial || "auto",
       enabled: true,
     });

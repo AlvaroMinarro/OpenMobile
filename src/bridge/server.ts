@@ -29,6 +29,7 @@ import {
 import {
   sendControlEvent,
   ControlError,
+  type ControlInjector,
 } from "../stream/control";
 import {
   authenticateRequest,
@@ -171,10 +172,11 @@ export interface StreamGateway {
   /** Release a video viewer (last release may tear the session down). */
   unsubscribeVideo(viewerId: string): void;
   /**
-   * The ACTIVE session's control writer, or null when no stream is up.
-   * The control route sends scrcpy bytes through `write` after validation.
+   * The ACTIVE stream's control injector, or null when no stream is up.
+   * The control route validates the JSON contract and calls `inject`
+   * (gRPC unary in device physical pixels, design D3/D5).
    */
-  controlActive(): { video: { width: number; height: number }; write: (bytes: Buffer[]) => Promise<void> } | null;
+  controlActive(): ControlInjector | null;
 }
 
 /** Additive `stream` object in /v1/state (design D6; locked contract delta). */
@@ -1023,12 +1025,7 @@ export function createBridgeApp(deps: BridgeDeps, opts: BridgeOptions = {}): Bri
     }
     const active = deps.streamGateway.controlActive();
     try {
-      const result = await sendControlEvent(
-        active
-          ? { video: active.video, writer: (b: Buffer[]) => active.write(b) }
-          : undefined,
-        text,
-      );
+      const result = await sendControlEvent(active, text);
       if (result.ok) {
         ws.send(JSON.stringify({ type: "ack" }));
       } else {
