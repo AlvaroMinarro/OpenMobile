@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { AndroidCli } from "../src/device/androidCli";
@@ -30,8 +30,12 @@ import type { DeviceContext } from "../src/tools/context";
 import type { CommandRunner } from "../src/device/runner";
 import { TimeoutRunner } from "./helpers/timeoutRunner";
 
-function makeCtx(runner: CommandRunner, timeoutMs = 200): DeviceContext {
-  const cli = new AndroidCli(runner);
+function makeCtx(
+  runner: CommandRunner,
+  timeoutMs = 200,
+  spawn?: (argv: string[]) => { exited: Promise<number>; kill(): void },
+): DeviceContext {
+  const cli = new AndroidCli(runner, spawn);
   const adb = new AdbWrapper(runner);
   return {
     cli,
@@ -207,74 +211,157 @@ describe("get_device_info — device props via adb getprop (D6: never android in
   });
 });
 
-describe("emulator_start — correlates the STARTED emulator (D5: never first state=device)", () => {
+describe("emulator_start — direct-spawn launch (D4/D6) correlating the STARTED emulator (D5)", () => {
+  const SDK = "/opt/fake-sdk";
+  const EMU = `${SDK}/emulator/emulator`;
+  const VERSION_36_5 = "Android emulator version 36.5.11.0 (build_id 15261951) (CL:N/A)\n";
   const listOne =
     "AVD ID            AVD Name       API Level    Status   Serial\nPixel_9_Pro       Pixel 9 Pro    android-36   Offline\n";
+  const listOnline =
+    "AVD ID            AVD Name       API Level    Status   Serial\nPixel_9_Pro       Pixel 9 Pro    android-36   Online   emulator-5554\n";
 
-  it("starts the single AVD (no name) and waits for the reported serial to reach 'device'", async () => {
-    const runner = new MemoryRunner();
-    runner.expect(["android", "emulator", "list", "--long"], { stdout: listOne });
-    runner.expect(["adb", "devices", "-l"], { stdout: "List of devices attached\n" }); // pre-start snapshot
-    runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], { exitCode: 0 }); // no marker => fallback
-    runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5557\tdevice\n" }); // post-start: NEW serial
-    runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5557\tdevice\n" }); // readiness poll
-    const ctx = makeCtx(runner, 200);
-    const res = await emulatorStart(ctx, {});
-    expect(res.isError).toBeFalsy();
-    expect(JSON.parse(textOf(res))).toEqual({ started: "Pixel_9_Pro", serial: "emulator-5557" });
-    runner.assertSatisfied();
+  /** Detached-spawn double: the emulator keeps running (exited stays pending). */
+  const detachedSpawn = () => () => ({
+    exited: new Promise<number>(() => {}),
+    kill: () => {},
   });
 
-  it("polls the serial named in the CLI 'started as' marker, ignoring an already-attached device", async () => {
-    const runner = new MemoryRunner();
-    runner.expect(["android", "emulator", "list", "--long"], { stdout: listOne });
-    runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5556\tdevice\n" }); // OTHER device is already device
-    runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], {
-      stdout: "Virtual device successfully started as 'emulator-5554'.\n",
-    });
-    runner.expect(["adb", "devices", "-l"], {
-      stdout: "emulator-5556\tdevice\nemulator-5554\toffline\n",
-    });
-    runner.expect(["adb", "devices", "-l"], {
-      stdout: "emulator-5556\tdevice\nemulator-5554\tdevice\n",
-    });
-    const ctx = makeCtx(runner, 400);
-    const res = await emulatorStart(ctx, { name: "Pixel_9_Pro" });
-    expect(res.isError).toBeFalsy();
-    const parsed = JSON.parse(textOf(res)) as { started: string; serial: string };
-    expect(parsed.started).toBe("Pixel_9_Pro");
-    expect(parsed.serial).toBe("emulator-5554"); // NOT emulator-5556
-    runner.assertSatisfied();
+  /** Allowlist dir the CLI's writeAllowlist() honors (env contract). */
+  function useAllowlistDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), "om-tools-allowlist-"));
+    process.env["OPENMOBILE_ALLOWLIST_DIR"] = dir;
+    return dir;
+  }
+
+  function cleanupAllowlist(dir?: string): void {
+    delete process.env["OPENMOBILE_ALLOWLIST_DIR"];
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+
+  /** Record the shared happy-path expectations: pre-check, sdk, version, then a poll that goes Online. */
+  function expectLaunchFlow(runner: MemoryRunner, pollList: string): void {
+    runner.expect(["android", "emulator", "list", "--long"], { stdout: listOne }); // pre-start pre-check
+    runner.expect(["android", "info", "sdk"], { stdout: `${SDK}\n` });
+    runner.expect([EMU, "-version"], { stdout: VERSION_36_5 });
+    runner.expect(["android", "emulator", "list", "--long"], { stdout: pollList }); // registration poll
+  }
+
+  it("starts the single AVD (no name) via direct spawn and waits for its serial to reach 'device'", async () => {
+    const dir = useAllowlistDir();
+    try {
+      const runner = new MemoryRunner();
+      expectLaunchFlow(runner, listOnline);
+      runner.expect(["adb", "devices", "-l"], {
+        stdout: "emulator-5556\tdevice\nemulator-5554\toffline\n",
+      }); // readiness poll 1: not ready yet
+      runner.expect(["adb", "devices", "-l"], {
+        stdout: "emulator-5556\tdevice\nemulator-5554\tdevice\n",
+      }); // readiness poll 2: ready
+      const calls: string[][] = [];
+      const spawn = (argv: string[]) => {
+        calls.push([...argv]);
+        return { exited: new Promise<number>(() => {}), kill: () => {} };
+      };
+      const ctx = makeCtx(runner, 400, spawn);
+      const res = await emulatorStart(ctx, {});
+      expect(res.isError).toBeFalsy();
+      expect(JSON.parse(textOf(res))).toEqual({ started: "Pixel_9_Pro", serial: "emulator-5554" });
+      // The emulator binary was launched directly with the allowlist flag.
+      expect(calls[0]![0]).toBe(EMU);
+      expect(calls[0]).toContain("-grpc-allowlist");
+      // D5: the OTHER already-attached device (emulator-5556) is never mistaken for ours.
+      runner.assertSatisfied();
+    } finally {
+      cleanupAllowlist(dir);
+    }
   });
 
-  it("falls back to the new emulator-* serial diff when the CLI prints no marker", async () => {
-    const runner = new MemoryRunner();
-    runner.expect(["android", "emulator", "list", "--long"], { stdout: listOne });
-    runner.expect(["adb", "devices", "-l"], { stdout: "List of devices attached\n" });
-    runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], { exitCode: 0 });
-    runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5554\tdevice\n" }); // new serial appears
-    runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5554\tdevice\n" });
-    const ctx = makeCtx(runner, 300);
-    const res = await emulatorStart(ctx, { name: "Pixel_9_Pro" });
-    const parsed = JSON.parse(textOf(res)) as { serial: string };
-    expect(parsed.serial).toBe("emulator-5554");
-    runner.assertSatisfied();
+  it("polls the serial registered in the AVD list, ignoring an already-attached device", async () => {
+    const dir = useAllowlistDir();
+    try {
+      const runner = new MemoryRunner();
+      runner.expect(["android", "emulator", "list", "--long"], { stdout: listOne }); // pre-start pre-check
+      runner.expect(["android", "info", "sdk"], { stdout: `${SDK}\n` });
+      runner.expect([EMU, "-version"], { stdout: VERSION_36_5 });
+      runner.expect(["android", "emulator", "list", "--long"], { stdout: listOne }); // still booting
+      runner.expect(["android", "emulator", "list", "--long"], { stdout: listOnline }); // registered
+      runner.expect(["adb", "devices", "-l"], {
+        stdout: "emulator-5556\tdevice\nemulator-5554\tdevice\n",
+      }); // readiness: 5554 ready while 5556 was already device
+      const ctx = makeCtx(runner, 400, detachedSpawn());
+      const res = await emulatorStart(ctx, { name: "Pixel_9_Pro" });
+      expect(res.isError).toBeFalsy();
+      const parsed = JSON.parse(textOf(res)) as { started: string; serial: string };
+      expect(parsed.started).toBe("Pixel_9_Pro");
+      expect(parsed.serial).toBe("emulator-5554"); // NOT emulator-5556
+      runner.assertSatisfied();
+    } finally {
+      cleanupAllowlist(dir);
+    }
+  });
+
+  it("passes an explicit fps: 60 through to the -rtcfps launch flag", async () => {
+    const dir = useAllowlistDir();
+    try {
+      const runner = new MemoryRunner();
+      runner.expect(["android", "emulator", "list", "--long"], { stdout: listOne }); // pre-start pre-check
+      runner.expect(["android", "info", "sdk"], { stdout: `${SDK}\n` });
+      // 36.6 knows -rtcfps (36.5.11 does not — live-verified).
+      runner.expect([EMU, "-version"], {
+        stdout: "Android emulator version 36.6.11.0 (build_id 16000000) (CL:N/A)\n",
+      });
+      runner.expect(["android", "emulator", "list", "--long"], { stdout: listOnline }); // registration poll
+      runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5554\tdevice\n" }); // readiness
+      const calls: string[][] = [];
+      const spawn = (argv: string[]) => {
+        calls.push([...argv]);
+        return { exited: new Promise<number>(() => {}), kill: () => {} };
+      };
+      const ctx = makeCtx(runner, 400, spawn);
+      const res = await emulatorStart(ctx, { name: "Pixel_9_Pro", fps: 60 });
+      expect(res.isError).toBeFalsy();
+      expect(calls[0]!.slice(calls[0]!.indexOf("-rtcfps") + 1)[0]).toBe("60");
+      runner.assertSatisfied();
+    } finally {
+      cleanupAllowlist(dir);
+    }
   });
 
   it("returns an actionable error when the started serial never reaches 'device'", async () => {
-    const runner = new MemoryRunner();
-    runner.expect(["android", "emulator", "list", "--long"], { stdout: listOne });
-    runner.expect(["adb", "devices", "-l"], { stdout: "List of devices attached\n" });
-    runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], { exitCode: 0 });
-    runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5554\toffline\n" }); // post-start snapshot
-    runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5554\toffline\n" }); // readiness poll
-    const ctx = makeCtx(runner, 60);
-    const res = await emulatorStart(ctx, { name: "Pixel_9_Pro" });
-    expect(res.isError).toBe(true);
-    expect(textOf(res)).toContain("Pixel_9_Pro");
-    expect(textOf(res)).toContain("emulator-5554");
-    expect(textOf(res)).toContain("offline");
-    runner.assertSatisfied();
+    const dir = useAllowlistDir();
+    try {
+      const runner = new MemoryRunner();
+      expectLaunchFlow(runner, listOnline);
+      runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5554\toffline\n" }); // readiness poll
+      const ctx = makeCtx(runner, 60, detachedSpawn());
+      const res = await emulatorStart(ctx, { name: "Pixel_9_Pro" });
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain("Pixel_9_Pro");
+      expect(textOf(res)).toContain("emulator-5554");
+      expect(textOf(res)).toContain("offline");
+      runner.assertSatisfied();
+    } finally {
+      cleanupAllowlist(dir);
+    }
+  });
+
+  it("surfaces an actionable launch failure (version gate) instead of starting", async () => {
+    const dir = useAllowlistDir();
+    try {
+      const runner = new MemoryRunner();
+      runner.expect(["android", "emulator", "list", "--long"], { stdout: listOne }); // pre-start pre-check
+      runner.expect(["android", "info", "sdk"], { stdout: `${SDK}\n` });
+      runner.expect([EMU, "-version"], {
+        stdout: "Android emulator version 36.4.9.0 (build_id 1) (CL:N/A)\n",
+      });
+      const ctx = makeCtx(runner, 200, detachedSpawn());
+      const res = await emulatorStart(ctx, { name: "Pixel_9_Pro" });
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain("36.5.11");
+      runner.assertSatisfied();
+    } finally {
+      cleanupAllowlist(dir);
+    }
   });
 
   it("returns an error naming the unknown AVD and listing the available ones", async () => {
@@ -286,19 +373,6 @@ describe("emulator_start — correlates the STARTED emulator (D5: never first st
     expect(textOf(res)).toContain("Ghost_AVD");
     expect(textOf(res)).toContain("Pixel_9_Pro"); // lists available AVDs
     runner.assertSatisfied(); // no start command was ever issued
-  });
-
-  it("refuses success when no serial can be correlated (no marker, no new emulator-* device)", async () => {
-    const runner = new MemoryRunner();
-    runner.expect(["android", "emulator", "list", "--long"], { stdout: listOne });
-    runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5556\tdevice\n" });
-    runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], { exitCode: 0 });
-    runner.expect(["adb", "devices", "-l"], { stdout: "emulator-5556\tdevice\n" }); // nothing new appears
-    const ctx = makeCtx(runner, 200);
-    const res = await emulatorStart(ctx, { name: "Pixel_9_Pro" });
-    expect(res.isError).toBe(true);
-    expect(textOf(res)).toContain("Pixel_9_Pro");
-    runner.assertSatisfied();
   });
 });
 

@@ -61,7 +61,7 @@ describe("SPAWN_TIMEOUTS — D1 timeout table", () => {
     expect(SPAWN_TIMEOUTS.devices).toBe(10_000); // devices / getprop / info
     expect(SPAWN_TIMEOUTS.input).toBe(10_000); // input ops
     expect(SPAWN_TIMEOUTS.emulatorManage).toBe(30_000); // list / stop / create
-    expect(SPAWN_TIMEOUTS.emulatorStart).toBe(120_000); // start blocks until ready
+    expect(SPAWN_TIMEOUTS.emulatorStart).toBe(120_000); // direct-spawn registration deadline
     expect(SPAWN_TIMEOUTS.install).toBe(120_000); // install / run deploy
   });
 });
@@ -135,39 +135,30 @@ describe("Timeout wiring — wrappers pass their per-op SPAWN_TIMEOUTS entry (D1
     await cli.emulatorList();
     expect(runner.optsLog[5]?.timeoutMs).toBe(SPAWN_TIMEOUTS.emulatorManage);
 
-    runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], {});
-    await cli.emulatorStart("Pixel_9_Pro");
-    expect(runner.optsLog[6]?.timeoutMs).toBe(SPAWN_TIMEOUTS.emulatorStart);
+    // emulatorStart is NOT wired through the runner anymore: it direct-spawns
+    // <sdk>/emulator/emulator (design D4) and uses SPAWN_TIMEOUTS.emulatorStart
+    // as its registration deadline — covered by test/androidCli.test.ts.
 
     runner.expect(["android", "emulator", "stop", "Pixel_9_Pro"], {});
     await cli.emulatorStop("Pixel_9_Pro");
-    expect(runner.optsLog[7]?.timeoutMs).toBe(SPAWN_TIMEOUTS.emulatorManage);
+    expect(runner.optsLog[6]?.timeoutMs).toBe(SPAWN_TIMEOUTS.emulatorManage);
 
     runner.expect(["android", "emulator", "create", "Pixel_9_Pro"], {});
     await cli.emulatorCreate("Pixel_9_Pro");
-    expect(runner.optsLog[8]?.timeoutMs).toBe(SPAWN_TIMEOUTS.emulatorManage);
+    expect(runner.optsLog[7]?.timeoutMs).toBe(SPAWN_TIMEOUTS.emulatorManage);
 
     runner.expect(["android", "install", `--device=${serial}`, "/tmp/a.apk"], {});
     await cli.install({ serial, apk: "/tmp/a.apk" });
-    expect(runner.optsLog[9]?.timeoutMs).toBe(SPAWN_TIMEOUTS.install);
+    expect(runner.optsLog[8]?.timeoutMs).toBe(SPAWN_TIMEOUTS.install);
 
     runner.expect(["android", "run", `--device=${serial}`, "/tmp/a.apk"], {});
     await cli.run({ serial, apk: "/tmp/a.apk" });
-    expect(runner.optsLog[10]?.timeoutMs).toBe(SPAWN_TIMEOUTS.install);
+    expect(runner.optsLog[9]?.timeoutMs).toBe(SPAWN_TIMEOUTS.install);
 
     runner.expect(["android", "info", "version"], { stdout: "1.0.0\n" });
     await cli.info("version");
-    expect(runner.optsLog[11]?.timeoutMs).toBe(SPAWN_TIMEOUTS.devices);
+    expect(runner.optsLog[10]?.timeoutMs).toBe(SPAWN_TIMEOUTS.devices);
 
-    runner.assertSatisfied();
-  });
-
-  it("a per-call timeoutMs override wins over the SPAWN_TIMEOUTS default", async () => {
-    const runner = new MemoryRunner();
-    const cli = new AndroidCli(runner);
-    runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], {});
-    await cli.emulatorStart("Pixel_9_Pro", 300_000);
-    expect(runner.optsLog[0]?.timeoutMs).toBe(300_000);
     runner.assertSatisfied();
   });
 

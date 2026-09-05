@@ -102,7 +102,10 @@ export interface BridgeDeps {
      * legacy fakes stay valid — absent ⇒ the route 404s
      * (streaming-not-deployed precedent).
      */
-    emulatorStart?(name: string, timeoutMs?: number): Promise<string | null>;
+    emulatorStart?(
+      name: string,
+      opts?: { fps?: number; timeoutMs?: number },
+    ): Promise<string>;
     emulatorStop?(name: string): Promise<void>;
     emulatorCreate?(name: string): Promise<void>;
     /** CLI layout path of the local get_ui_tree tool (GET /v1/ui-tree). */

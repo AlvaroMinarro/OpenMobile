@@ -17,6 +17,10 @@ export const emulatorListSchema = z.object({});
 export const emulatorStartSchema = z.object({
   name: z.string().optional().describe("AVD name; defaults to the single available AVD"),
   timeoutMs: z.number().int().positive().optional().describe("Outer readiness timeout (ms)"),
+  fps: z
+    .union([z.literal(30), z.literal(60)])
+    .optional()
+    .describe("RTC encoder fps for -rtcfps (30 default; 60 needs emulator ≥ 36.6)"),
 });
 
 export const emulatorStopSchema = z.object({

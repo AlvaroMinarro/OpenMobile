@@ -1,7 +1,6 @@
 import type { DeviceContext, ResolvedTarget } from "./context";
 import { resolveTarget, safe, ToolError } from "./context";
 import { xmlToTree, uiElementToJson } from "../device/serialize";
-import type { Device } from "../device/types";
 import { tempPngPath } from "../device/temp";
 import { rm } from "node:fs/promises";
 
@@ -34,21 +33,6 @@ const okImage = (data: string, mimeType = "image/png"): ToolResult => ({
 });
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
-/**
- * Correlate the emulator we just started when the CLI prints no `started as`
- * marker: the post-start device list must contain exactly one NEW `emulator-*`
- * serial that was not present before the start (design D5 fallback). Returns
- * null when no serial can be attributed — the caller refuses success rather
- * than guessing the first state=device device.
- */
-function diffNewEmulatorSerial(before: Device[], after: Device[]): string | null {
-  const beforeEmulators = new Set(before.filter((d) => /^emulator-\d+$/.test(d.serial)).map((d) => d.serial));
-  const candidates = after.filter(
-    (d) => /^emulator-\d+$/.test(d.serial) && !beforeEmulators.has(d.serial),
-  );
-  return candidates.length === 1 ? (candidates[0]!.serial as string) : null;
-}
 
 async function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -153,7 +137,10 @@ export const getDeviceInfo = (ctx: DeviceContext, args: { device?: string }) =>
 export const emulatorList = (ctx: DeviceContext, _args?: unknown) =>
   safe(async () => ({ avds: await ctx.cli.emulatorList() }));
 
-export const emulatorStart = (ctx: DeviceContext, args: { name?: string; timeoutMs?: number }) =>
+export const emulatorStart = (
+  ctx: DeviceContext,
+  args: { name?: string; timeoutMs?: number; fps?: number },
+) =>
   safe(async () => {
     const timeout = args.timeoutMs ?? ctx.timeoutMs;
     const available = await ctx.cli.emulatorList();
@@ -172,24 +159,21 @@ export const emulatorStart = (ctx: DeviceContext, args: { name?: string; timeout
         `unknown AVD '${name}'; available AVDs: ${available.map((a) => a.name).join(", ") || "(none)"}`,
       );
     }
-    // CLI-delegated readiness: the start command blocks until boot, wrapped in
-    // an outer timeout, and prints the serial of the STARTED emulator. We poll
-    // THAT serial to state 'device' — never the first state=device device
+    // Direct-spawn launch (design D4/D6): the CLI layer spawns the emulator
+    // binary with -grpc-allowlist (+ -rtcfps on ≥ 36.6) and blocks until the
+    // STARTED AVD registers a serial — never the first state=device device
     // (design D5: an already-attached device must not be mistaken for the one
-    // we started). When the CLI prints no marker we diff the pre/post device
-    // lists for a NEW emulator-* serial.
-    const preStart = await ctx.adb.devices();
-    const started = await withTimeout(
-      ctx.cli.emulatorStart(name),
+    // we started). The serial is always correlated or the launch throws.
+    // Registration polling stays well inside this outer readiness budget:
+    // one poll never exceeds a quarter of it.
+    const serial = await withTimeout(
+      ctx.cli.emulatorStart(name, {
+        fps: args.fps,
+        pollMs: Math.min(250, Math.max(10, Math.floor(timeout / 4))),
+      }),
       timeout,
       `emulator start for ${name} timed out`,
     );
-    const serial = started ?? diffNewEmulatorSerial(preStart, await ctx.adb.devices());
-    if (!serial) {
-      throw new ToolError(
-        `emulator ${name} started, but its serial could not be determined (no 'started as' marker and no new emulator-* device appeared)`,
-      );
-    }
     const deadline = Date.now() + timeout;
     let last = "no-device";
     while (Date.now() < deadline) {
