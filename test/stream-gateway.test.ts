@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { StreamGateway } from "../src/stream/gateway";
-import type { StreamViewer } from "../src/stream/types";
+import type { RtcServerMessage, StreamViewer } from "../src/stream/types";
 
 /**
  * StreamGateway in PR1 (native gRPC control): the legacy daemon transport is
@@ -12,6 +12,7 @@ import type { StreamViewer } from "../src/stream/types";
 class Recorder implements StreamViewer {
   open = true;
   closed = 0;
+  messages: RtcServerMessage[] = [];
   private readonly _id: string;
   constructor(id: string) {
     this._id = id;
@@ -19,9 +20,9 @@ class Recorder implements StreamViewer {
   get id(): string {
     return this._id;
   }
-  async sendHandshake(): Promise<void> {}
-  async sendFrame(): Promise<void> {}
-  async sendState(): Promise<void> {}
+  async sendMessage(msg: RtcServerMessage): Promise<void> {
+    this.messages.push(msg);
+  }
   close(): void {
     this.open = false;
     this.closed++;

@@ -124,6 +124,9 @@ const openGateway: StreamGateway = {
     return { ok: true, viewerId: "v1" };
   },
   unsubscribeVideo(): void {},
+  relayViewerMessage(): boolean {
+    return true;
+  },
   controlActive() {
     return null;
   },

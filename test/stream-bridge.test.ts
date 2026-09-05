@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { createBridgeApp } from "../src/bridge/server";
 import type { BridgeDeps, StreamGateway, StreamStateView, StreamSubscribeResult } from "../src/bridge/server";
 import type { AVD, Device } from "../src/device/types";
-import type { ControlEvent, StreamViewer } from "../src/stream/types";
+import type { ControlEvent, RtcClientMessage, RtcServerMessage, StreamViewer } from "../src/stream/types";
 import { WS_CLOSE_CODES } from "../src/stream/types";
 import { grpcControlInjector, type ControlInjector } from "../src/stream/control";
 import { GrpcControlError } from "../src/device/grpc";
@@ -11,16 +11,15 @@ import type { EmulatorControl } from "../src/device/grpc";
 /**
  * Bridge WS integration (task 2.1/2.6): in-memory Bun.serve on port 0 with a
  * REAL Bun WebSocket client, against a FAKE StreamGateway (no adb, no
- * emulator — the gateway contract is all the bridge cares about). In PR1 the
- * real gateway reports streaming UNSUPPORTED, so the video route always
- * rejects 4403 and the control route rejects at upgrade unless the (fake)
- * gateway reports an active injector.
+ * emulator — the gateway contract is all the bridge cares about). Video is
+ * JSON JSEP signaling (task 2.7); the control route rejects at upgrade
+ * unless the (fake) gateway reports an active injector.
  */
 
 // ─── Fake gateway / viewer / deps ────────────────────────────────────────
 
 class FakeViewer implements StreamViewer {
-  states: unknown[] = [];
+  messages: RtcServerMessage[] = [];
   open = true;
   closed = 0;
   private readonly _id: string;
@@ -30,10 +29,8 @@ class FakeViewer implements StreamViewer {
   get id(): string {
     return this._id;
   }
-  async sendHandshake(): Promise<void> {}
-  async sendFrame(): Promise<void> {}
-  async sendState(s: unknown): Promise<void> {
-    this.states.push(s);
+  async sendMessage(msg: RtcServerMessage): Promise<void> {
+    this.messages.push(msg);
   }
   close(): void {
     this.open = false;
@@ -97,6 +94,12 @@ class FakeGateway implements StreamGateway {
   controlActive(): ControlInjector | null {
     return this.active ? this.injector : null;
   }
+
+  relayViewerMessage(viewerId: string, msg: RtcClientMessage): boolean {
+    this.relays.push({ viewerId, msg });
+    return this.viewers.some((v) => v.id === viewerId);
+  }
+  relays: Array<{ viewerId: string; msg: RtcClientMessage }> = [];
 }
 
 /** Recording injector fake (no gRPC client involved). */

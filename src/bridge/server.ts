@@ -21,8 +21,10 @@ import type { DeviceContext } from "../tools/context";
 import { LogcatHub, type LogcatSocket, type LogcatSubscription } from "../stream/logcatHub";
 import {
   WS_CLOSE_CODES,
+  parseClientJsep,
   type ControlErrorMessage,
-  type StreamStateMessage,
+  type RtcClientMessage,
+  type RtcServerMessage,
   type StreamViewer,
 } from "../stream/types";
 import {
@@ -143,8 +145,9 @@ export interface BridgeDeps {
    * Stream subsystem for the WS routes (design D2/D3/D5). When absent, the
    * WS /v1/stream/* routes are rejected with 404 (no streaming deployed).
    * The bridge only consumes this narrow contract:
-   *  - subscribeVideo → a StreamViewer the daemon will feed (handshake
-   *    first, then binary AUs; the viewer's close() means session ending),
+   *  - subscribeVideo → a StreamViewer the session will feed (handshake
+   *    first, then the JSEP offer/ice frames; the viewer's close() means
+   *    session ending → 4409),
    *  - unsubscribeVideo → release the viewer,
    *  - controlActive → the ACTIVE stream's gRPC control injector (null =
    *    none; the bridge sends validated JSON injects through it),
@@ -162,7 +165,7 @@ export type StreamSubscribeResult =
   | { ok: true; viewerId: string }
   | {
       ok: false;
-      code: "UNSUPPORTED" | "CAP_REACHED" | "NO_DEVICE";
+      code: "UNSUPPORTED" | "CAP_REACHED" | "NO_DEVICE" | "PERMISSION_DENIED";
       reason?: string;
     };
 
@@ -171,15 +174,22 @@ export interface StreamGateway {
   snapshot(): StreamStateView;
   /**
    * Register a video viewer. The bridge PASSES the socket-facing viewer; the
-   * gateway (via its fanout) broadcasts into it: sendHandshake (JSON) first,
-   * then sendFrame (binary AU) per access unit; when the session ends the
-   * gateway's teardown calls viewer.close() (the bridge closes 4409).
-   * Returns UNSUPPORTED (kill-switch off), CAP_REACHED (design D4, 8 max),
-   * or NO_DEVICE (start failed) — the bridge maps these onto close codes.
+   * gateway (via its RtcSession) relays JSEP signaling into it: the
+   * handshake (JSON) FIRST, then the offer/ice frames; when the session ends
+   * the gateway's teardown calls viewer.close() (the bridge closes 4409).
+   * Returns UNSUPPORTED (kill-switch off / capability gate), CAP_REACHED
+   * (design D4, 8 max), PERMISSION_DENIED (4401) or NO_DEVICE (start
+   * failed) — the bridge maps these onto close codes.
    */
   subscribeVideo(viewer: StreamViewer): Promise<StreamSubscribeResult>;
   /** Release a video viewer (last release may tear the session down). */
   unsubscribeVideo(viewerId: string): void;
+  /**
+   * Relay a validated client JSEP frame (answer/ice/state) into THAT
+   * viewer's RTC stream. Returns false when no session/viewer exists — the
+   * bridge closes the socket (4409) instead of silently dropping the frame.
+   */
+  relayViewerMessage(viewerId: string, msg: RtcClientMessage): boolean;
   /**
    * The ACTIVE stream's control injector, or null when no stream is up.
    * The control route validates the JSON contract and calls `inject`
@@ -979,6 +989,7 @@ export function createBridgeApp(deps: BridgeDeps, opts: BridgeOptions = {}): Bri
     message(ws, msg) {
       const conn = ws.data as unknown as WsConn;
       if (conn.kind === "control") void onControlMessage(ws, msg);
+      else if (conn.kind === "video") onVideoMessage(ws, msg);
       else if (conn.kind === "logcat") {
         const text =
           typeof msg === "string" ? msg : Buffer.from(msg as Uint8Array).toString("utf8");
@@ -1026,21 +1037,15 @@ export function createBridgeApp(deps: BridgeDeps, opts: BridgeOptions = {}): Bri
       wsReject(ws, WS_CLOSE_CODES.UNSUPPORTED, snap.reason ?? "streaming unsupported");
       return;
     }
-    // Socket-facing viewer: the gateway's fanout broadcasts INTO it. The
-    // bridge maps the viewer's close() (session teardown) onto 4409, and the
-    // sendHandshake/sendFrame/sendState calls onto WS text/binary frames.
+    // Socket-facing viewer: the gateway (via its RtcSession) relays JSEP
+    // signaling INTO it — every frame is a JSON text message (the WS MUST
+    // NOT carry binary video frames; media flows browser↔emulator over
+    // loopback UDP, design D1). The viewer's close() (session teardown /
+    // device loss) maps onto 4409.
     const socketViewer: StreamViewer = {
       id: crypto.randomUUID(),
-      sendHandshake: (h) => {
-        ws.send(JSON.stringify(h));
-        return Promise.resolve();
-      },
-      sendFrame: (f) => {
-        ws.send(f);
-        return Promise.resolve();
-      },
-      sendState: (s) => {
-        ws.send(JSON.stringify(s));
+      sendMessage: (msg: RtcServerMessage) => {
+        ws.send(JSON.stringify(msg));
         return Promise.resolve();
       },
       get open() {
@@ -1062,13 +1067,35 @@ export function createBridgeApp(deps: BridgeDeps, opts: BridgeOptions = {}): Bri
         wsReject(ws, WS_CLOSE_CODES.VIEWER_CAP, result.reason ?? "viewer cap reached (8)");
       } else if (result.code === "UNSUPPORTED") {
         wsReject(ws, WS_CLOSE_CODES.UNSUPPORTED, result.reason ?? "streaming unsupported");
+      } else if (result.code === "PERMISSION_DENIED") {
+        wsReject(ws, WS_CLOSE_CODES.PERMISSION_DENIED, result.reason ?? "emulator gRPC denied RtcService");
       } else {
         wsReject(ws, WS_CLOSE_CODES.NO_DEVICE, result.reason ?? "no usable device for streaming");
       }
       return;
     }
-    // The handshake + frames flow through sendHandshake/sendFrame once the
-    // daemon's session is up. Nothing more to do here.
+    // The handshake + offer + ice frames flow through sendMessage once the
+    // viewer's RTC stream is up. Client frames arrive in message() below.
+  }
+
+  /**
+   * Client→server JSEP signaling on the video WS (task 2.7). Malformed or
+   * unknown frames produce a JSON error body + close (spec: Malformed
+   * signaling — never a silent hang); valid frames relay into the viewer's
+   * RTC stream, and a frame for a stream that is gone closes 4409.
+   */
+  function onVideoMessage(ws: Bun.ServerWebSocket<Record<string, unknown>>, raw: unknown): void {
+    const text = typeof raw === "string" ? raw : Buffer.from(raw as Uint8Array).toString("utf8");
+    const parsed = parseClientJsep(text);
+    if (!parsed.ok) {
+      wsReject(ws, WS_CLOSE_CODES.BAD_MESSAGE, parsed.message);
+      return;
+    }
+    const viewerId = (ws.data as unknown as WsConn).viewerId;
+    const gw = deps.streamGateway;
+    if (!gw || !viewerId || !gw.relayViewerMessage(viewerId, parsed.msg)) {
+      wsReject(ws, WS_CLOSE_CODES.DEVICE_LOST, "no active rtc stream for this viewer");
+    }
   }
 
   async function onControlMessage(ws: Bun.ServerWebSocket<Record<string, unknown>>, raw: unknown): Promise<void> {

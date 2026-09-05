@@ -11,54 +11,39 @@
 
 // ─── Fan-out ────────────────────────────────────────────────────────────
 
-/** Maximum concurrent video viewers (design D4). */
+/** Maximum concurrent video viewers (design D4; ours — the emulator has none). */
 export const MAX_VIEWERS = 8;
 
-/** Per-viewer drop-oldest queue depth (design D4). */
-export const VIEWER_QUEUE_DEPTH = 4;
-
-/** A registered video viewer: a WebSocket (or test double). */
+/**
+ * A registered video viewer: one JSEP signaling socket (or test double).
+ * The socket carries JSON JSEP frames ONLY (spec: the WS MUST NOT carry
+ * binary video frames) — the handshake/offer/ice/state shapes below.
+ */
 export interface StreamViewer {
   readonly id: string;
-  /** Deliver the stream handshake (first frame on the socket). */
-  sendHandshake(handshake: unknown): Promise<void> | void;
-  /** Deliver a stream payload; resolves when written. */
-  sendFrame(frame: Uint8Array): Promise<void> | void;
-  /** Deliver a JSON state message (streaming/error). */
-  sendState(state: StreamStateMessage): Promise<void> | void;
+  /** Deliver a server→client JSEP signaling message (JSON text frame). */
+  sendMessage(msg: RtcServerMessage): Promise<void> | void;
   /** True when the viewer's socket is still open. */
   get open(): boolean;
-  /** Close the viewer socket (used on teardown/cap-reject). */
+  /** Close the viewer socket (used on teardown/cap-reject/device loss). */
   close(): void;
 }
 
-/** Viewer registry with per-viewer drop-oldest queues + cap enforcement. */
+/** Viewer registry with the cap enforced at add-time. */
 export interface FanoutRegistry {
   /** Current connected viewer count. */
   readonly count: number;
   /**
    * Register a viewer. Returns false (and closes the viewer) when the cap
-   * is reached; otherwise delivers future frames without blocking.
+   * is reached; otherwise the viewer receives broadcasts until removed.
    */
   add(viewer: StreamViewer): boolean;
   /** Remove a viewer by id; returns false when unknown. */
   remove(id: string): boolean;
-  /** Queue the frame for every registered viewer (drop-oldest per viewer). */
-  broadcast(frame: Uint8Array): void;
-  /** Deliver a state message to every registered viewer (streaming/error). */
-  broadcastState(state: StreamStateMessage): void;
-  /** Close and clear all viewers (session teardown). */
+  /** Deliver a signaling message to every registered viewer (advisory). */
+  broadcast(msg: RtcServerMessage): void;
+  /** Close and clear all viewers (session teardown / device loss). */
   closeAll(): void;
-}
-
-// ─── WS state messages ──────────────────────────────────────────────────
-
-export type StreamState = "buffering" | "streaming" | "error";
-
-export interface StreamStateMessage {
-  type: "state";
-  state: StreamState;
-  reason?: string;
 }
 
 // ─── JSEP signaling contract (design §Interfaces, task 2.4) ─────────────

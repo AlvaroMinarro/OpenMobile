@@ -23,7 +23,7 @@ import type {
   StreamStateView,
   StreamGateway as GatewayContract,
 } from "../bridge/server";
-import type { StreamViewer } from "./types";
+import type { RtcClientMessage, StreamViewer } from "./types";
 import type { ControlInjector } from "./control";
 
 export interface StreamGatewayDeps {
@@ -69,6 +69,12 @@ export class StreamGateway implements GatewayContract {
   unsubscribeVideo(_viewerId: string): void {
     // No viewers can attach while RTC video is undeployed (PR2 retargets this
     // onto the manager refcount).
+  }
+
+  relayViewerMessage(_viewerId: string, _msg: RtcClientMessage): boolean {
+    // No session can exist while RTC video is undeployed: every frame is
+    // answered with the DEVICE_LOST close by the bridge (never silently kept).
+    return false;
   }
 
   controlActive(): ControlInjector | null {
