@@ -457,8 +457,14 @@ export class GrpcRtcClient {
   receiveJsepMessages(guid: string): AsyncIterable<JsepWireMessage> {
     const self = this;
     const iterate = async function* () {
-      const stream = await self.openStream(guid);
-      if (self.cancelledGuids.has(guid)) {
+      let stream: grpc.ClientReadableStream<unknown>;
+      try {
+        stream = await self.openStream(guid);
+      } catch (e) {
+        if (self.closed) return; // teardown raced the lazy open — clean end
+        throw mapGrpcError(e);
+      }
+      if (self.closed || self.cancelledGuids.has(guid)) {
         self.streams.delete(guid);
         swallowCancellation(stream);
         stream.cancel();
@@ -483,6 +489,9 @@ export class GrpcRtcClient {
 
   /** Raw server-stream call, tracked for cancellation. */
   private async openStream(guid: string): Promise<grpc.ClientReadableStream<unknown>> {
+    if (this.closed) {
+      throw new GrpcControlError("DEVICE_OFFLINE", "rtc client is closed; no new receive stream");
+    }
     const client = await this.ensureRtc();
     const rpc = (client as unknown as Record<
       string,
