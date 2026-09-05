@@ -29,6 +29,14 @@ import * as protoLoader from "@grpc/proto-loader";
 /** Vendored proto paths (protos/README.md pins the SDK version). */
 export const PROTOS_DIR = join(import.meta.dir, "..", "..", "protos");
 export const EMULATOR_CONTROLLER_PROTO = join(PROTOS_DIR, "emulator_controller.proto");
+export const RTC_SERVICE_PROTO = join(PROTOS_DIR, "rtc_service.proto");
+
+/**
+ * Receive ceiling for JSEP streams (task 2.6): grpc-js defaults to 4MB which
+ * an SDP with a rich candidate list can plausibly exceed; the emulator's own
+ * client uses 64MB. Receive-only — sends stay small JSON dictionaries.
+ */
+export const MAX_RECEIVE_MESSAGE_LENGTH = 64 * 1024 * 1024;
 
 /** gRPC port the emulator listens on (per-instance ini usually overrides). */
 export const DEFAULT_GRPC_PORT = 8554;
@@ -193,6 +201,15 @@ interface TouchLike {
 /** proto-loader options mirroring the probe (keepCase + defaults). */
 const LOAD_OPTS = { includeDirs: [PROTOS_DIR], keepCase: true, defaults: true };
 
+/**
+ * A client-cancelled stream emits a CANCELLED error event that has no reader
+ * once the iterator is gone — swallow it so teardown never crashes the
+ * process with an unhandled stream error (idempotent noop listener).
+ */
+function swallowCancellation(stream: grpc.ClientReadableStream<unknown>): void {
+  (stream as unknown as { on?: (ev: string, cb: () => void) => void }).on?.("error", () => {});
+}
+
 let serviceHolder:
   | { EmulatorController: new (addr: string, creds: grpc.ChannelCredentials) => grpc.Client }
   | undefined;
@@ -337,5 +354,190 @@ export class GrpcEmulatorControl implements EmulatorControl {
       throw new GrpcControlError("OUT_OF_RANGE", "keyCode must be a non-negative integer", code);
     }
     await this.sendKey({ keyCode: code, codeType, eventType: 2 });
+  }
+}
+
+// ─── RtcService v1 transport stubs (design D2, task 2.6) ─────────────────
+
+/** One wire JSEP message off the server stream (envelope, verbatim). */
+export interface JsepWireMessage {
+  id: { guid: string };
+  message: string;
+}
+
+interface RtcServiceHolder {
+  Rtc: new (addr: string, creds: grpc.ChannelCredentials, options?: Record<string, unknown>) => grpc.Client;
+}
+
+let rtcHolder: RtcServiceHolder | undefined;
+let rtcLoading: Promise<RtcServiceHolder> | undefined;
+
+/** Load the vendored Rtc package once (reflection is allowlist-blocked). */
+function loadRtcPackage(): Promise<RtcServiceHolder> {
+  if (rtcHolder) return Promise.resolve(rtcHolder);
+  rtcLoading ??= protoLoader.load(RTC_SERVICE_PROTO, LOAD_OPTS).then((pkg) => {
+    const grpcObj = grpc.loadPackageDefinition(pkg) as unknown as {
+      android: { emulation: { control: { Rtc: RtcServiceHolder["Rtc"] } } };
+    };
+    rtcHolder = { Rtc: grpcObj.android.emulation.control.Rtc };
+    return rtcHolder;
+  });
+  return rtcLoading;
+}
+
+/**
+ * gRPC-backed RtcService v1 client (the transport half of the RTC adapter,
+ * design D2). One persistent channel for the whole session lifetime — unlike
+ * the control surface, the JSEP receive stream MUST stay open per stream.
+ *
+ * The `authorization: Bearer <token>` metadata rides EVERY call (probe A:
+ * without it → PERMISSION_DENIED, external-launch degradation path).
+ */
+export class GrpcRtcClient {
+  private readonly addr: string;
+  private readonly token: string;
+  private rtc: grpc.Client | undefined;
+  private ctrl: grpc.Client | undefined;
+  /** Open server-stream calls per guid, so teardown can cancel them. */
+  private readonly streams = new Map<string, grpc.ClientReadableStream<unknown>>();
+  /** Guids whose cancel was requested before the stream finished opening. */
+  private readonly cancelledGuids = new Set<string>();
+  private closed = false;
+
+  constructor(addr: string, token: string) {
+    this.addr = addr;
+    this.token = token;
+  }
+
+  private metadata(): grpc.Metadata {
+    const meta = new grpc.Metadata();
+    meta.add("authorization", `Bearer ${this.token}`);
+    return meta;
+  }
+
+  private async ensureRtc(): Promise<grpc.Client> {
+    if (this.rtc) return this.rtc;
+    const { Rtc } = await loadRtcPackage();
+    this.rtc = new Rtc(this.addr, grpc.credentials.createInsecure(), {
+      "grpc.max_receive_message_length": MAX_RECEIVE_MESSAGE_LENGTH,
+    });
+    return this.rtc;
+  }
+
+  /** getStatus lives on EmulatorController — a second client over the same
+   *  endpoint powers the watchdog probe (task 2.3). */
+  private async ensureCtrl(): Promise<grpc.Client> {
+    if (this.ctrl) return this.ctrl;
+    await loadControllerPackage();
+    const { EmulatorController } = serviceHolder!;
+    this.ctrl = new EmulatorController(this.addr, grpc.credentials.createInsecure());
+    return this.ctrl;
+  }
+
+  /** requestRtcStream → the per-stream opaque guid (RtcId). */
+  async requestRtcStream(): Promise<string> {
+    const client = await this.ensureRtc();
+    const rpc = (client as unknown as Record<string, (req: unknown, m: grpc.Metadata, cb: (e: grpc.ServiceError | null, r?: unknown) => void) => void>)["requestRtcStream"]?.bind(client);
+    if (!rpc) throw new GrpcControlError("INJECTION_FAILED", "unsupported gRPC method: requestRtcStream");
+    const res = await new Promise<{ guid?: string }>((resolve, reject) => {
+      rpc({}, this.metadata(), (e, r) => (e ? reject(mapGrpcError(e)) : resolve((r ?? {}) as { guid?: string })));
+    });
+    if (!res.guid) {
+      throw new GrpcControlError("INJECTION_FAILED", "requestRtcStream returned no guid");
+    }
+    return res.guid;
+  }
+
+  /**
+   * receiveJsepMessages — the BLOCKING server stream for one guid (v1:
+   * `receiveJsepMessages(RtcId) returns (stream JsepMsg)`). The returned
+   * iterable yields wire envelopes verbatim; `cancelReceive` ends it
+   * (a cancelled stream ends the iteration — never a dangling read).
+   */
+  receiveJsepMessages(guid: string): AsyncIterable<JsepWireMessage> {
+    const self = this;
+    const iterate = async function* () {
+      const stream = await self.openStream(guid);
+      if (self.cancelledGuids.has(guid)) {
+        self.streams.delete(guid);
+        swallowCancellation(stream);
+        stream.cancel();
+        return;
+      }
+      try {
+        for await (const raw of stream) {
+          yield raw as JsepWireMessage;
+        }
+      } catch (e) {
+        const code = (e as { code?: number }).code;
+        if (code === grpc.status.CANCELLED) return; // teardown cancel — clean end
+        throw mapGrpcError(e);
+      } finally {
+        self.streams.delete(guid);
+      }
+    };
+    return {
+      [Symbol.asyncIterator]: () => iterate(),
+    };
+  }
+
+  /** Raw server-stream call, tracked for cancellation. */
+  private async openStream(guid: string): Promise<grpc.ClientReadableStream<unknown>> {
+    const client = await this.ensureRtc();
+    const rpc = (client as unknown as Record<
+      string,
+      (req: unknown, m: grpc.Metadata) => grpc.ClientReadableStream<unknown>
+    >)["receiveJsepMessages"]?.bind(client);
+    if (!rpc) throw new GrpcControlError("INJECTION_FAILED", "unsupported gRPC method: receiveJsepMessages");
+    const stream = rpc({ guid }, this.metadata());
+    this.streams.set(guid, stream);
+    return stream;
+  }
+
+  /** sendJsepMessage — one JSEP dictionary (verbatim JSON payload). */
+  async sendJsepMessage(guid: string, payload: string): Promise<void> {
+    const client = await this.ensureRtc();
+    const rpc = (client as unknown as Record<string, (req: unknown, m: grpc.Metadata, cb: (e: grpc.ServiceError | null, r?: unknown) => void) => void>)["sendJsepMessage"]?.bind(client);
+    if (!rpc) throw new GrpcControlError("INJECTION_FAILED", "unsupported gRPC method: sendJsepMessage");
+    await new Promise<void>((resolve, reject) => {
+      rpc({ id: { guid }, message: payload }, this.metadata(), (e) => (e ? reject(mapGrpcError(e)) : resolve()));
+    });
+  }
+
+  /** Watchdog probe: getStatus on EmulatorController (task 2.3). Throws a
+   *  mapped GrpcControlError when the emulator is unreachable (DEVICE_OFFLINE)
+   *  or denies the call (PERMISSION_DENIED → 4401). */
+  async probe(): Promise<void> {
+    const client = await this.ensureCtrl();
+    const rpc = (client as unknown as Record<string, (req: unknown, m: grpc.Metadata, cb: (e: grpc.ServiceError | null, r?: unknown) => void) => void>)["getStatus"]?.bind(client);
+    if (!rpc) throw new GrpcControlError("INJECTION_FAILED", "unsupported gRPC method: getStatus");
+    await new Promise<void>((resolve, reject) => {
+      rpc({}, this.metadata(), (e) => (e ? reject(mapGrpcError(e)) : resolve()));
+    });
+  }
+
+  /** Cancel the receive stream for one guid (viewer teardown / bye). */
+  cancelReceive(guid: string): void {
+    this.cancelledGuids.add(guid);
+    const stream = this.streams.get(guid);
+    if (!stream) return;
+    this.streams.delete(guid);
+    swallowCancellation(stream);
+    try {
+      stream.cancel();
+    } catch {
+      // Already finished — nothing to cancel.
+    }
+  }
+
+  /** Tear down the channel (session stop). Cancels every open stream. */
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const guid of [...this.streams.keys()]) this.cancelReceive(guid);
+    this.rtc?.close();
+    this.ctrl?.close();
+    this.rtc = undefined;
+    this.ctrl = undefined;
   }
 }
