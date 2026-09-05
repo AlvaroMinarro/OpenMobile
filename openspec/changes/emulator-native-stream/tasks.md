@@ -23,15 +23,15 @@ Chain strategy: feature-branch-chain
 - [x] 1.2 `package.json`: add `@grpc/grpc-js` + `@grpc/proto-loader`
 - [x] 1.3 `src/device/grpc.ts` RED→GREEN: token from pid ini, version gate ≥36.5.11, bounds, sendTouch/sendKey unary, ControlError incl. 4401 (probe-d)
 - [x] 1.4 `src/stream/rtc/allowlist.ts`: android-studio issuer + Rtc/reflection entries, golden vs om_allowlist.json
-- [ ] 1.5 `src/device/androidCli.ts`: `emulatorStart` direct spawn `emulator @avd -grpc-allowlist <gen>`; `-rtcfps` ≥36.6; tests
-- [ ] 1.6 `src/tools/{handlers,schemas}.ts`: tap/swipe/text/key gRPC-first, adb fallback, physical-px bounds validation
-- [ ] 1.7 `src/stream/control.ts`: delete scrcpy encoder; gRPC injector; keep parseControlJson/ControlError/ack
-- [ ] 1.8 `src/stream/{manager,gateway}.ts`: sever StreamSession/encoder deps; subscribeVideo→UNSUPPORTED; manager skeleton kept
-- [ ] 1.9 `src/bridge/server.ts`: `/v1/input/*` → gRPC injector (adb fallback); `/v1/state` supported:false + reason
-- [ ] 1.10 DELETE `stream/{scrcpy,daemon,wire}.ts`, scrcpy/Annex-B consts, jar + assets README, record-stream-fixture, stream-* fixtures; add 4401
-- [ ] 1.11 DELETE/rework stream-{scrcpy,wire,daemon,bridge,gateway,manager,client} tests, jar pin, fixture loads
-- [ ] 1.12 Proof test: zero scrcpy/jar/Annex-B/WebCodecs refs in src+test
-- [ ] 1.13 `bun test` + typecheck green; work-unit commits
+- [x] 1.5 `src/device/androidCli.ts`: `emulatorStart` direct spawn `emulator @avd -grpc-allowlist <gen>`; `-rtcfps` ≥36.6; tests
+- [x] 1.6 `src/tools/{handlers,schemas}.ts`: tap/swipe/text/key gRPC-first, adb fallback, physical-px bounds validation
+- [x] 1.7 `src/stream/control.ts`: delete scrcpy encoder; gRPC injector; keep parseControlJson/ControlError/ack
+- [x] 1.8 `src/stream/{manager,gateway}.ts`: sever StreamSession/encoder deps; subscribeVideo→UNSUPPORTED; manager skeleton kept
+- [x] 1.9 `src/bridge/server.ts`: `/v1/input/*` → gRPC injector (adb fallback); `/v1/state` supported:false + reason
+- [x] 1.10 DELETE `stream/{scrcpy,daemon,wire}.ts`, scrcpy/Annex-B consts, jar + assets README, record-stream-fixture, stream-* fixtures; add 4401
+- [x] 1.11 DELETE/rework stream-{scrcpy,wire,daemon,bridge,gateway,manager,client} tests, jar pin, fixture loads
+- [x] 1.12 Proof test: zero scrcpy/jar/Annex-B/WebCodecs refs in src+test
+- [x] 1.13 `bun test` + typecheck green; work-unit commits
 
 ## Phase 2: PR2, RtcSession + signaling + fanout
 
