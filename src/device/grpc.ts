@@ -45,6 +45,12 @@ export const DEFAULT_GRPC_PORT = 8554;
 export const MIN_EMULATOR_VERSION = { major: 36, minor: 5, patch: 11 } as const;
 /** Version from which `-rtcfps` exists (unknown option on 36.5.11). */
 export const RTCPFS_VERSION = { major: 36, minor: 6, patch: 0 } as const;
+/**
+ * Version that REMOVED `-rtcfps` again (live-verified on 37.1.11: the option
+ * is rejected with `unknown option: -rtcfps`; the 37.x help exposes no
+ * replacement). The flag is only valid in the [36.6, 37.0) window.
+ */
+export const RTCPFS_REMOVED_VERSION = { major: 37, minor: 0, patch: 0 } as const;
 
 // ─── pure helpers ────────────────────────────────────────────────────────
 
