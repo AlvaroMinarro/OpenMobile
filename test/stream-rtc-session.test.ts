@@ -348,7 +348,9 @@ describe("RtcSession — getStatus watchdog (task 2.3: loss → teardown + reaso
     expect(session.active).toBe(false);
     expect(adapter.sendsFor("guid-1")).toEqual([{ bye: true }]);
     expect(adapter.cancelled).toContain("guid-1");
-    expect(v.closeCount).toBe(1);
+    // Socket closure on loss is the GATEWAY's job (single ownership): the
+    // session only tears down the per-guid JSEP streams.
+    expect(v.closeCount).toBe(0);
   });
 
   it("does NOT probe while no viewer is attached (watchdog armed on first attach only)", async () => {

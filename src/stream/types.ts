@@ -58,6 +58,20 @@ export interface RtcIceCandidateInit {
 /** RTC signaling states (design §WS Contract). */
 export type RtcStreamState = "connecting" | "streaming" | "error";
 
+/**
+ * Additive /v1/state `stream.rtc` object (task 2.7): the RTC video surface.
+ * `guid` is the first active viewer's RtcId; `fps` is the configured -rtcfps
+ * value; `reason` explains non-supported/non-active states.
+ */
+export interface RtcStateView {
+  supported: boolean;
+  active: boolean;
+  viewers: number;
+  guid?: string;
+  fps?: number;
+  reason?: string;
+}
+
 /** Server→client JSEP signaling frames (JSON text, never binary). */
 export type RtcServerMessage =
   | { type: "handshake"; rtcId: string; fps: number; codecs: string[] }

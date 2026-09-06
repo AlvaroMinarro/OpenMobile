@@ -108,6 +108,11 @@ export class RtcSession {
     return this.streams.size;
   }
 
+  /** True when `viewerId` has a live stream (relay routing guard). */
+  has(viewerId: string): boolean {
+    return this.streams.has(viewerId);
+  }
+
   /** First active stream's guid (the /v1/state `stream.rtc.guid` surface). */
   get guid(): string | undefined {
     return this.streams.values().next().value?.guid;
@@ -213,10 +218,10 @@ export class RtcSession {
   }
 
   /**
-   * Full teardown (manager stop / loss): bye for every open stream and the
-   * viewers are closed — that close is the 4409 DEVICE_LOST path when the
-   * session ends under still-attached viewers (emulator loss); on a normal
-   * last-viewer teardown the sockets are already gone, so it is a no-op.
+   * Full teardown (manager stop / loss): bye for every open stream + receive
+   * cancellation. The session does NOT close viewer sockets — socket
+   * ownership is the gateway's (its teardown event closes them with 4409);
+   * the session owns the per-guid JSEP state machines only.
    */
   close(): void {
     if (this.closed) return;
@@ -224,15 +229,7 @@ export class RtcSession {
     this.disarmWatchdog();
     for (const [viewerId, entry] of [...this.streams]) {
       this.streams.delete(viewerId);
-      const wasOpen = !entry.ended;
       this.teardownStream(entry.guid, entry);
-      if (wasOpen) {
-        try {
-          entry.viewer.close();
-        } catch {
-          // best effort — the socket layer reaps dead sockets
-        }
-      }
     }
     this.adapter.stop();
   }

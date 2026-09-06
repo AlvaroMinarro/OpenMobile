@@ -185,6 +185,16 @@ export class StreamManager {
     }
   }
 
+  /**
+   * Report device loss from OUTSIDE the poll loop (task 2.3: the RtcSession's
+   * getStatus watchdog fires this through the gateway). Sets the reason and
+   * tears the session down — same observable outcome as a failed poke.
+   */
+  async forceStop(reason: string): Promise<void> {
+    this.reason = reason;
+    await this.stopSession();
+  }
+
   /** Explicit start (used by hosts that pre-warm the stream). */
   async start(): Promise<void> {
     if (this.active) return;

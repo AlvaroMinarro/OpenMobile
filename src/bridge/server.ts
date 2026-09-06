@@ -25,6 +25,7 @@ import {
   type ControlErrorMessage,
   type RtcClientMessage,
   type RtcServerMessage,
+  type RtcStateView,
   type StreamViewer,
 } from "../stream/types";
 import {
@@ -207,6 +208,8 @@ export interface StreamStateView {
   /** Video size of the active stream (present once the handshake landed). */
   width?: number;
   height?: number;
+  /** Additive RTC video surface (task 2.7): stream.rtc{…}. */
+  rtc?: RtcStateView;
 }
 
 export interface BridgeOptions {
