@@ -75,6 +75,8 @@ describe("pid-ini token lookup (per-instance grpc.token, design D6)", () => {
       ["pid_101.ini", "port.serial=5554\ngrpc.token=TOKEN-A\ngrpc.port=8554\n"],
     ]);
     try {
+      // emulatorVersion is additive (PR2 capability gate); inis without the
+      // field resolve without it.
       expect(findEmulatorConfig(dir, "emulator-5554")).toEqual({ token: "TOKEN-A", port: 8554 });
       expect(findEmulatorConfig(dir, "emulator-5556")).toEqual({ token: "OTHER", port: 8556 });
     } finally {

@@ -1,5 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { bridgeHandler, resolvePort, startBridge } from "../src/bridge/main";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { bridgeHandler, createBridgeDeps, resolvePort, startBridge } from "../src/bridge/main";
 
 describe("resolvePort", () => {
   it("defaults to 8765 when unset or blank", () => {
@@ -56,5 +59,68 @@ describe("startBridge", () => {
     } finally {
       server.stop();
     }
+  });
+});
+
+/**
+ * RTC wiring (task 2.8): createBridgeDeps builds the StreamGateway over the
+ * REAL capability probe (pid ini + version gate in OPENMOBILE_AVD_RUN_DIR)
+ * and the -rtcfps value from OPENMOBILE_RTC_FPS (30 default, 30|60 only).
+ */
+describe("createBridgeDeps — RTC gateway wiring (task 2.8)", () => {
+  function runDirWith5554(): string {
+    const dir = mkdtempSync(join(tmpdir(), "om-main-rtc-"));
+    writeFileSync(
+      join(dir, "pid_101.ini"),
+      "port.serial=5554\ngrpc.token=TOK\ngrpc.port=8554\nemulator.version=36.5.11.0\n",
+    );
+    return dir;
+  }
+
+  it("wires a stream gateway that resolves the pid-ini capability (supported + endpoint)", () => {
+    const dir = runDirWith5554();
+    try {
+      const deps = createBridgeDeps({
+        ANDROID_DEVICE: "emulator-5554",
+        OPENMOBILE_AVD_RUN_DIR: dir,
+      });
+      const snap = deps.streamGateway?.snapshot();
+      expect(snap?.supported).toBe(true);
+      expect(snap?.rtc?.fps).toBe(30); // default -rtcfps
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports grpc_permission_denied when no pid ini matches (external launch)", () => {
+    const deps = createBridgeDeps({ ANDROID_DEVICE: "emulator-5554" });
+    const snap = deps.streamGateway?.snapshot();
+    expect(snap?.supported).toBe(false);
+    expect(snap?.rtc?.reason).toBe("grpc_permission_denied");
+  });
+
+  it("honors OPENMOBILE_RTC_FPS=60 and ignores invalid values (default 30)", () => {
+    const dir = runDirWith5554();
+    try {
+      const fast = createBridgeDeps({
+        ANDROID_DEVICE: "emulator-5554",
+        OPENMOBILE_AVD_RUN_DIR: dir,
+        OPENMOBILE_RTC_FPS: "60",
+      });
+      expect(fast.streamGateway?.snapshot().rtc?.fps).toBe(60);
+      const slow = createBridgeDeps({
+        ANDROID_DEVICE: "emulator-5554",
+        OPENMOBILE_AVD_RUN_DIR: dir,
+        OPENMOBILE_RTC_FPS: "144",
+      });
+      expect(slow.streamGateway?.snapshot().rtc?.fps).toBe(30);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("wires no stream gateway at all when OPENMOBILE_STREAM=off", () => {
+    const deps = createBridgeDeps({ OPENMOBILE_STREAM: "off" });
+    expect(deps.streamGateway).toBeUndefined();
   });
 });

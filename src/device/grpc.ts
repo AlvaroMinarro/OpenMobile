@@ -89,6 +89,8 @@ export function adbPort(serial: string): string | null {
 export interface EmulatorGrpcConfig {
   token: string;
   port: number;
+  /** `emulator.version=X.Y.Z.W` from the ini (absent in some ini layouts). */
+  emulatorVersion?: string;
 }
 
 /** Default run dir where the emulator writes per-pid ini files. */
@@ -118,9 +120,47 @@ export function findEmulatorConfig(runDir: string, serial: string): EmulatorGrpc
     }
     if (ini["port.serial"] !== wanted || !ini["grpc.token"]) continue;
     const port = Number(ini["grpc.port"]);
-    return { token: ini["grpc.token"]!, port: Number.isInteger(port) ? port : DEFAULT_GRPC_PORT };
+    return {
+      token: ini["grpc.token"]!,
+      port: Number.isInteger(port) ? port : DEFAULT_GRPC_PORT,
+      ...(ini["emulator.version"] !== undefined ? { emulatorVersion: ini["emulator.version"] } : {}),
+    };
   }
   return null;
+}
+
+/** Resolved RTC capability for one serial (the gateway's capability probe). */
+export interface ResolvedRtcCapability {
+  supported: boolean;
+  reason?: string;
+  endpoint?: { addr: string; token: string };
+}
+
+/**
+ * Resolve the RTC streaming capability for a serial (task 2.8):
+ *  - no per-instance pid ini (externally launched / physical device) →
+ *    `grpc_permission_denied` (spec: Externally launched emulator — control
+ *    keeps working, video degrades; there is NO second video path),
+ *  - version parsed from the ini below 36.5.11 → a reason naming the
+ *    requirement + the upgrade path (spec: Version gate),
+ *  - an ini without a version field is accepted (it cannot be proven below
+ *    the gate; the gRPC call itself fails closed if the service is missing).
+ */
+export function resolveRtcCapability(runDir: string, serial: string): ResolvedRtcCapability {
+  const cfg = findEmulatorConfig(runDir, serial);
+  if (!cfg) return { supported: false, reason: "grpc_permission_denied" };
+  if (cfg.emulatorVersion !== undefined) {
+    const version = parseEmulatorVersion(`Android emulator version ${cfg.emulatorVersion}`);
+    if (version && !isAtLeast(version, MIN_EMULATOR_VERSION)) {
+      return {
+        supported: false,
+        reason:
+          `emulator ${version.major}.${version.minor}.${version.patch} lacks native RTC ` +
+          `(requires >= 36.5.11; upgrade the Android emulator)`,
+      };
+    }
+  }
+  return { supported: true, endpoint: { addr: `localhost:${cfg.port}`, token: cfg.token } };
 }
 
 // ─── typed errors (mapped onto WS close codes by the bridge) ─────────────

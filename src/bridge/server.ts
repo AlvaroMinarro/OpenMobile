@@ -912,6 +912,10 @@ function wsReject(ws: Bun.ServerWebSocket<Record<string, unknown>>, code: number
 
 function errorCodeForClose(code: number): string {
   switch (code) {
+    case WS_CLOSE_CODES.BAD_MESSAGE:
+      return "BAD_MESSAGE";
+    case WS_CLOSE_CODES.PERMISSION_DENIED:
+      return "PERMISSION_DENIED";
     case WS_CLOSE_CODES.UNSUPPORTED:
       return "STREAM_UNSUPPORTED";
     case WS_CLOSE_CODES.NO_DEVICE:
