@@ -49,9 +49,9 @@ Chain strategy: feature-branch-chain
 
 ## Phase 3: PR3, Browser RTC rewrite
 
-- [ ] 3.1 `src/stream/client/index.ts`: RTCPeerConnection + signal WS; VP8 mandatory; delete annexb/decoder/support
-- [ ] 3.2 `package.json`: exports/scripts cleanup (drop record-stream-fixture, rewire build:stream-demo)
-- [ ] 3.3 `examples/stream.html` + bundle: demo page
-- [ ] 3.4 Docs: replace scrcpy/H.264/WebCodecs refs with native RTC
-- [ ] 3.5 Client tests: signaling vs fake WS server; proof: no annexb/WebCodecs refs
-- [ ] 3.6 `bun build` demo + typecheck green; work-unit commits
+- [x] 3.1 `src/stream/client/index.ts`: RTCPeerConnection + signal WS; VP8 mandatory; delete annexb/decoder/support
+- [x] 3.2 `package.json`: exports/scripts cleanup (drop record-stream-fixture, rewire build:stream-demo)
+- [x] 3.3 `examples/stream.html` + bundle: demo page
+- [x] 3.4 Docs: replace scrcpy/H.264/WebCodecs refs with native RTC
+- [x] 3.5 Client tests: signaling vs fake WS server; proof: no annexb/WebCodecs refs
+- [x] 3.6 `bun build` demo + typecheck green; work-unit commits
