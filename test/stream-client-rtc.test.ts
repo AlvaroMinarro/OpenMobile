@@ -568,8 +568,8 @@ describe("package surface for the RTC demo client (task 3.2)", () => {
     expect(pkg.scripts["build:stream-demo"]).toBe(
       "bun build src/stream/client/index.ts --outfile examples/stream-client.js --target browser",
     );
-    // The scrcpy fixture recorder stays gone; the screenshot fixture
-    // recorder (record-fixtures) is unrelated and stays.
+    // The legacy in-guest-encoder fixture recorder stays gone; the
+    // screenshot fixture recorder (record-fixtures) is unrelated and stays.
     expect(pkg.scripts["record-stream-fixture"]).toBeUndefined();
   });
 });
