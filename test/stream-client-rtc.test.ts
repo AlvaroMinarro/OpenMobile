@@ -554,3 +554,22 @@ describe("RTC stream client — control socket and lifecycle", () => {
     });
   });
 });
+
+// ─── Package surface (task 3.2): exports/scripts wiring ─────────────────
+
+describe("package surface for the RTC demo client (task 3.2)", () => {
+  it("keeps the ./stream-client export pointed at the RTC client entry", () => {
+    const pkg = JSON.parse(require("node:fs").readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+      exports: Record<string, string>;
+      scripts: Record<string, string>;
+    };
+    expect(pkg.exports["./stream-client"]).toBe("./src/stream/client/index.ts");
+    // Demo bundle regenerates from the same entry (old build:stream-demo wiring).
+    expect(pkg.scripts["build:stream-demo"]).toBe(
+      "bun build src/stream/client/index.ts --outfile examples/stream-client.js --target browser",
+    );
+    // The scrcpy fixture recorder stays gone; the screenshot fixture
+    // recorder (record-fixtures) is unrelated and stays.
+    expect(pkg.scripts["record-stream-fixture"]).toBeUndefined();
+  });
+});
