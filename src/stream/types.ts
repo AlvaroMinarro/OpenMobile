@@ -1,163 +1,171 @@
 /**
- * Wire-level and session types for the device-streaming core (design D1-D7).
+ * Wire-level and session types for the streaming core.
  *
- * The byte layouts here are pinned to the bundled scrcpy-server v4.1 jar —
- * see assets/README.md. All multi-byte integers are BIG-ENDIAN on the wire.
+ * PR1 (native gRPC control): the legacy byte-layout world (device/session
+ * meta, frame meta, access-unit framing, control-socket message encodings)
+ * is DELETED together with the in-guest encoder transport. What survives is
+ * the transport-neutral contract surface: the WS control JSON contract, the
+ * fan-out registry, the lifecycle snapshot, the logcat live-stream knobs,
+ * and the WS close codes. PR2 adds the JSEP signaling types here (task 2.4).
  */
-
-// ─── scrcpy video socket (connection #1) ────────────────────────────────
-
-/** 64 bytes, ASCII, null-padded (send_device_meta=true). */
-export const DEVICE_META_LEN = 64;
-
-/** 4-byte codec id, ASCII ("h264" = 0x68323634). */
-export const CODEC_ID_LEN = 4;
-
-/** 12-byte session meta: flags u32 + width u32 + height u32. */
-export const SESSION_META_LEN = 12;
-
-/** Session meta flag: this is a session header, not a frame. */
-export const META_FLAG_SESSION = 0x8000_0000;
-
-/** 12-byte frame meta header: ptsAndFlags u64 + len u32. */
-export const FRAME_META_LEN = 12;
-
-/**
- * Max bytes a single frame may declare (frame-meta `len`). Real frames at
- * 8 Mbps/30fps are ~35 KB — 16 MiB is ~450× headroom, so the bound only
- * trips on corruption or a hostile peer. Guards the assembler against
- * `len=0xFFFFFFFF` → unbounded Buffer.concat accumulation → OOM (the bridge
- * daemon runs REST + streaming; one OOM kills everything).
- */
-export const MAX_FRAME = 16 * 1024 * 1024;
-
-/**
- * Hard cap on the StreamAssembler accumulator: one legal frame (< MAX_FRAME)
- * plus one in-flight data burst, before concat. ~32 MiB bounds memory even
- * when a hostile peer sends oversized chunks with legal declared lengths.
- */
-export const MAX_ACCUMULATED = MAX_FRAME * 2 + FRAME_META_LEN;
-
-/** Frame-meta flag bits inside ptsAndFlags (upper 2 bits). */
-export const FLAG_CONFIG = 1n << 62n; // bit62 — SPS/PPS AU
-export const FLAG_KEY = 1n << 61n; // bit61 — keyframe (IDR)
-export const PTS_MASK = (1n << 61n) - 1n; // low 61 bits
-
-/** scrcpy stream-format version negotiated by the server (design D1 pin). */
-export const SCRCPY_VERSION = "4.1";
-
-/** Device-side jar path the adapter pushes to (design §Live-validated facts). */
-export const JAR_DEVICE_PATH = "/data/local/tmp/scrcpy-server.jar";
-
-// ─── Control socket (connection #2) message types (scrcpy v4.1) ─────────
-
-export const TYPE_INJECT_KEYCODE = 0;
-export const TYPE_INJECT_TEXT = 1;
-export const TYPE_INJECT_TOUCH_EVENT = 2;
-
-export const TOUCH_ACTION_DOWN = 0;
-export const TOUCH_ACTION_UP = 1;
-export const TOUCH_ACTION_MOVE = 2;
-
-/** Total encoded length of a touch event. */
-export const TOUCH_MESSAGE_LEN = 32;
-/** Total encoded length of a keycode event. */
-export const KEYCODE_MESSAGE_LEN = 14;
-
-// ─── Parsed session / frame / control shapes ────────────────────────────
-
-/** Parsed 64B device meta + 12B session meta. */
-export interface SessionMeta {
-  /** ASCII device name from the 64B header (null-padded). */
-  deviceName: string;
-  /** 4-char codec id, e.g. "h264". */
-  codecId: string;
-  /** Raw session flags (META_FLAG_SESSION for a session header). */
-  flags: number;
-  /** Video width in scrcpy frames (e.g. 430 with max_size=960). */
-  width: number;
-  /** Video height in scrcpy frames. */
-  height: number;
-}
-
-/** Parsed 12B frame meta: pts + len + frame-kind flags. */
-export interface FrameMeta {
-  /** Presentation timestamp in µs (low 61 bits of ptsAndFlags). */
-  pts: bigint;
-  /** True when the payload is a CONFIG AU (SPS/PPS) — bit 62. */
-  isConfig: boolean;
-  /** True when the payload starts with a keyframe (IDR) — bit 61. */
-  isKey: boolean;
-  /** Payload length in bytes (Annex-B AU). */
-  len: number;
-}
 
 // ─── Fan-out ────────────────────────────────────────────────────────────
 
-/** Maximum concurrent video viewers (design D4). */
+/** Maximum concurrent video viewers (design D4; ours — the emulator has none). */
 export const MAX_VIEWERS = 8;
 
-/** Per-viewer drop-oldest queue depth (design D4). */
-export const VIEWER_QUEUE_DEPTH = 4;
-
-/** A registered video viewer: a WebSocket (or test double) that receives AUs. */
+/**
+ * A registered video viewer: one JSEP signaling socket (or test double).
+ * The socket carries JSON JSEP frames ONLY (spec: the WS MUST NOT carry
+ * binary video frames) — the handshake/offer/ice/state shapes below.
+ */
 export interface StreamViewer {
   readonly id: string;
-  /** Deliver a JSON handshake; resolves once accepted. */
-  sendHandshake(handshake: VideoHandshake): Promise<void> | void;
-  /** Deliver one Annex-B AU as a binary message; resolves when written. */
-  sendFrame(frame: Uint8Array): Promise<void> | void;
-  /** Deliver a JSON state message (buffering/streaming/error). */
-  sendState(state: StreamStateMessage): Promise<void> | void;
+  /** Deliver a server→client JSEP signaling message (JSON text frame). */
+  sendMessage(msg: RtcServerMessage): Promise<void> | void;
   /** True when the viewer's socket is still open. */
   get open(): boolean;
-  /** Close the viewer socket (used on teardown/cap-reject). */
+  /** Close the viewer socket (used on teardown/cap-reject/device loss). */
   close(): void;
 }
 
-/** Viewer registry with per-viewer drop-oldest queues + cap enforcement. */
+/** Viewer registry with the cap enforced at add-time. */
 export interface FanoutRegistry {
   /** Current connected viewer count. */
   readonly count: number;
   /**
    * Register a viewer. Returns false (and closes the viewer) when the cap
-   * is reached; otherwise delivers future frames without blocking.
+   * is reached; otherwise the viewer receives broadcasts until removed.
    */
   add(viewer: StreamViewer): boolean;
   /** Remove a viewer by id; returns false when unknown. */
   remove(id: string): boolean;
-  /** Queue the frame for every registered viewer (drop-oldest per viewer). */
-  broadcast(frame: Uint8Array): void;
-  /** Deliver a state message to every registered viewer (streaming/error). */
-  broadcastState(state: StreamStateMessage): void;
-  /** Close and clear all viewers (session teardown). */
+  /** Deliver a signaling message to every registered viewer (advisory). */
+  broadcast(msg: RtcServerMessage): void;
+  /** Close and clear all viewers (session teardown / device loss). */
   closeAll(): void;
 }
 
-// ─── WS /v1/stream/video contract (design D2) ───────────────────────────
+// ─── JSEP signaling contract (design §Interfaces, task 2.4) ─────────────
 
-export interface VideoHandshake {
-  type: "handshake";
-  codec: "h264";
-  /** Frame-meta length the server uses (pinned to the bundled jar). */
-  lengthSize: 12;
-  width: number;
-  height: number;
-  /** base64 SPS NAL (after the start code). */
-  sps: string;
-  /** base64 PPS NAL (after the start code). */
-  pps: string;
+/** RTCIceCandidateInit as it rides the WS (relayed verbatim). */
+export interface RtcIceCandidateInit {
+  candidate: string;
+  sdpMid?: string | null;
+  sdpMLineIndex?: number | null;
 }
 
-export type StreamState = "buffering" | "streaming" | "error";
+/** RTC signaling states (design §WS Contract). */
+export type RtcStreamState = "connecting" | "streaming" | "error";
 
-export interface StreamStateMessage {
-  type: "state";
-  state: StreamState;
+/**
+ * Additive /v1/state `stream.rtc` object (task 2.7): the RTC video surface.
+ * `guid` is the first active viewer's RtcId; `fps` is the configured -rtcfps
+ * value; `reason` explains non-supported/non-active states.
+ */
+export interface RtcStateView {
+  supported: boolean;
+  active: boolean;
+  viewers: number;
+  guid?: string;
+  fps?: number;
   reason?: string;
 }
 
-// ─── WS /v1/stream/control contract (design D3) ─────────────────────────
+/** Server→client JSEP signaling frames (JSON text, never binary). */
+export type RtcServerMessage =
+  | { type: "handshake"; rtcId: string; fps: number; codecs: string[] }
+  | { type: "offer"; sdp: string }
+  | { type: "answer"; sdp: string }
+  | { type: "ice"; candidate: RtcIceCandidateInit }
+  | { type: "state"; state: RtcStreamState; reason?: string };
+
+/** Client→server JSEP signaling frames (the answer/ice/state subset). */
+export type RtcClientMessage =
+  | { type: "answer"; sdp: string }
+  | { type: "ice"; candidate: RtcIceCandidateInit }
+  | { type: "state"; state: "streaming" };
+
+/**
+ * Parse + validate ONE client signaling frame (spec: Malformed signaling).
+ * Unknown or malformed input MUST produce a typed error — the bridge sends a
+ * JSON error body and closes; it NEVER hangs or silently drops the frame.
+ * The client may report only `state:"streaming"` (peer connected) — error
+ * states are server-driven.
+ */
+export type ParseClientJsepResult =
+  | { ok: true; msg: RtcClientMessage }
+  | { ok: false; code: "BAD_MESSAGE"; message: string };
+
+export function parseClientJsep(raw: string): ParseClientJsepResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { ok: false, code: "BAD_MESSAGE", message: "signaling frame is not valid JSON" };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, code: "BAD_MESSAGE", message: "signaling frame must be a JSON object" };
+  }
+  const obj = parsed as Record<string, unknown>;
+  switch (obj.type) {
+    case "answer":
+      if (typeof obj.sdp === "string" && obj.sdp.length > 0) {
+        return { ok: true, msg: { type: "answer", sdp: obj.sdp } };
+      }
+      return { ok: false, code: "BAD_MESSAGE", message: "answer requires a non-empty sdp string" };
+    case "ice": {
+      const candidate = obj.candidate;
+      if (
+        candidate !== null && typeof candidate === "object" && !Array.isArray(candidate) &&
+        typeof (candidate as Record<string, unknown>).candidate === "string"
+      ) {
+        // Verbatim relay: the candidate dictionary passes through untouched.
+        return { ok: true, msg: { type: "ice", candidate: candidate as RtcIceCandidateInit } };
+      }
+      return { ok: false, code: "BAD_MESSAGE", message: "ice requires an RTCIceCandidateInit dictionary" };
+    }
+    case "state":
+      if (obj.state === "streaming") {
+        return { ok: true, msg: { type: "state", state: "streaming" } };
+      }
+      return { ok: false, code: "BAD_MESSAGE", message: "state must be 'streaming' (client→server)" };
+    default:
+      return { ok: false, code: "BAD_MESSAGE", message: `unknown signaling type: ${String(obj.type)}` };
+  }
+}
+
+/**
+ * The JSEP dictionary inside a gRPC JsepMsg.message (probe B, verbatim
+ * relay): {"start":{}}, {"sdp","type"}, {"candidate","sdpMid","sdpMLineIndex"},
+ * {"bye":true}. The adapter decodes this once; contents are relayed verbatim.
+ */
+export type JsepPayload =
+  | { start: Record<string, unknown> }
+  | { type: string; sdp: string }
+  | (RtcIceCandidateInit & Record<string, unknown>)
+  | { bye: true };
+
+/** Decode one gRPC JsepMsg.message; null when it is not a known payload. */
+export function parseJsepPayload(raw: string): JsepPayload | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const obj = parsed as Record<string, unknown>;
+  if (typeof obj["start"] === "object" && obj["start"] !== null) return obj as JsepPayload;
+  if (obj["bye"] === true) return { bye: true };
+  if (typeof obj["sdp"] === "string" && typeof obj["type"] === "string") {
+    return obj as JsepPayload;
+  }
+  if (typeof obj["candidate"] === "string") return obj as JsepPayload;
+  return null;
+}
+
+// ─── WS /v1/stream/control contract (frozen, design D3) ─────────────────
 
 export type ControlEvent =
   | { type: "inject"; event: "tap"; x: number; y: number }
@@ -188,8 +196,7 @@ export const LOGCAT_BACKLOG_DEFAULT = 100;
 /**
  * Per-subscriber drop-oldest queue depth (Fanout drain precedent): a stalled
  * reader discards its OLDEST undelivered lines so newest ones keep flowing
- * without unbounded memory growth. Lines are tiny (~100B), so the bound is
- * far more forgiving than the video frame queue.
+ * without unbounded memory growth.
  */
 export const LOGCAT_QUEUE_DEPTH = 256;
 
@@ -200,15 +207,19 @@ export const LOGCAT_QUEUE_DEPTH = 256;
  */
 export const LOGCAT_SUBSCRIBER_CAP = 8;
 
-// ─── WS /v1/stream close codes (design §WS Contract) ────────────────────
+// ─── WS /v1/stream close codes (design §WS Contract + Error States) ─────
 
 export const WS_CLOSE_CODES = {
-  /** Streaming unsupported: kill-switch off, gateway absent, degraded env. */
-  UNSUPPORTED: 4403,
-  /** No usable device (push/reverse/spawn failed — device gone at start). */
+  /** Malformed/unknown signaling frame (JSON error body then close). */
+  BAD_MESSAGE: 4400,
+  /** PERMISSION_DENIED: token/allowlist blocks the requested surface. */
+  PERMISSION_DENIED: 4401,
+  /** No usable device (stream cannot start — device gone at start). */
   NO_DEVICE: 4404,
-  /** Viewer cap reached (design D4). */
-  VIEWER_CAP: 4429,
   /** Device lost mid-stream (spec: Device lost mid-stream). */
   DEVICE_LOST: 4409,
+  /** Streaming unsupported: kill-switch off, gateway absent, degraded env. */
+  UNSUPPORTED: 4403,
+  /** Viewer cap reached (design D4). */
+  VIEWER_CAP: 4429,
 } as const;

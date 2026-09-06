@@ -119,7 +119,8 @@ The localhost bridge serves five route groups under `/v1` (loopback
 - `GET /v1/state` → `200` always (empty lists when no device):
   `{ "selected": {...}|null, "frame": {...}|null, "devices": [...], "emulators": [...], "stream"?: {...}, "selection"?: {"serial","source":"override"} }`
   The additive `stream` object (present when streaming is wired):
-  `{ supported, active, reason?, viewers, width?, height? }`. The additive
+  `{ supported, active, reason?, viewers, rtc: { supported, active,
+  viewers, guid?, fps?, reason? } }` (see §Emulator-native streaming). The additive
   `selection` sibling appears only while a selection override is active —
   without one those keys are absent entirely.
 - `GET /v1/screenshot` → `200 image/png`, or an error body when no usable device.
@@ -218,68 +219,80 @@ Status map: `400 BAD_REQUEST`, `401 UNAUTHORIZED/TOKEN_EXPIRED`,
 `422 VALIDATION_ERROR`, `504 BOOT_TIMEOUT`, `500 INTERNAL_ERROR`. Contract is
 versioned: breaking changes land under `/v2`.
 
-### Streaming WebSockets (device streaming)
+### Emulator-native streaming (gRPC control + WebRTC video)
 
-Live H.264 streaming over loopback WebSockets, enabled by default; set
-`OPENMOBILE_STREAM=off` to disable (WS routes reject, `/v1/state` reports
-`stream.supported:false`). The stream starts on the FIRST video viewer and
+Native WebRTC video against the emulator's RtcService, enabled by default;
+set `OPENMOBILE_STREAM=off` to disable (WS routes reject, `/v1/state`
+reports `stream.supported:false`). The browser is a WebRTC peer: the bridge
+relays JSEP signaling only (design D1) — media flows browser↔emulator over
+loopback UDP and the daemon touches no media bytes. Requires an emulator
+launched with the gRPC allowlist (≥36.5.11; `POST /v1/emulator/start` adds
+`-grpc-allowlist` automatically). `OPENMOBILE_RTC_FPS` sets the `-rtcfps`
+encoder rate (30 default, 60 fast; applied on emulator ≥36.6). The stream
+starts on the FIRST video viewer (each gets its own RtcStream guid) and
 tears down when the last one disconnects or the device is lost (watchdog).
 
-- **`WS /v1/stream/video`** — server → client:
-  1. JSON handshake first: `{type:"handshake", codec:"h264", lengthSize:12,
-     width, height, sps, pps}` (SPS/PPS base64 after the Annex-B start code),
-  2. then ONE binary Annex-B access unit per message (SPS/PPS/IDR/slice),
-  3. JSON state messages: `{type:"state", state:"buffering"|"streaming"|"error",
-     reason?}`.
-  Per-viewer drop-oldest under backpressure (queue depth 4); max 8 viewers.
-- **`WS /v1/stream/control`** — client → server JSON:
+- **`GET /v1/state`** — the additive `stream` object is
+  `{ supported, active, reason?, viewers, rtc: { supported, active,
+  viewers, guid?, fps?, reason? } }`; existing scalars are unchanged.
+- **`WS /v1/stream/video`** — JSON JSEP signaling ONLY (never binary video):
+  1. `{"type":"handshake","rtcId","fps","codecs":["VP8"]}` first (VP8 is
+     mandatory; the browser client refuses any handshake without it),
+  2. the emulator's `{"type":"offer","sdp"}` relayed verbatim,
+  3. `{"type":"ice","candidate":{...}}` in both directions (the daemon
+     flushes client candidates to the emulator only AFTER the answer —
+     the emulator drops early candidates),
+  4. `{"type":"state","state":"connecting"|"streaming"|"error","reason"}`.
+  Client → server: `answer`/`ice`/`state` frames; malformed or unknown
+  frames get a JSON error body and a `4400` close.
+- **`WS /v1/stream/control`** — client → server JSON (contract unchanged,
+  backend is now gRPC unary):
   `{type:"inject", event:"tap", x, y}` |
   `{type:"inject", event:"swipe", x1, y1, x2, y2, durationMs?}` |
   `{type:"inject", event:"text", text}` |
   `{type:"inject", event:"key", keycode}`.
   Server → client: `{type:"ack"}` | `{type:"error", code, message}`.
-  Coordinates are in VIDEO space (e.g. 430×960 with `max_size=960`), not
-  device pixels. Rejected with `409 STREAM_OFF` when no stream is active
-  (fall back to `POST /v1/input/*`).
-- **Close codes**: `4403` unsupported (kill-switch off), `4404` no usable
-  device, `4429` viewer cap, `4409` device lost mid-stream. The secret gate
-  and CORS apply to WS upgrades exactly like REST.
-- Input routing rule: while `stream.active:true`, input goes through the
-  control socket; otherwise `adb shell input` (REST) — same coordinate
-  semantics and range validation in both modes.
+  Coordinates are DEVICE PHYSICAL pixels (proposal D5) — the same space as
+  `POST /v1/input/*`, validated against the emulator display bounds.
+  Rejected with `409 STREAM_OFF` when no stream is active.
+- **Close codes**: `4400` malformed signaling frame, `4401`
+  PERMISSION_DENIED (token/allowlist), `4403` unsupported (kill-switch or
+  degraded environment), `4404` no usable device, `4429` viewer cap (8),
+  `4409` device lost mid-stream. The secret gate and CORS apply to WS
+  upgrades exactly like REST.
+- Input routing rule: while capable, input goes through gRPC
+  (`sendTouch`/`sendKey` unary, ~12 ms); otherwise `adb shell input` —
+  same coordinate semantics and range validation in both modes.
 
 ### Browser client (`./stream-client`)
 
-Framework-free browser helper implementing the contract above (design D7).
-Chromium-based browsers decode H.264 in real time with WebCodecs; Firefox and
-platforms without an H.264 decoder report `false` from `isStreamSupported()`
-and the surface falls back to polling (`/v1/screenshot` driven).
+Framework-free browser helper implementing the contract above: an
+`RTCPeerConnection` driven over the signaling WS. VP8 is mandatory and
+universal in WebRTC-capable browsers — every WebRTC browser can display
+the stream, with no codec support gate.
 
 ```ts
-import { createStreamClient, isStreamSupported } from "@openmobile/android-device-bridge/stream-client";
+import { createStreamClient } from "@openmobile/android-device-bridge/stream-client";
 
-if (!isStreamSupported()) {
-  // polling fallback (REST screenshot + /v1/input/*)
-  return;
-}
 const client = createStreamClient({
   url: "ws://127.0.0.1:8765/v1/stream/video", // control URL derived (/video → /control)
-  canvas, // caller-owned <canvas>
-  onStatus: (s) => { /* connecting | handshake | streaming | {error,message} | {closed,code?} */ },
+  video, // caller-owned <video> element; the remote track attaches to it
+  onStatus: (s) => { /* connecting | handshake | streaming | {error,message} | {closed,code?,reason?} */ },
 });
-await client.open();
-client.sendInput({ type: "inject", event: "tap", x: 215, y: 480 }); // video-space coords
+await client.open(); // completes once the JSEP answer is on the wire
+client.sendInput({ type: "inject", event: "tap", x: 215, y: 480 }); // device px
 ```
 
-- `open()` gates on the support probe and reports `{phase:"error"}` when
-  unsupported, so the caller can switch to polling before opening sockets.
+- `open()` resolves after the handshake (VP8-verified) and the answer are
+  done; failures surface as `{phase:"error"}` so the caller can fall back
+  to polling (`GET /v1/screenshot` + `POST /v1/input/*`).
 - `sendInput()` returns `false` when the control socket is not open (no
   active stream) — route input through `POST /v1/input/*` in that case.
 - `onMessage` (optional, assignable) receives server contract messages:
   `{type:"state",…}` on the video socket, `{type:"ack"}` / `{type:"error",…}`
-  on the control socket. `client.videoSize` exposes the handshake size once
-  the stream is configured.
-- Close codes surface through `onStatus` (`4403/4404/4429/4409`).
+  on the control socket. `client.info` exposes the handshake facts
+  (`rtcId`, configured `fps`).
+- Close codes surface through `onStatus` (`4400/4401/4403/4404/4429/4409`).
 - **Auth caveat**: browsers cannot attach custom headers to WebSocket
   upgrades, so authenticate stream sockets with a requested subprotocol entry
   `openmobile.bearer.<token>` (minted via `POST /v1/auth/token`) instead of
@@ -287,9 +300,10 @@ client.sendInput({ type: "inject", event: "tap", x: 215, y: 480 }); // video-spa
   the bridge to a browser page; with auth off, loopback remains the trust
   boundary and any local page can drive the daemon.
 
-Demo page: `examples/stream.html` (open it in a browser while the bridge
-streams; tap the canvas to inject taps). The client bundle it imports is
-generated — regenerate with `bun run build:stream-demo`.
+Demo page: `examples/stream.html` (open it in a browser while an
+RTC-capable emulator streams; click the video to inject taps in device
+pixels). The client bundle it imports is generated — regenerate with
+`bun run build:stream-demo`.
 
 ## License
 

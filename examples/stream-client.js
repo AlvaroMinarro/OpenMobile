@@ -1,350 +1,252 @@
-// src/stream/client/annexb.ts
-function classifyNal(nal) {
-  const h = nal[0];
-  if (h === undefined || (h & 128) !== 0)
-    return "slice";
-  const type = h & 31;
-  if (type === 7)
-    return "sps";
-  if (type === 8)
-    return "pps";
-  if (type === 5)
-    return "idr";
-  return "slice";
-}
-
-class AnnexBSplitter {
-  pending = new Uint8Array(0);
-  push(chunk) {
-    if (this.pending.length === 0) {
-      this.pending = chunk;
-      return;
-    }
-    const next = new Uint8Array(this.pending.length + chunk.length);
-    next.set(this.pending, 0);
-    next.set(chunk, this.pending.length);
-    this.pending = next;
-  }
-  drain(segmentEnd = false) {
-    const out = [];
-    const n = this.pending.length;
-    let cursor = 0;
-    let i = 0;
-    while (i + 2 < n && cursor < n) {
-      const a = this.pending[i];
-      const b = this.pending[i + 1];
-      const c = this.pending[i + 2];
-      if (a === 0 && b === 0 && c === 1) {
-        const codeLen = i > 0 && this.pending[i - 1] === 0 ? 4 : 3;
-        const codeStart = i + 3 - codeLen;
-        if (cursor < codeStart) {
-          out.push(this.pending.slice(cursor, codeStart));
-        }
-        cursor = codeStart + codeLen;
-        i = cursor;
-        continue;
-      }
-      i++;
-    }
-    const tail = this.pending.slice(cursor);
-    if (segmentEnd) {
-      if (cursor < n)
-        out.push(tail);
-      this.pending = new Uint8Array(0);
-      return out;
-    }
-    this.pending = tail;
-    return out;
-  }
-}
-
-// src/stream/client/decoder.ts
-var defaultChunkFactory = (init) => {
-  const Ctor = globalThis.EncodedVideoChunk;
-  if (Ctor)
-    return new Ctor(init);
-  return { type: init.type, timestamp: init.timestamp, data: init.data };
-};
-var frameFree = (frame) => {
-  const f = frame;
-  if (f && typeof f.close === "function" && !f.closed) {
-    try {
-      f.close();
-    } catch {}
-  }
-};
-
-class DecoderSession {
-  decoder;
-  canvas;
-  onFirstFrame;
-  chunk;
-  pts = 0;
-  configured = false;
-  firstDelivered = false;
-  constructor(deps) {
-    this.decoder = deps.decoder;
-    this.canvas = deps.canvas ?? null;
-    this.onFirstFrame = deps.onFirstFrame ?? null;
-    this.chunk = deps.chunkFactory ?? defaultChunkFactory;
-    this.decoder.onoutput = (frame) => this.draw(frame);
-    this.decoder.onerror = (e) => {
-      deps.onError?.(e?.message ?? "decoder error");
-    };
-  }
-  async configure(hs) {
-    const sps = decodeB64(hs.sps);
-    const pps = decodeB64(hs.pps);
-    const desc = new Uint8Array(4 + sps.length + 4 + pps.length);
-    desc.set([0, 0, 0, 1], 0);
-    desc.set(sps, 4);
-    desc.set([0, 0, 0, 1], 4 + sps.length);
-    desc.set(pps, 4 + sps.length + 4);
-    this.decoder.configure({
-      codec: avc1Codec(sps),
-      codedWidth: hs.width,
-      codedHeight: hs.height,
-      description: desc,
-      optimizeForLatency: true
-    });
-    this.configured = true;
-  }
-  decode(nal) {
-    if (!this.configured)
-      return;
-    this.pts += 1;
-    const data = new Uint8Array(4 + nal.data.length);
-    data.set([0, 0, 0, 1], 0);
-    data.set(nal.data, 4);
-    this.decoder.decode(this.chunk({
-      type: nal.type === "idr" ? "key" : "delta",
-      timestamp: this.pts * 1000,
-      data
-    }));
-  }
-  async close() {
-    if (this.decoder.state === "closed") {
-      this.configured = false;
-      return;
-    }
-    if (this.configured) {
-      try {
-        await this.decoder.flush();
-      } catch {}
-    }
-    this.decoder.close();
-    this.configured = false;
-  }
-  draw(frame) {
-    if (!this.firstDelivered) {
-      this.firstDelivered = true;
-      try {
-        this.onFirstFrame?.();
-      } catch {}
-    }
-    const raw = this.canvas?.getContext("2d");
-    const ctx = typeof raw === "object" && raw !== null ? raw : null;
-    if (this.canvas && ctx && typeof ctx.drawImage === "function") {
-      try {
-        ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
-      } catch {}
-    }
-    frameFree(frame);
-  }
-}
-function avc1Codec(sps) {
-  const p = sps[1] ?? 0;
-  const c = sps[2] ?? 0;
-  const l = sps[3] ?? 0;
-  return `avc1.${hex2(p)}${hex2(c)}${hex2(l)}`;
-}
-function decodeB64(b64) {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0;i < bin.length; i++)
-    out[i] = bin.charCodeAt(i);
-  return out;
-}
-function hex2(n) {
-  return n.toString(16).padStart(2, "0");
-}
-
-// src/stream/client/support.ts
-function isStreamSupported() {
-  const g = globalThis;
-  if (typeof g.VideoDecoder !== "function")
-    return false;
-  const Ctor = g.VideoDecoder;
-  try {
-    const probe = new Ctor({ output: () => {}, error: () => {} });
-    probe?.close?.();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 // src/stream/client/index.ts
-var defaultSocketFactory = (url) => new WebSocket(url);
-function toBytes(data) {
-  if (data instanceof Uint8Array)
-    return data;
-  if (data instanceof ArrayBuffer)
-    return new Uint8Array(data);
-  return null;
+function hasVp8(codecs) {
+  return codecs.some((c) => c.toUpperCase() === "VP8");
 }
+function deriveControlUrl(videoUrl) {
+  return videoUrl.replace(/\/video(?=$|\?)/, "/control");
+}
+var WS_OPEN = 1;
+var defaultSocketFactory = (url) => new WebSocket(url);
 function createStreamClient(opts) {
   const deps = opts.deps ?? {};
-  const videoUrl = opts.url;
-  const controlUrl = videoUrl.replace(/\/video$/, "/control");
-  const videoSock = (deps.createVideoSocket ?? defaultSocketFactory)(videoUrl);
-  const controlSock = (deps.createControlSocket ?? defaultSocketFactory)(controlUrl);
-  const splitter = new AnnexBSplitter;
-  const status = (s) => opts.onStatus(s);
-  let session = null;
-  let controlOpen = false;
-  let closed = false;
-  let started = false;
-  let onMessage;
-  const size = { current: null };
-  const onVideoJson = (raw) => {
+  const makeSocket = deps.createSignalSocket ?? defaultSocketFactory;
+  const makeControlSocket = deps.createControlSocket ?? makeSocket;
+  const makePeerConnection = deps.createPeerConnection ?? (() => new RTCPeerConnection);
+  const controlUrl = deriveControlUrl(opts.url);
+  let signal = null;
+  let pc = null;
+  let control = null;
+  let closedByUs = false;
+  let finished = false;
+  let handshakeSeen = false;
+  let answered = false;
+  let streamingSent = false;
+  let info = null;
+  let pendingRemoteIce = [];
+  let pendingLocalIce = [];
+  let resolveOpen = null;
+  let rejectOpen = null;
+  const openPromise = new Promise((res, rej) => {
+    resolveOpen = res;
+    rejectOpen = rej;
+  });
+  let messageListener;
+  const emitMessage = (msg) => {
+    messageListener?.(msg);
+  };
+  const status = (s) => {
+    if (finished)
+      return;
+    if (s.phase === "error" || s.phase === "closed")
+      finished = true;
+    opts.onStatus?.(s);
+  };
+  const fail = (message) => {
+    status({ phase: "error", message });
+    teardownSockets();
+    rejectOpen?.(new Error(message));
+  };
+  const teardownSockets = () => {
+    pc?.close();
+    pc = null;
+    signal?.close();
+    signal = null;
+  };
+  const send = (msg) => {
+    try {
+      signal?.send(JSON.stringify(msg));
+    } catch {}
+  };
+  const addRemoteCandidate = (candidate) => {
+    if (!pc || !answered) {
+      pendingRemoteIce.push(candidate);
+      return;
+    }
+    pc.addIceCandidate(candidate).catch(() => {});
+  };
+  const handleOffer = async (sdp) => {
+    if (answered || !pc)
+      return;
+    try {
+      await pc.setRemoteDescription({ type: "offer", sdp });
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      send({ type: "answer", sdp: pc.localDescription?.sdp ?? answer.sdp });
+      answered = true;
+      for (const candidate of pendingRemoteIce.splice(0)) {
+        pc.addIceCandidate(candidate).catch(() => {});
+      }
+      resolveOpen?.();
+    } catch (e) {
+      fail(`answer failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+  const handleFrame = async (raw) => {
     let msg;
     try {
       msg = JSON.parse(raw);
     } catch {
-      return;
+      return fail("malformed signaling frame (not valid JSON)");
     }
-    if (!msg || typeof msg !== "object")
-      return;
-    const m = msg;
-    if (m.type === "handshake") {
-      const hs = m;
-      if (hs.codec !== "h264") {
-        status({ phase: "error", message: `unsupported codec: ${String(hs.codec)}` });
+    if (msg === null || typeof msg !== "object" || Array.isArray(msg)) {
+      return fail("signaling frame must be a JSON object");
+    }
+    const obj = msg;
+    switch (obj.type) {
+      case "handshake": {
+        if (handshakeSeen)
+          return fail("duplicate handshake");
+        if (typeof obj.rtcId !== "string" || typeof obj.fps !== "number" || !Array.isArray(obj.codecs)) {
+          return fail("handshake requires rtcId, fps and codecs");
+        }
+        if (!hasVp8(obj.codecs)) {
+          return fail(`VP8 is mandatory but the handshake offered: ${obj.codecs.join(", ")}`);
+        }
+        handshakeSeen = true;
+        info = { rtcId: obj.rtcId, fps: obj.fps };
+        pc = pc ?? makePeerConnection();
+        wirePeerConnection(pc);
+        status({ phase: "handshake", rtcId: info.rtcId, fps: info.fps });
         return;
       }
-      size.current = { width: hs.width, height: hs.height };
-      session?.configure(hs).then(() => status({ phase: "handshake" })).catch((e) => status({ phase: "error", message: e instanceof Error ? e.message : "decoder configure failed" }));
-      return;
-    }
-    if (m.type === "state") {
-      const st = m;
-      onMessage?.(st);
-      if (st.state === "error") {
-        status({ phase: "error", message: st.reason ?? "stream error" });
-      }
-    }
-  };
-  const onVideoBinary = (data) => {
-    const bytes = toBytes(data);
-    if (!bytes)
-      return;
-    splitter.push(bytes);
-    for (const nal of splitter.drain(true)) {
-      session?.decode({ type: classifyNal(nal), data: nal });
-    }
-  };
-  const onControlJson = (raw) => {
-    let msg;
-    try {
-      msg = JSON.parse(raw);
-    } catch {
-      return;
-    }
-    onMessage?.(msg);
-  };
-  const api = {
-    open() {
-      if (closed || started)
-        return Promise.resolve();
-      started = true;
-      const supported = deps.support ? deps.support() : isStreamSupported();
-      if (!supported) {
-        status({
-          phase: "error",
-          message: "WebCodecs H.264 decode unsupported in this browser — use the polling fallback"
-        });
-        return Promise.resolve();
-      }
-      status({ phase: "connecting" });
-      try {
-        const decoder = deps.decoder ?? new globalThis.VideoDecoder({
-          output: () => {},
-          error: () => {}
-        });
-        session = new DecoderSession({
-          decoder,
-          canvas: opts.canvas,
-          onFirstFrame: () => status({ phase: "streaming" }),
-          onError: (message) => status({ phase: "error", message })
-        });
-      } catch {
-        status({ phase: "error", message: "VideoDecoder unavailable — use the polling fallback" });
-        return Promise.resolve();
-      }
-      videoSock.binaryType = "arraybuffer";
-      videoSock.onopen = () => {};
-      videoSock.onmessage = (ev) => {
-        const d = ev.data;
-        if (typeof d === "string")
-          onVideoJson(d);
-        else
-          onVideoBinary(d);
-      };
-      videoSock.onclose = (ev) => {
-        if (!closed) {
-          status({ phase: "closed", ...ev?.code !== undefined ? { code: ev.code } : {} });
+      case "offer":
+        if (!handshakeSeen)
+          return fail("offer before handshake");
+        await handleOffer(obj.sdp);
+        return;
+      case "answer":
+        if (!handshakeSeen)
+          return fail("answer before handshake");
+        await pc?.setRemoteDescription({ type: "answer", sdp: obj.sdp });
+        return;
+      case "ice": {
+        if (!handshakeSeen)
+          return fail("ice before handshake");
+        const candidate = obj.candidate;
+        if (!candidate || typeof candidate.candidate !== "string") {
+          return fail("ice frame requires an RTCIceCandidateInit candidate");
         }
-        controlOpen = false;
+        addRemoteCandidate(candidate);
+        return;
+      }
+      case "state": {
+        const state = obj.state;
+        const reason = typeof obj.reason === "string" ? obj.reason : undefined;
+        emitMessage({ type: "state", state, reason });
+        if (state === "error")
+          status({ phase: "error", message: reason ?? "stream error" });
+        return;
+      }
+      case "error": {
+        emitMessage(obj);
+        return;
+      }
+      default:
+        return fail(`unknown signaling type: ${String(obj.type)}`);
+    }
+  };
+  const wirePeerConnection = (connection) => {
+    connection.onicecandidate = (ev) => {
+      if (!ev.candidate)
+        return;
+      if (answered) {
+        send({ type: "ice", candidate: ev.candidate });
+      } else {
+        pendingLocalIce.push(ev.candidate);
+      }
+    };
+    connection.ontrack = (ev) => {
+      const stream = ev.streams[0];
+      if (stream !== undefined)
+        opts.video.srcObject = stream;
+    };
+    connection.onconnectionstatechange = () => {
+      if (connection.connectionState === "connected" && !streamingSent) {
+        streamingSent = true;
+        send({ type: "state", state: "streaming" });
+        status({ phase: "streaming" });
+      } else if (connection.connectionState === "failed") {
+        status({ phase: "error", message: "peer connection failed" });
+      }
+    };
+  };
+  return {
+    open() {
+      if (signal)
+        return openPromise;
+      status({ phase: "connecting" });
+      signal = makeSocket(opts.url);
+      signal.onmessage = (ev) => {
+        const data = ev.data;
+        handleFrame(typeof data === "string" ? data : String(data));
       };
-      videoSock.onerror = () => {
-        if (!closed)
-          status({ phase: "error", message: "video socket error" });
+      signal.onclose = (ev) => {
+        if (closedByUs || finished)
+          return;
+        const code = typeof ev?.code === "number" ? ev.code : undefined;
+        const reason = typeof ev?.reason === "string" && ev.reason !== "" ? ev.reason : undefined;
+        teardownSockets();
+        status({ phase: "closed", ...code !== undefined ? { code } : {}, ...reason ? { reason } : {} });
+        rejectOpen?.(new Error(`signal socket closed${code !== undefined ? ` (${code})` : ""}`));
       };
-      controlSock.onopen = () => {
-        controlOpen = true;
-      };
-      controlSock.onmessage = (ev) => {
-        const d = ev.data;
-        if (typeof d === "string")
-          onControlJson(d);
-      };
-      controlSock.onclose = () => {
-        controlOpen = false;
-      };
-      controlSock.onerror = () => {
-        controlOpen = false;
-      };
-      return Promise.resolve();
+      signal.onerror = () => {};
+      return openPromise;
     },
     close() {
-      if (closed)
+      if (closedByUs)
         return;
-      closed = true;
-      controlSock.close();
-      videoSock.close();
-      session?.close().catch(() => {});
+      closedByUs = true;
+      teardownSockets();
+      control?.close();
+      control = null;
       status({ phase: "closed" });
+      rejectOpen?.(new Error("stream closed before signaling completed"));
     },
     sendInput(event) {
-      if (closed || !controlOpen)
+      if (closedByUs)
         return false;
-      controlSock.send(JSON.stringify(event));
-      return true;
-    },
-    get videoSize() {
-      return size.current;
+      if (!control || control.readyState !== WS_OPEN) {
+        if (!control) {
+          control = makeControlSocket(controlUrl);
+          control.onmessage = (ev) => {
+            const data = ev.data;
+            const text = typeof data === "string" ? data : String(data);
+            let parsed;
+            try {
+              parsed = JSON.parse(text);
+            } catch {
+              return;
+            }
+            const msg = parsed;
+            if (msg.type === "ack" || msg.type === "error") {
+              emitMessage(parsed);
+            }
+          };
+          control.onclose = () => {};
+          control.onerror = () => {};
+        }
+        return false;
+      }
+      try {
+        control.send(JSON.stringify(event));
+        return true;
+      } catch {
+        return false;
+      }
     },
     get onMessage() {
-      return onMessage;
+      return messageListener;
     },
     set onMessage(fn) {
-      onMessage = fn;
+      messageListener = fn;
+    },
+    get info() {
+      return info;
     }
   };
-  return api;
 }
 export {
-  isStreamSupported,
-  createStreamClient
+  createStreamClient,
+  deriveControlUrl,
+  hasVp8
 };

@@ -1,276 +1,376 @@
 /**
- * Public browser client for the device-streaming WS contract (task 3.4, D7).
+ * Browser RTC stream client (Phase 3 / PR3, task 3.1).
  *
- * ```ts
- * const client = createStreamClient({
- *   url: "ws://127.0.0.1:8765/v1/stream/video",
- *   canvas,
- *   onStatus: (s) => { /* connecting → handshake → streaming | error | closed *\/ },
- * });
- * client.open();
- * client.sendInput({ type: "inject", event: "tap", x, y });
- * ```
+ * The browser is a WebRTC peer (design D1): this client opens the JSON JSEP
+ * signaling WebSocket (`/v1/stream/video`), drives the RTCPeerConnection
+ * through the emulator's offer (VP8 is mandatory — the emulator's RtcService
+ * v1 answer is video-only VP8), and relays answer/ICE/state frames back.
+ * Media flows browser↔emulator over loopback UDP; the daemon touches no
+ * media bytes (spec: the WS MUST NOT carry binary video frames).
  *
- * Wire contract (README §Streaming WebSockets): the video socket delivers a
- * JSON handshake first, then ONE binary Annex-B access unit per message,
- * then JSON state messages; the control socket accepts JSON inject events
- * and acks/errors. Control URL is derived from the video URL
- * (`/video` → `/control`).
+ * Wire contract (src/stream/types.ts, pinned by the Phase-2 daemon):
+ *   server → client: handshake first, then offer / ice / state frames.
+ *   client → server: answer / ice / state ("streaming").
+ *   close codes: 4400 BAD_MESSAGE, 4401 PERMISSION_DENIED, 4403 UNSUPPORTED,
+ *   4404 NO_DEVICE, 4409 DEVICE_LOST, 4429 VIEWER_CAP.
  *
- * Browser-only: no Bun/node APIs. Sockets, the VideoDecoder and the support
- * probe are injectable so the suite runs headless under bun — the real
- * WebCodecs path is validated on the demo page (examples/stream.html).
+ * Browser-only module: no Bun/node APIs. Sockets and the RTCPeerConnection
+ * are injectable so the suite runs headless under bun against a fake WS
+ * server + fake PC (the real WebRTC path is validated on the demo page).
  */
 
-import { AnnexBSplitter, classifyNal } from "./annexb";
-import { DecoderSession, type CanvasLike, type DecoderLike } from "./decoder";
-import { isStreamSupported } from "./support";
 import type {
   ControlAckMessage,
   ControlErrorMessage,
   ControlEvent,
-  StreamStateMessage,
-  VideoHandshake,
+  RtcIceCandidateInit,
+  RtcStreamState,
 } from "../types";
 
-export { isStreamSupported } from "./support";
-export type { CanvasLike, DecodedNal, DecoderLike } from "./decoder";
+// ─── Structural seams (DOM-agnostic; one cast at the platform edge) ──────
 
-/** Client lifecycle phases, mirroring the server's state contract. */
-export type StreamClientStatus =
-  | { phase: "connecting" }
-  | { phase: "handshake" }
-  | { phase: "streaming" }
-  | { phase: "error"; message: string }
-  | { phase: "closed"; code?: number };
-
-/** Server contract messages the client can surface (README §WS Contract). */
-export type StreamClientMessage = ControlAckMessage | ControlErrorMessage | StreamStateMessage;
-
-/**
- * Structural WebSocket surface (DOM-agnostic). Handler properties are
- * `unknown` so platform sockets (browser/Bun) and test doubles both fit;
- * the platform invokes them with its own event objects.
- */
-export interface VideoSocketLike {
-  binaryType: string;
+/** JSON text socket surface (browser/Bun WebSocket or test double). */
+export interface SignalSocketLike {
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  readonly readyState: number;
   onopen: unknown;
   onmessage: unknown;
   onclose: unknown;
   onerror: unknown;
-  send(data: string | ArrayBuffer | Uint8Array): void;
-  close(code?: number, reason?: string): void;
 }
 
-/** Dependency injection seam (tests substitute sockets/decoder/support). */
+/** Structural RTCPeerConnection surface the client actually drives. */
+export interface PeerConnectionLike {
+  readonly localDescription: { type: string; sdp: string } | null;
+  connectionState: string;
+  onicecandidate: ((ev: { candidate: RtcIceCandidateInit | null }) => void) | null;
+  ontrack: ((ev: { track: unknown; streams: readonly unknown[] }) => void) | null;
+  onconnectionstatechange: (() => void) | null;
+  setRemoteDescription(desc: { type: string; sdp: string }): Promise<void>;
+  createAnswer(): Promise<{ type: string; sdp: string }>;
+  setLocalDescription(desc: { type: string; sdp: string }): Promise<void>;
+  addIceCandidate(candidate: RtcIceCandidateInit): Promise<void>;
+  close(): void;
+}
+
+/** Caller-owned <video> element (structural — srcObject assignment only). */
+export interface VideoSinkLike {
+  srcObject: unknown;
+}
+
+/** Client lifecycle phases, mirroring the server's state contract. */
+export type StreamClientStatus =
+  | { phase: "connecting" }
+  | { phase: "handshake"; rtcId: string; fps: number }
+  | { phase: "streaming" }
+  | { phase: "error"; message: string }
+  | { phase: "closed"; code?: number; reason?: string };
+
+/** Server contract messages the client can surface (state / ack / error). */
+export type StreamClientMessage =
+  | ControlAckMessage
+  | ControlErrorMessage
+  | { type: "state"; state: RtcStreamState; reason?: string };
+
 export interface StreamClientDeps {
-  createVideoSocket?: (url: string) => VideoSocketLike;
-  createControlSocket?: (url: string) => VideoSocketLike;
-  decoder?: DecoderLike;
-  /** Support probe override (default: real isStreamSupported()). */
-  support?: () => boolean;
+  createSignalSocket?: (url: string) => SignalSocketLike;
+  createControlSocket?: (url: string) => SignalSocketLike;
+  createPeerConnection?: () => PeerConnectionLike;
 }
 
 export interface StreamClientOptions {
-  /** Video WS URL, e.g. `ws://127.0.0.1:8765/v1/stream/video`. */
+  /** Video signaling WS URL, e.g. `ws://127.0.0.1:8765/v1/stream/video`. */
   url: string;
-  /** Caller-owned canvas the decoded frames are drawn onto. */
-  canvas: CanvasLike;
-  onStatus: (status: StreamClientStatus) => void;
+  /** Caller-owned video element the remote track's MediaStream attaches to. */
+  video: VideoSinkLike;
+  onStatus?: (status: StreamClientStatus) => void;
   deps?: StreamClientDeps;
 }
 
 export interface StreamClient {
-  /** Connect both sockets and start decoding. Safe to call once. */
+  /** Connect the signal socket and complete the JSEP answer. Call once. */
   open(): Promise<void>;
-  /** Close both sockets + the decoder. Idempotent. */
+  /** Close the peer connection + both sockets. Idempotent. */
   close(): void;
   /**
-   * Inject an input event over the control socket (README §WS Contract).
-   * Returns false when the control socket is not open (no active stream —
-   * the caller should fall back to REST /v1/input/*).
+   * Inject an input event over the control socket (`/video` → `/control`,
+ * frozen contract). Returns false when the control socket is not open —
+   * route input through `POST /v1/input/*` in that case.
    */
   sendInput(event: ControlEvent): boolean;
   /** Optional listener for server contract messages (state / ack / error). */
   onMessage?: (msg: StreamClientMessage) => void;
-  /** Video size from the handshake (set once configured). */
-  readonly videoSize: { width: number; height: number } | null;
+  /** Handshake facts (rtcId + configured fps) once received. */
+  readonly info: { rtcId: string; fps: number } | null;
 }
+
+/** VP8 is mandatory (proposal D1): every other codec gate is deleted. */
+export function hasVp8(codecs: readonly string[]): boolean {
+  return codecs.some((c) => c.toUpperCase() === "VP8");
+}
+
+/** The control WS is the video URL with the `/video` suffix swapped. */
+export function deriveControlUrl(videoUrl: string): string {
+  return videoUrl.replace(/\/video(?=$|\?)/, "/control");
+}
+
+const WS_OPEN = 1;
 
 /** Structural adaptation of the platform WebSocket — one cast at the edge. */
-const defaultSocketFactory = (url: string): VideoSocketLike =>
-  new WebSocket(url) as unknown as VideoSocketLike;
-
-/** Normalize WS binary payloads (binaryType=arraybuffer). */
-function toBytes(data: unknown): Uint8Array | null {
-  if (data instanceof Uint8Array) return data;
-  if (data instanceof ArrayBuffer) return new Uint8Array(data);
-  return null;
-}
+const defaultSocketFactory = (url: string): SignalSocketLike =>
+  new WebSocket(url) as unknown as SignalSocketLike;
 
 export function createStreamClient(opts: StreamClientOptions): StreamClient {
   const deps = opts.deps ?? {};
-  const videoUrl = opts.url;
-  const controlUrl = videoUrl.replace(/\/video$/, "/control");
-  const videoSock = (deps.createVideoSocket ?? defaultSocketFactory)(videoUrl);
-  const controlSock = (deps.createControlSocket ?? defaultSocketFactory)(controlUrl);
-  const splitter = new AnnexBSplitter();
-  const status = (s: StreamClientStatus): void => opts.onStatus(s);
+  const makeSocket = deps.createSignalSocket ?? defaultSocketFactory;
+  const makeControlSocket = deps.createControlSocket ?? makeSocket;
+  const makePeerConnection =
+    deps.createPeerConnection ?? (() => new RTCPeerConnection() as unknown as PeerConnectionLike);
 
-  let session: DecoderSession | null = null;
-  let controlOpen = false;
-  let closed = false;
-  let started = false;
-  let onMessage: StreamClient["onMessage"];
-  const size = { current: null as { width: number; height: number } | null };
+  const controlUrl = deriveControlUrl(opts.url);
+  let signal: SignalSocketLike | null = null;
+  let pc: PeerConnectionLike | null = null;
+  let control: SignalSocketLike | null = null;
+  let closedByUs = false;
+  let finished = false; // one terminal status wins (error or closed)
+  let handshakeSeen = false;
+  let answered = false;
+  let streamingSent = false;
+  let info: { rtcId: string; fps: number } | null = null;
+  /** Remote candidates arriving before the offer is applied (robustness). */
+  let pendingRemoteIce: RtcIceCandidateInit[] = [];
+  /** Local candidates generated before our answer is set (defensive buffer). */
+  let pendingLocalIce: RtcIceCandidateInit[] = [];
 
-  /** JSON messages on the video socket: handshake or state. */
-  const onVideoJson = (raw: string): void => {
+  let resolveOpen: (() => void) | null = null;
+  let rejectOpen: ((e: Error) => void) | null = null;
+  const openPromise = new Promise<void>((res, rej) => {
+    resolveOpen = res;
+    rejectOpen = rej;
+  });
+
+  /** The assignable listener lives behind a getter/setter (see return). */
+  let messageListener: ((msg: StreamClientMessage) => void) | undefined;
+  const emitMessage = (msg: StreamClientMessage): void => {
+    messageListener?.(msg);
+  };
+
+  const status = (s: StreamClientStatus): void => {
+    if (finished) return;
+    if (s.phase === "error" || s.phase === "closed") finished = true;
+    opts.onStatus?.(s);
+  };
+
+  const fail = (message: string): void => {
+    status({ phase: "error", message });
+    teardownSockets();
+    rejectOpen?.(new Error(message));
+  };
+
+  const teardownSockets = (): void => {
+    pc?.close();
+    pc = null;
+    signal?.close();
+    signal = null;
+  };
+
+  const send = (msg: unknown): void => {
+    try {
+      signal?.send(JSON.stringify(msg));
+    } catch {
+      // A send on a dying socket races the close event; nothing to do.
+    }
+  };
+
+  const addRemoteCandidate = (candidate: RtcIceCandidateInit): void => {
+    if (!pc || !answered) {
+      pendingRemoteIce.push(candidate);
+      return;
+    }
+    pc.addIceCandidate(candidate).catch(() => {
+      // Transient ICE failures surface via connectionState, not as errors.
+    });
+  };
+
+  const handleOffer = async (sdp: string): Promise<void> => {
+    if (answered || !pc) return;
+    try {
+      await pc.setRemoteDescription({ type: "offer", sdp });
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      send({ type: "answer", sdp: pc.localDescription?.sdp ?? answer.sdp });
+      answered = true;
+      for (const candidate of pendingRemoteIce.splice(0)) {
+        pc.addIceCandidate(candidate).catch(() => {});
+      }
+      resolveOpen?.();
+    } catch (e) {
+      fail(`answer failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  const handleFrame = async (raw: string): Promise<void> => {
     let msg: unknown;
     try {
-      msg = JSON.parse(raw) as unknown;
+      msg = JSON.parse(raw);
     } catch {
-      return; // malformed message — never crash the page
+      return fail("malformed signaling frame (not valid JSON)");
     }
-    if (!msg || typeof msg !== "object") return;
-    const m = msg as Record<string, unknown>;
-    if (m.type === "handshake") {
-      const hs = m as unknown as VideoHandshake;
-      if (hs.codec !== "h264") {
-        status({ phase: "error", message: `unsupported codec: ${String(hs.codec)}` });
+    if (msg === null || typeof msg !== "object" || Array.isArray(msg)) {
+      return fail("signaling frame must be a JSON object");
+    }
+    const obj = msg as Record<string, unknown>;
+    switch (obj.type) {
+      case "handshake": {
+        if (handshakeSeen) return fail("duplicate handshake");
+        if (typeof obj.rtcId !== "string" || typeof obj.fps !== "number" || !Array.isArray(obj.codecs)) {
+          return fail("handshake requires rtcId, fps and codecs");
+        }
+        if (!hasVp8(obj.codecs as string[])) {
+          return fail(`VP8 is mandatory but the handshake offered: ${(obj.codecs as string[]).join(", ")}`);
+        }
+        handshakeSeen = true;
+        info = { rtcId: obj.rtcId as string, fps: obj.fps as number };
+        pc = pc ?? makePeerConnection();
+        wirePeerConnection(pc);
+        status({ phase: "handshake", rtcId: info.rtcId, fps: info.fps });
         return;
       }
-      size.current = { width: hs.width, height: hs.height };
-      void session
-        ?.configure(hs)
-        .then(() => status({ phase: "handshake" }))
-        .catch((e: unknown) =>
-          status({ phase: "error", message: e instanceof Error ? e.message : "decoder configure failed" }),
-        );
-      return;
-    }
-    if (m.type === "state") {
-      const st = m as unknown as StreamStateMessage;
-      onMessage?.(st);
-      if (st.state === "error") {
-        status({ phase: "error", message: st.reason ?? "stream error" });
-      }
-    }
-  };
-
-  /** Binary messages on the video socket: one Annex-B AU per message. */
-  const onVideoBinary = (data: unknown): void => {
-    const bytes = toBytes(data);
-    if (!bytes) return;
-    splitter.push(bytes);
-    for (const nal of splitter.drain(true)) {
-      session?.decode({ type: classifyNal(nal), data: nal });
-    }
-  };
-
-  /** JSON messages on the control socket: acks + errors. */
-  const onControlJson = (raw: string): void => {
-    let msg: unknown;
-    try {
-      msg = JSON.parse(raw) as unknown;
-    } catch {
-      return;
-    }
-    onMessage?.(msg as StreamClientMessage);
-  };
-
-  const api: StreamClient = {
-    open(): Promise<void> {
-      if (closed || started) return Promise.resolve();
-      started = true;
-      // Fail fast BEFORE touching sockets: the caller falls back to polling.
-      const supported = deps.support ? deps.support() : isStreamSupported();
-      if (!supported) {
-        status({
-          phase: "error",
-          message: "WebCodecs H.264 decode unsupported in this browser — use the polling fallback",
-        });
-        return Promise.resolve();
-      }
-      status({ phase: "connecting" });
-      try {
-        const decoder =
-          deps.decoder ??
-          new (globalThis as { VideoDecoder?: new (init: object) => DecoderLike }).VideoDecoder!({
-            output: () => {},
-            error: () => {},
-          });
-        session = new DecoderSession({
-          decoder,
-          canvas: opts.canvas,
-          onFirstFrame: () => status({ phase: "streaming" }),
-          onError: (message) => status({ phase: "error", message }),
-        });
-      } catch {
-        status({ phase: "error", message: "VideoDecoder unavailable — use the polling fallback" });
-        return Promise.resolve();
-      }
-      videoSock.binaryType = "arraybuffer";
-      videoSock.onopen = () => {
-        // Video socket open — the server sends the handshake as message #1.
-      };
-      videoSock.onmessage = (ev: { data: unknown }) => {
-        const d = (ev as { data: unknown }).data;
-        if (typeof d === "string") onVideoJson(d);
-        else onVideoBinary(d);
-      };
-      videoSock.onclose = (ev?: { code?: number }) => {
-        if (!closed) {
-          status({ phase: "closed", ...(ev?.code !== undefined ? { code: ev.code } : {}) });
+      case "offer":
+        if (!handshakeSeen) return fail("offer before handshake");
+        await handleOffer(obj.sdp as string);
+        return;
+      case "answer":
+        if (!handshakeSeen) return fail("answer before handshake");
+        await pc?.setRemoteDescription({ type: "answer", sdp: obj.sdp as string });
+        return;
+      case "ice": {
+        if (!handshakeSeen) return fail("ice before handshake");
+        const candidate = obj.candidate as RtcIceCandidateInit | undefined;
+        if (!candidate || typeof candidate.candidate !== "string") {
+          return fail("ice frame requires an RTCIceCandidateInit candidate");
         }
-        controlOpen = false;
+        addRemoteCandidate(candidate);
+        return;
+      }
+      case "state": {
+        const state = obj.state as RtcStreamState;
+        const reason = typeof obj.reason === "string" ? obj.reason : undefined;
+        emitMessage({ type: "state", state, reason });
+        if (state === "error") status({ phase: "error", message: reason ?? "stream error" });
+        return;
+      }
+      case "error": {
+        // Rejection bodies (cap/permission/etc.) ride the same socket.
+        emitMessage(obj as unknown as ControlErrorMessage);
+        return;
+      }
+      default:
+        return fail(`unknown signaling type: ${String(obj.type)}`);
+    }
+  };
+
+  const wirePeerConnection = (connection: PeerConnectionLike): void => {
+    connection.onicecandidate = (ev) => {
+      if (!ev.candidate) return; // end-of-candidates — nothing to relay
+      if (answered) {
+        send({ type: "ice", candidate: ev.candidate });
+      } else {
+        pendingLocalIce.push(ev.candidate); // flushed right after the answer
+      }
+    };
+    connection.ontrack = (ev) => {
+      const stream = ev.streams[0];
+      if (stream !== undefined) opts.video.srcObject = stream;
+    };
+    connection.onconnectionstatechange = () => {
+      if (connection.connectionState === "connected" && !streamingSent) {
+        streamingSent = true;
+        send({ type: "state", state: "streaming" });
+        status({ phase: "streaming" });
+      } else if (connection.connectionState === "failed") {
+        status({ phase: "error", message: "peer connection failed" });
+      }
+    };
+  };
+
+  return {
+    open(): Promise<void> {
+      if (signal) return openPromise;
+      status({ phase: "connecting" });
+      signal = makeSocket(opts.url);
+      // Server speaks first (handshake first — Phase-2 daemon contract).
+      signal.onmessage = (ev: { data: unknown }) => {
+        const data = (ev as { data?: unknown }).data;
+        void handleFrame(typeof data === "string" ? data : String(data));
       };
-      videoSock.onerror = () => {
-        if (!closed) status({ phase: "error", message: "video socket error" });
+      signal.onclose = (ev: { code?: number; reason?: string }) => {
+        if (closedByUs || finished) return;
+        const code = typeof ev?.code === "number" ? ev.code : undefined;
+        const reason = typeof ev?.reason === "string" && ev.reason !== "" ? ev.reason : undefined;
+        teardownSockets();
+        status({ phase: "closed", ...(code !== undefined ? { code } : {}), ...(reason ? { reason } : {}) });
+        rejectOpen?.(new Error(`signal socket closed${code !== undefined ? ` (${code})` : ""}`));
       };
-      controlSock.onopen = () => {
-        controlOpen = true;
+      signal.onerror = () => {
+        // The close event always follows; keep it from being unhandled.
       };
-      controlSock.onmessage = (ev: { data: unknown }) => {
-        const d = (ev as { data: unknown }).data;
-        if (typeof d === "string") onControlJson(d);
-      };
-      controlSock.onclose = () => {
-        controlOpen = false;
-      };
-      controlSock.onerror = () => {
-        controlOpen = false;
-      };
-      return Promise.resolve();
+      return openPromise;
     },
 
     close(): void {
-      if (closed) return;
-      closed = true;
-      controlSock.close();
-      videoSock.close();
-      void session?.close().catch(() => {});
+      if (closedByUs) return;
+      closedByUs = true;
+      teardownSockets();
+      control?.close();
+      control = null;
       status({ phase: "closed" });
+      rejectOpen?.(new Error("stream closed before signaling completed"));
     },
 
     sendInput(event: ControlEvent): boolean {
-      if (closed || !controlOpen) return false;
-      controlSock.send(JSON.stringify(event));
-      return true;
+      if (closedByUs) return false;
+      if (!control || control.readyState !== WS_OPEN) {
+        if (!control) {
+          control = makeControlSocket(controlUrl);
+          control.onmessage = (ev: { data: unknown }) => {
+            const data = (ev as { data?: unknown }).data;
+            const text = typeof data === "string" ? data : String(data);
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(text);
+            } catch {
+              return;
+            }
+            const msg = parsed as Record<string, unknown>;
+            if (msg.type === "ack" || msg.type === "error") {
+              emitMessage(parsed as unknown as ControlAckMessage | ControlErrorMessage);
+            }
+          };
+          control.onclose = () => {};
+          control.onerror = () => {};
+        }
+        return false;
+      }
+      try {
+        control.send(JSON.stringify(event));
+        return true;
+      } catch {
+        return false;
+      }
     },
 
-    get videoSize(): { width: number; height: number } | null {
-      return size.current;
+    get onMessage() {
+      return messageListener;
     },
 
-    get onMessage(): StreamClient["onMessage"] {
-      return onMessage;
+    set onMessage(fn: ((msg: StreamClientMessage) => void) | undefined) {
+      messageListener = fn;
     },
 
-    set onMessage(fn: StreamClient["onMessage"]) {
-      onMessage = fn;
+    get info() {
+      return info;
     },
   };
-
-  return api;
 }

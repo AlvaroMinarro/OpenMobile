@@ -4,8 +4,16 @@ import { AdbWrapper } from "../device/adb";
 import { BunCommandRunner } from "../device/runner";
 import { createBridgeApp } from "./server";
 import { tempPngPath } from "../device/temp";
+import { resolveGrpcControl } from "../tools/context";
 import type { BridgeApp, BridgeDeps } from "./server";
 import { StreamGateway } from "../stream/gateway";
+import { RtcSession } from "../stream/rtc/session";
+import { GrpcRtcAdapter } from "../stream/rtc/adapter";
+import {
+  GrpcRtcClient,
+  defaultRunDir,
+  resolveRtcCapability,
+} from "../device/grpc";
 import { parseAuthConfig } from "./auth";
 
 /**
@@ -29,6 +37,8 @@ import { parseAuthConfig } from "./auth";
  *   OPENMOBILE_STREAM                 (`on` default; `off` disables streaming —
  *                                     the WS routes reject with 4403 and
  *                                     /v1/state reports stream.supported:false)
+ *   OPENMOBILE_RTC_FPS                (configured -rtcfps: 30 default, 60 fast;
+ *                                     reported in the handshake + stream.rtc.fps)
  */
 const DEFAULT_PORT = 8765;
 const HOSTNAME = "127.0.0.1";
@@ -57,6 +67,36 @@ export function createSelectionOverride(): NonNullable<BridgeDeps["selectionOver
   };
 }
 
+/**
+ * Configured `-rtcfps` (Codec and FPS Negotiation requirement): 30 is the
+ * emulator default; 60 is the fast option. Anything else falls back to 30 —
+ * the value is only ever REPORTED here (handshake + /v1/state), the flag
+ * itself is applied at launch (androidCli, ≥36.6 gate).
+ */
+export function parseRtcFps(raw: string | undefined): number {
+  return raw === "60" ? 60 : 30;
+}
+
+/**
+ * Build the RtcSession for one resolved endpoint (task 2.8): the gRPC v1
+ * adapter over GrpcRtcClient, the getStatus watchdog probe on the same
+ * endpoint, and VP8 as the mandatory codec.
+ */
+function createRtcSession(
+  endpoint: { addr: string; token: string },
+  serial: string,
+  fps: number,
+): RtcSession {
+  const client = new GrpcRtcClient(endpoint.addr, endpoint.token);
+  return new RtcSession({
+    serial,
+    adapter: new GrpcRtcAdapter(client),
+    fps,
+    codecs: ["VP8"],
+    probe: () => client.probe(),
+  });
+}
+
 export function createBridgeDeps(env: Record<string, string> = process.env as Record<string, string>): BridgeDeps {
   const runner = new BunCommandRunner(env);
   const adb = new AdbWrapper(runner);
@@ -70,19 +110,33 @@ export function createBridgeDeps(env: Record<string, string> = process.env as Re
     tempPngPath,
     // Runtime selection override (design D7): fresh per wiring ⇒ restart clears.
     selectionOverride: createSelectionOverride(),
+    // gRPC-first input (input-channel delta): resolve the serial → pid-ini
+    // token/port; null (external launch, physical device) ⇒ adb fallback.
+    grpcControl: resolveGrpcControl,
   };
   if (streamEnabled(env)) {
     // The gateway serial follows the same resolution as REST: ANDROID_DEVICE
     // env beats the single attached device. autodetect-ing here is deferred
-    // to the gateway's own device read via the watchdog source.
+    // to when a stream actually starts (first viewer) — keeps /v1/state
+    // honest before any viewer is attached.
     const serial = env["ANDROID_DEVICE"] ?? "";
+    const fps = parseRtcFps(env["OPENMOBILE_RTC_FPS"]);
     deps.streamGateway = new StreamGateway({
-      runner,
-      // Empty serial: the gateway falls back to resolving the device when a
-      // stream actually starts (first viewer) — keeps /v1/state honest before
-      // any viewer is attached.
+      // Empty serial: the gateway resolves the device when a stream actually
+      // starts (first viewer).
       serial: serial || "auto",
       enabled: true,
+      fps,
+      // Capability probe (task 2.8): pid-ini endpoint + version gate under
+      // the per-instance run dir (env record first, then the default).
+      resolveCapability: (target) =>
+        resolveRtcCapability(env["OPENMOBILE_AVD_RUN_DIR"] ?? defaultRunDir(), target),
+      // RtcSession factory: real gRPC v1 adapter + getStatus watchdog.
+      createSession: (endpoint, target) => createRtcSession(endpoint, target, fps),
+      // Control injector for the active stream (WS /v1/stream/control).
+      controlFor: resolveGrpcControl,
+      // "auto" resolution + the manager's adb watchdog share the device poll.
+      pollDevices: () => adb.devices(),
     });
   }
   return deps;

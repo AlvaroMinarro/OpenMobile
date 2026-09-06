@@ -21,15 +21,20 @@ import type { DeviceContext } from "../tools/context";
 import { LogcatHub, type LogcatSocket, type LogcatSubscription } from "../stream/logcatHub";
 import {
   WS_CLOSE_CODES,
+  parseClientJsep,
   type ControlErrorMessage,
-  type StreamStateMessage,
+  type RtcClientMessage,
+  type RtcServerMessage,
+  type RtcStateView,
   type StreamViewer,
-  type VideoHandshake,
 } from "../stream/types";
 import {
   sendControlEvent,
   ControlError,
+  type ControlInjector,
 } from "../stream/control";
+import type { EmulatorControl } from "../device/grpc";
+import { GrpcControlError } from "../device/grpc";
 import {
   authenticateRequest,
   bearerCredential,
@@ -102,7 +107,10 @@ export interface BridgeDeps {
      * legacy fakes stay valid — absent ⇒ the route 404s
      * (streaming-not-deployed precedent).
      */
-    emulatorStart?(name: string, timeoutMs?: number): Promise<string | null>;
+    emulatorStart?(
+      name: string,
+      opts?: { fps?: number; timeoutMs?: number },
+    ): Promise<string>;
     emulatorStop?(name: string): Promise<void>;
     emulatorCreate?(name: string): Promise<void>;
     /** CLI layout path of the local get_ui_tree tool (GET /v1/ui-tree). */
@@ -128,13 +136,22 @@ export interface BridgeDeps {
    */
   streamStatusProvider?: () => StreamStateView;
   /**
+   * gRPC-first input surface (input-channel delta, design D3/D5): resolves a
+   * serial to the emulator's EmulatorController when the running instance has
+   * a per-instance pid ini; null ⇒ `adb shell input` fallback. Optional so
+   * legacy minimal test deps stay valid (adb-only).
+   */
+  grpcControl?: (serial: string) => Promise<EmulatorControl | null>;
+  /**
    * Stream subsystem for the WS routes (design D2/D3/D5). When absent, the
    * WS /v1/stream/* routes are rejected with 404 (no streaming deployed).
    * The bridge only consumes this narrow contract:
-   *  - subscribeVideo → a StreamViewer the daemon will feed (handshake
-   *    first, then binary AUs; the viewer's close() means session ending),
+   *  - subscribeVideo → a StreamViewer the session will feed (handshake
+   *    first, then the JSEP offer/ice frames; the viewer's close() means
+   *    session ending → 4409),
    *  - unsubscribeVideo → release the viewer,
-   *  - controlActive → the ACTIVE session's control writer (null = none),
+   *  - controlActive → the ACTIVE stream's gRPC control injector (null =
+   *    none; the bridge sends validated JSON injects through it),
    *  - snapshot → additive /v1/state stream object (used when
    *    streamStatusProvider is absent; provider wins when both present).
    */
@@ -149,7 +166,7 @@ export type StreamSubscribeResult =
   | { ok: true; viewerId: string }
   | {
       ok: false;
-      code: "UNSUPPORTED" | "CAP_REACHED" | "NO_DEVICE";
+      code: "UNSUPPORTED" | "CAP_REACHED" | "NO_DEVICE" | "PERMISSION_DENIED";
       reason?: string;
     };
 
@@ -158,20 +175,28 @@ export interface StreamGateway {
   snapshot(): StreamStateView;
   /**
    * Register a video viewer. The bridge PASSES the socket-facing viewer; the
-   * gateway (via its fanout) broadcasts into it: sendHandshake (JSON) first,
-   * then sendFrame (binary AU) per access unit; when the session ends the
-   * gateway's teardown calls viewer.close() (the bridge closes 4409).
-   * Returns UNSUPPORTED (kill-switch off), CAP_REACHED (design D4, 8 max),
-   * or NO_DEVICE (start failed) — the bridge maps these onto close codes.
+   * gateway (via its RtcSession) relays JSEP signaling into it: the
+   * handshake (JSON) FIRST, then the offer/ice frames; when the session ends
+   * the gateway's teardown calls viewer.close() (the bridge closes 4409).
+   * Returns UNSUPPORTED (kill-switch off / capability gate), CAP_REACHED
+   * (design D4, 8 max), PERMISSION_DENIED (4401) or NO_DEVICE (start
+   * failed) — the bridge maps these onto close codes.
    */
   subscribeVideo(viewer: StreamViewer): Promise<StreamSubscribeResult>;
   /** Release a video viewer (last release may tear the session down). */
   unsubscribeVideo(viewerId: string): void;
   /**
-   * The ACTIVE session's control writer, or null when no stream is up.
-   * The control route sends scrcpy bytes through `write` after validation.
+   * Relay a validated client JSEP frame (answer/ice/state) into THAT
+   * viewer's RTC stream. Returns false when no session/viewer exists — the
+   * bridge closes the socket (4409) instead of silently dropping the frame.
    */
-  controlActive(): { video: { width: number; height: number }; write: (bytes: Buffer[]) => Promise<void> } | null;
+  relayViewerMessage(viewerId: string, msg: RtcClientMessage): boolean;
+  /**
+   * The ACTIVE stream's control injector, or null when no stream is up.
+   * The control route validates the JSON contract and calls `inject`
+   * (gRPC unary in device physical pixels, design D3/D5).
+   */
+  controlActive(): ControlInjector | null;
 }
 
 /** Additive `stream` object in /v1/state (design D6; locked contract delta). */
@@ -183,6 +208,8 @@ export interface StreamStateView {
   /** Video size of the active stream (present once the handshake landed). */
   width?: number;
   height?: number;
+  /** Additive RTC video surface (task 2.7): stream.rtc{…}. */
+  rtc?: RtcStateView;
 }
 
 export interface BridgeOptions {
@@ -471,12 +498,44 @@ function readOptionalBoundedInt(raw: string | null, min: number, max: number, fa
   return Number.isInteger(n) && n >= min && n <= max ? n : fallback;
 }
 
+/**
+ * gRPC-first input mode selection (input-channel delta): when the selected
+ * emulator exposes a usable EmulatorController the gesture goes through gRPC
+ * unary in DEVICE PHYSICAL pixels (bounds validated client-side inside the
+ * control client); `adb shell input` is the fallback when no gRPC surface
+ * exists. A failing gRPC call propagates as an actionable error — NEVER a
+ * silent adb fallback (Injection-failure scenario).
+ */
+async function injectGrpcFirst(
+  deps: BridgeDeps,
+  serial: string,
+  grpc: (control: EmulatorControl) => Promise<void>,
+  adbFallback: () => Promise<void>,
+): Promise<void> {
+  const control = deps.grpcControl ? await deps.grpcControl(serial) : null;
+  if (control) {
+    try {
+      await grpc(control);
+      return;
+    } catch (e) {
+      if (e instanceof GrpcControlError) throw new HttpError(502, e.code, e.message, e.details);
+      throw e;
+    }
+  }
+  await adbFallback();
+}
+
 async function handleTap(deps: BridgeDeps, explicit: string | undefined, req: Request): Promise<Response> {
   const body = await requireJson(req);
   const x = needNumber(body, "x");
   const y = needNumber(body, "y");
   const serial = await requireUsable(deps, explicit);
-  await deps.adb.inputTap(serial, x, y);
+  await injectGrpcFirst(
+    deps,
+    serial,
+    (control) => control.tap(x, y),
+    () => deps.adb.inputTap(serial, x, y),
+  );
   return json(200, { ok: true, x, y, serial });
 }
 
@@ -492,7 +551,12 @@ async function handleSwipe(
   const y2 = needNumber(body, "y2");
   const durationMs = readOptionalNumber(body, "durationMs");
   const serial = await requireUsable(deps, explicit);
-  await deps.adb.inputSwipe(serial, x1, y1, x2, y2, durationMs);
+  await injectGrpcFirst(
+    deps,
+    serial,
+    (control) => control.swipe(x1, y1, x2, y2, durationMs),
+    () => deps.adb.inputSwipe(serial, x1, y1, x2, y2, durationMs),
+  );
   return json(200, { ok: true, serial });
 }
 
@@ -502,16 +566,24 @@ async function handleText(deps: BridgeDeps, explicit: string | undefined, req: R
   if (typeof raw !== "string" || raw.length === 0) {
     throw new HttpError(422, "VALIDATION_ERROR", "field 'text' must be a non-empty string", "text");
   }
-  // Validate injectability through the device-core rule before dispatching.
-  let serial: string;
-  try {
-    escapeForAdb(raw);
-  } catch (e) {
-    const message = e instanceof InputError ? e.message : "text cannot be injected";
-    throw new HttpError(422, "VALIDATION_ERROR", message);
-  }
-  serial = await requireUsable(deps, explicit);
-  await deps.adb.inputText(serial, raw);
+  const serial = await requireUsable(deps, explicit);
+  await injectGrpcFirst(
+    deps,
+    serial,
+    // gRPC path: full UTF-8 rides sendKey(KeyboardEvent{text}) — probe D;
+    // there is no sendText RPC and no adb ASCII restriction.
+    (control) => control.text(raw),
+    async () => {
+      // adb path only: validate injectability through the device-core rule.
+      try {
+        escapeForAdb(raw);
+      } catch (e) {
+        const message = e instanceof InputError ? e.message : "text cannot be injected";
+        throw new HttpError(422, "VALIDATION_ERROR", message);
+      }
+      await deps.adb.inputText(serial, raw);
+    },
+  );
   return json(200, { ok: true, serial });
 }
 
@@ -840,6 +912,10 @@ function wsReject(ws: Bun.ServerWebSocket<Record<string, unknown>>, code: number
 
 function errorCodeForClose(code: number): string {
   switch (code) {
+    case WS_CLOSE_CODES.BAD_MESSAGE:
+      return "BAD_MESSAGE";
+    case WS_CLOSE_CODES.PERMISSION_DENIED:
+      return "PERMISSION_DENIED";
     case WS_CLOSE_CODES.UNSUPPORTED:
       return "STREAM_UNSUPPORTED";
     case WS_CLOSE_CODES.NO_DEVICE:
@@ -920,6 +996,7 @@ export function createBridgeApp(deps: BridgeDeps, opts: BridgeOptions = {}): Bri
     message(ws, msg) {
       const conn = ws.data as unknown as WsConn;
       if (conn.kind === "control") void onControlMessage(ws, msg);
+      else if (conn.kind === "video") onVideoMessage(ws, msg);
       else if (conn.kind === "logcat") {
         const text =
           typeof msg === "string" ? msg : Buffer.from(msg as Uint8Array).toString("utf8");
@@ -967,21 +1044,15 @@ export function createBridgeApp(deps: BridgeDeps, opts: BridgeOptions = {}): Bri
       wsReject(ws, WS_CLOSE_CODES.UNSUPPORTED, snap.reason ?? "streaming unsupported");
       return;
     }
-    // Socket-facing viewer: the gateway's fanout broadcasts INTO it. The
-    // bridge maps the viewer's close() (session teardown) onto 4409, and the
-    // sendHandshake/sendFrame/sendState calls onto WS text/binary frames.
+    // Socket-facing viewer: the gateway (via its RtcSession) relays JSEP
+    // signaling INTO it — every frame is a JSON text message (the WS MUST
+    // NOT carry binary video frames; media flows browser↔emulator over
+    // loopback UDP, design D1). The viewer's close() (session teardown /
+    // device loss) maps onto 4409.
     const socketViewer: StreamViewer = {
       id: crypto.randomUUID(),
-      sendHandshake: (h) => {
-        ws.send(JSON.stringify(h));
-        return Promise.resolve();
-      },
-      sendFrame: (f) => {
-        ws.send(f);
-        return Promise.resolve();
-      },
-      sendState: (s) => {
-        ws.send(JSON.stringify(s));
+      sendMessage: (msg: RtcServerMessage) => {
+        ws.send(JSON.stringify(msg));
         return Promise.resolve();
       },
       get open() {
@@ -1003,13 +1074,35 @@ export function createBridgeApp(deps: BridgeDeps, opts: BridgeOptions = {}): Bri
         wsReject(ws, WS_CLOSE_CODES.VIEWER_CAP, result.reason ?? "viewer cap reached (8)");
       } else if (result.code === "UNSUPPORTED") {
         wsReject(ws, WS_CLOSE_CODES.UNSUPPORTED, result.reason ?? "streaming unsupported");
+      } else if (result.code === "PERMISSION_DENIED") {
+        wsReject(ws, WS_CLOSE_CODES.PERMISSION_DENIED, result.reason ?? "emulator gRPC denied RtcService");
       } else {
         wsReject(ws, WS_CLOSE_CODES.NO_DEVICE, result.reason ?? "no usable device for streaming");
       }
       return;
     }
-    // The handshake + frames flow through sendHandshake/sendFrame once the
-    // daemon's session is up. Nothing more to do here.
+    // The handshake + offer + ice frames flow through sendMessage once the
+    // viewer's RTC stream is up. Client frames arrive in message() below.
+  }
+
+  /**
+   * Client→server JSEP signaling on the video WS (task 2.7). Malformed or
+   * unknown frames produce a JSON error body + close (spec: Malformed
+   * signaling — never a silent hang); valid frames relay into the viewer's
+   * RTC stream, and a frame for a stream that is gone closes 4409.
+   */
+  function onVideoMessage(ws: Bun.ServerWebSocket<Record<string, unknown>>, raw: unknown): void {
+    const text = typeof raw === "string" ? raw : Buffer.from(raw as Uint8Array).toString("utf8");
+    const parsed = parseClientJsep(text);
+    if (!parsed.ok) {
+      wsReject(ws, WS_CLOSE_CODES.BAD_MESSAGE, parsed.message);
+      return;
+    }
+    const viewerId = (ws.data as unknown as WsConn).viewerId;
+    const gw = deps.streamGateway;
+    if (!gw || !viewerId || !gw.relayViewerMessage(viewerId, parsed.msg)) {
+      wsReject(ws, WS_CLOSE_CODES.DEVICE_LOST, "no active rtc stream for this viewer");
+    }
   }
 
   async function onControlMessage(ws: Bun.ServerWebSocket<Record<string, unknown>>, raw: unknown): Promise<void> {
@@ -1020,12 +1113,7 @@ export function createBridgeApp(deps: BridgeDeps, opts: BridgeOptions = {}): Bri
     }
     const active = deps.streamGateway.controlActive();
     try {
-      const result = await sendControlEvent(
-        active
-          ? { video: active.video, writer: (b: Buffer[]) => active.write(b) }
-          : undefined,
-        text,
-      );
+      const result = await sendControlEvent(active, text);
       if (result.ok) {
         ws.send(JSON.stringify({ type: "ack" }));
       } else {

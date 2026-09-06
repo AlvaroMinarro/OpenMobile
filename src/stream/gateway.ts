@@ -1,275 +1,321 @@
 /**
- * StreamGateway — the bridge's stream subsystem (design D2/D3/D5, slice 2B).
+ * StreamGateway — the bridge's stream subsystem (design D2/D3/D5, task 2.5).
  *
- * Glues the StreamManager (lifecycle, slice 2A) to the StreamSession daemon
- * (raw sockets, slice 2B) and exposes the narrow contract the WS routes in
- * server.ts consume:
- *  - subscribeVideo(viewer): subscribe a WS viewer. On the FIRST viewer the
- *    gateway starts the manager (push→reverse→spawn→read-loop); the daemon's
- *    fan-out broadcasts AUs into the socket-facing viewer, and the handshake
- *    is delivered once the CONFIG frame lands. Returns UNSUPPORTED when the
- *    manager is disabled, NO_DEVICE when the session failed to start, or
- *    CAP_REACHED at 8 viewers (design D4).
- *  - unsubscribeVideo(viewerId): remove the viewer (last one tears the
- *    session down via the manager's refcount).
- *  - controlActive(): the ACTIVE session's control writer for /v1/stream/control.
- *  - snapshot(): additive /v1/state stream object (supported/active/viewers).
+ * PR2: the lifecycle skeleton (StreamManager: first-viewer start, last-viewer
+ * teardown, kill-switch, events) is RETARGETED onto a real RtcSession over
+ * the RtcService v1 adapter. The gateway owns:
+ *  - capability resolution (pid-ini endpoint + version gate, wired from
+ *    main.ts) — the kill-switch and the external-launch degradation live
+ *    here, surfaced additively as `stream.rtc{…}` in /v1/state,
+ *  - per-viewer subscribe/unsubscribe (the manager refcounts; each viewer
+ *    gets its own RtcId inside the ONE RtcSession),
+ *  - the getStatus watchdog chain: session loss → manager.forceStop →
+ *    teardown → every viewer socket closed with 4409 by the bridge,
+ *  - client JSEP frame routing (answer/ice/state) into the viewer's stream,
+ *  - the control injector: grpcControlInjector over the stream's serial, so
+ *    WS /v1/stream/control works exactly while a stream is active (control
+ *    itself is independent of video — REST /v1/input stays gRPC-first).
  *
- * The manager's device-loss watchdog closes the session → the fanout
- * closeAll() closes every socket-facing viewer → the bridge translates that
- * into a 4409 close + state message (spec: Device lost mid-stream).
+ * The manager does NOT know about WebSockets: routing a viewer to its socket
+ * is the bridge's job.
  */
 
-import { StreamManager, type StreamVideoInfo } from "./manager";
-import { StreamSession } from "./daemon";
-import type { CommandRunner } from "../device/runner";
+import { grpcControlInjector, type ControlInjector } from "./control";
+import { Fanout } from "./fanout";
+import { StreamManager, type StreamViewerSubscription } from "./manager";
+import { RtcSession, type RtcSessionErrorCode } from "./rtc/session";
+import type { RtcAdapter } from "./rtc/adapter";
+import type { Device } from "../device/types";
+import type { EmulatorControl } from "../device/grpc";
+import type {
+  RtcClientMessage,
+  RtcStateView,
+  StreamViewer,
+} from "./types";
+import { MAX_VIEWERS } from "./types";
 import type {
   StreamSubscribeResult,
   StreamStateView,
   StreamGateway as GatewayContract,
 } from "../bridge/server";
-import type { StreamViewer } from "./types";
-import { MAX_VIEWERS } from "./types";
+
+/** Resolved RTC capability for one serial (pid-ini endpoint + version gate). */
+export interface RtcCapability {
+  supported: boolean;
+  reason?: string;
+  /** Loopback endpoint when supported (addr "host:port" + Bearer token). */
+  endpoint?: { addr: string; token: string };
+}
 
 export interface StreamGatewayDeps {
-  runner: CommandRunner;
-  /** Target serial; `"auto"` = resolve the single attached device on first start. */
+  /** Target serial; "auto" resolves through pollDevices at subscribe time. */
   serial: string;
   /** Kill-switch: `OPENMOBILE_STREAM=off` disables streaming (design D6). */
   enabled: boolean;
-  /** Watchdog source (defaults to live `adb devices -l`). */
-  pollDevices?: () => Promise<import("../device/types").Device[]>;
-  /** Fixed session id (tests); default: fresh random scid per start. */
-  scid?: string;
-}
-
-/** Fresh scid per stream start: signed 32-bit hex (design §Live-validated facts). */
-function freshScid(): string {
-  const raw = new Uint32Array(1);
-  crypto.getRandomValues(raw);
-  return (raw[0]! & 0x7fffffff).toString(16);
+  /** Configured -rtcfps value (handshake + /v1/state stream.rtc.fps). */
+  fps: number;
+  /** Handshake codecs. Default ["VP8"] (mandatory). */
+  codecs?: string[];
+  /** Resolve the RTC capability for a serial (pid-ini + version gate). */
+  resolveCapability?: (serial: string) => RtcCapability | null;
+  /** Build the RtcSession for an endpoint (wires the gRPC adapter + probe). */
+  createSession?: (endpoint: { addr: string; token: string }, serial: string) => RtcSession;
+  /** Resolve the gRPC control surface for the active stream's serial. */
+  controlFor?: (serial: string) => Promise<EmulatorControl | null>;
+  /** Device source for "auto" resolution + the manager's adb watchdog. */
+  pollDevices?: () => Promise<Device[]>;
+  /** Watchdog poll interval ms for the manager's adb watchdog. Default 3000. */
+  watchdogMs?: number;
 }
 
 export class StreamGateway implements GatewayContract {
-  private readonly manager: StreamManager;
-  private readonly sessionFactory: (scid: string) => StreamSession;
-  private session: StreamSession | null = null;
-  /** id → socket-facing viewer registered through subscribeVideo. */
-  private viewers = new Map<string, StreamViewer>();
-  private videoInfo: StreamVideoInfo = { width: 0, height: 0 };
-  private readonly fixedScid: string | undefined;
-  private readonly runner: CommandRunner;
-  private resolvedSerial: string | null = null;
+  /** Lifecycle skeleton — now driving a REAL RtcSession (task 2.5). */
+  readonly managerRef: StreamManager;
+  private readonly deps: StreamGatewayDeps;
+  private readonly fanout = new Fanout();
+  private session: RtcSession | undefined;
+  private sessionCreation: Promise<RtcSession> | undefined;
+  private injector: ControlInjector | undefined;
+  private viewerSubs = new Map<string, StreamViewerSubscription>();
+  private capability: RtcCapability | undefined;
+  private capabilitySerial: string | undefined;
 
-  constructor(deps: StreamGatewayDeps, sessionFactory?: (scid: string) => StreamSession) {
-    this.fixedScid = deps.scid;
-    this.runner = deps.runner;
-    this.adapterSerial = deps.serial;
-    this.sessionFactory =
-      sessionFactory ??
-      ((scid) =>
-        new StreamSession({
-          runner: deps.runner,
-          serial: this.serialForStream(),
-          scid,
-        }));
-    this.manager = new StreamManager({
+  constructor(deps: StreamGatewayDeps) {
+    this.deps = deps;
+    this.managerRef = new StreamManager({
       adapter: {
-        start: async (serial) => {
-          // Resolve "auto" to the single attached device ONCE (adb devices).
-          if (this.adapterSerial === "auto" && !this.resolvedSerial) {
-            this.resolvedSerial = await this.resolveAutoSerial();
-          }
-          const target = this.serialForStream();
-          // One StreamSession per stream start; re-push+spawn every time
-          // (the server self-deletes the jar — design §Live-validated facts).
-          this.session = this.sessionFactory(this.fixedScid ?? freshScid());
-          try {
-            await this.session.start();
-          } catch (e) {
-            this.session = null;
-            throw e;
-          }
-          // Surface the video size once the handshake arrives so /v1/state
-          // and the control encoder see the real dimensions.
-          void this.session.handshakeReady.then((hs) => {
-            this.videoInfo = { width: hs.width, height: hs.height };
-          }).catch(() => {});
-          // Device loss → tell the attached viewers BEFORE the session tears
-          // down (the teardown closes the fanout → bridge closes 4409; the
-          // error state must land first — spec: Device lost mid-stream).
-          const session = this.session;
-          session.onLoss(() => {
-            session.fanout.broadcastState({ type: "state", state: "error", reason: "device_lost" });
-          });
-          void serial;
-          void target;
-          return this.session;
-        },
-        stop: async () => {
-          this.session?.close();
-          this.session = null;
-        },
+        start: async (serial) => this.adapterStart(serial),
+        stop: async () => {},
       },
       serial: deps.serial,
       enabled: deps.enabled,
-      pollDevices: deps.pollDevices,
-      video: this.videoInfo,
+      ...(deps.pollDevices !== undefined ? { pollDevices: deps.pollDevices } : {}),
+      ...(deps.watchdogMs !== undefined ? { watchdogMs: deps.watchdogMs } : {}),
     });
-    // Keep the manager's snapshot video size live: it starts 0x0 and updates
-    // from the session handshake (the manager reads AdapterSession.video).
-  }
-
-  private adapterSerial: string;
-
-  /** The serial the sessions actually use ("auto" → resolved). */
-  private serialForStream(): string {
-    if (this.adapterSerial !== "auto") return this.adapterSerial;
-    return this.resolvedSerial ?? "auto";
-  }
-
-  /** Auto-detect: the single `device`-state serial (mirrors REST resolveSerial). */
-  private async resolveAutoSerial(): Promise<string> {
-    const devices = await this.runner.run(["adb", "devices", "-l"]);
-    const lines = (devices.stdout ?? "").split("\n").slice(1);
-    const attached = lines
-      .map((l) => l.trim().split(/\s+/))
-      .filter((p) => p.length >= 2 && p[1] === "device")
-      .map((p) => p[0]!);
-    if (attached.length === 0) {
-      throw new Error("no Android device attached for streaming");
-    }
-    if (attached.length > 1) {
-      throw new Error(`multiple devices attached; set ANDROID_DEVICE (${attached.join(", ")})`);
-    }
-    return attached[0]!;
+    // Teardown (last viewer / loss / failed start): close every viewer socket
+    // (the bridge maps that onto 4409) and drop the cached session.
+    this.managerRef.onEvent((e) => {
+      if (e.type === "stopped") {
+        this.fanout.closeAll();
+        this.session = undefined;
+        this.sessionCreation = undefined;
+        this.injector = undefined;
+      }
+    });
   }
 
   snapshot(): StreamStateView {
-    const s = this.manager.snapshot();
-    const v = this.manager.activeSession()?.video ?? this.videoInfo;
+    const mgr = this.managerRef.snapshot();
+    if (!mgr.supported) {
+      const reason = mgr.reason ?? "OPENMOBILE_STREAM=off";
+      return {
+        supported: false,
+        active: false,
+        reason,
+        viewers: 0,
+        rtc: { supported: false, active: false, viewers: 0, reason },
+      };
+    }
+    const cap = this.currentCapability();
+    const active = mgr.active && cap.supported;
+    const reason = mgr.reason ?? (cap.supported ? undefined : cap.reason);
+    const rtc: RtcStateView = {
+      supported: cap.supported,
+      active,
+      viewers: mgr.viewers,
+      ...(active && this.session?.guid !== undefined ? { guid: this.session.guid } : {}),
+      ...(cap.supported ? { fps: this.deps.fps } : {}),
+      ...(reason !== undefined ? { reason } : {}),
+    };
     return {
-      supported: s.supported,
-      active: s.active,
-      ...(s.reason !== undefined ? { reason: s.reason } : {}),
-      viewers: s.viewers,
-      ...(v.width > 0 ? { width: v.width, height: v.height } : {}),
+      supported: cap.supported,
+      active,
+      ...(reason !== undefined ? { reason } : {}),
+      viewers: mgr.viewers,
+      rtc,
     };
   }
 
-  get managerRef(): StreamManager {
-    return this.manager;
-  }
-
-  /** Attached fanout viewer count (test/observability hook for the bridge). */
-  get attachedViewers(): number {
-    return this.session?.fanout.count ?? 0;
-  }
-
   async subscribeVideo(viewer: StreamViewer): Promise<StreamSubscribeResult> {
-    if (!this.manager.enabled) {
+    if (!this.managerRef.enabled) {
       return { ok: false, code: "UNSUPPORTED", reason: "OPENMOBILE_STREAM=off" };
     }
-    if (this.viewers.size >= MAX_VIEWERS) {
-      return { ok: false, code: "CAP_REACHED", reason: "viewer cap reached (8)" };
+    if (this.fanout.count >= MAX_VIEWERS) {
+      return { ok: false, code: "CAP_REACHED", reason: `viewer cap reached (${MAX_VIEWERS})` };
     }
-    // Resolve "auto" to the real serial BEFORE the manager starts — the
-    // manager's device-loss watchdog matches ITS serial against adb devices,
-    // so it must see the actual serial, never "auto".
-    if (this.adapterSerial === "auto" && !this.resolvedSerial) {
-      try {
-        this.resolvedSerial = await this.resolveAutoSerial();
-        this.manager.updateTargetSerial(this.resolvedSerial);
-      } catch (e) {
-        return {
-          ok: false,
-          code: "NO_DEVICE",
-          reason: e instanceof Error ? e.message : "no usable device for streaming",
-        };
-      }
+    const serial = await this.resolveTarget();
+    if (!serial) {
+      return { ok: false, code: "NO_DEVICE", reason: "no emulator attached" };
     }
-    // Connect race: the WS may have closed while we were resolving the serial
-    // (tab reload / rapid connect-close). A dead viewer must NEVER be
-    // registered — it would hold a manager refcount + a viewer-cap slot and
-    // the session would run forever (the bridge close handler can only
-    // unsubscribe a viewer it knows about).
+    this.managerRef.updateTargetSerial(serial);
+    // Fresh resolve per subscribe: the emulator (and its pid ini) may have
+    // appeared since the last look.
+    const cap = (this.capability =
+      this.deps.resolveCapability?.(serial) ?? { supported: false, reason: "grpc_permission_denied" });
+    this.capabilitySerial = serial;
+    if (!cap.supported) {
+      return { ok: false, code: "UNSUPPORTED", reason: cap.reason ?? "rtc unavailable" };
+    }
+    const sub = this.managerRef.subscribe();
+    if (!sub) {
+      return { ok: false, code: "UNSUPPORTED", reason: "OPENMOBILE_STREAM=off" };
+    }
+    this.viewerSubs.set(viewer.id, sub);
+    try {
+      const session = await this.ensureSession();
+      await session.attach(viewer);
+    } catch (e) {
+      // Fail closed: release the refcount (a first-viewer failure tears the
+      // session down) and map the error onto the spec close codes.
+      this.viewerSubs.delete(viewer.id);
+      this.managerRef.unsubscribe(sub);
+      return this.mapSubscribeFailure(e);
+    }
     if (!viewer.open) {
-      return { ok: false, code: "NO_DEVICE", reason: "viewer closed before subscription completed" };
+      // The socket died while attach was in flight (connect-close race):
+      // release everything, the close handler already ran.
+      this.releaseViewer(viewer.id);
+      return { ok: false, code: "NO_DEVICE", reason: "viewer closed during subscribe" };
     }
-    const subscription = this.manager.subscribe();
-    if (!subscription) {
-      return { ok: false, code: "UNSUPPORTED", reason: "OPENMOBILE_STREAM=off" };
+    if (!this.fanout.add(viewer)) {
+      this.releaseViewer(viewer.id);
+      return { ok: false, code: "CAP_REACHED", reason: `viewer cap reached (${MAX_VIEWERS})` };
     }
-    this.viewers.set(viewer.id, viewer);
-    // Attach the socket-facing viewer to the session's fanout. The session
-    // may not exist yet (first viewer starts it async); the manager's
-    // start-on-first-viewer path creates it, and the fanout is only reachable
-    // once the adapter.start resolves.
-    void this.attachToSession(viewer, subscription.id);
     return { ok: true, viewerId: viewer.id };
   }
 
   unsubscribeVideo(viewerId: string): void {
-    const viewer = this.viewers.get(viewerId);
-    if (!viewer) return;
-    this.viewers.delete(viewerId);
-    this.session?.fanout.remove(viewer.id);
-    // The manager refcounts viewers; last unsubscribe tears the session down.
-    const subscription = { id: viewerId };
-    this.manager.unsubscribe(subscription);
+    this.releaseViewer(viewerId);
   }
 
-  controlActive(): { video: { width: number; height: number }; write: (bytes: Buffer[]) => Promise<void> } | null {
-    const session = this.manager.activeSession();
-    if (!session || !this.manager.snapshot().active) return null;
-    const video = this.videoInfo.width > 0 ? this.videoInfo : { width: 0, height: 0 };
+  relayViewerMessage(viewerId: string, msg: RtcClientMessage): boolean {
+    const session = this.session;
+    if (!session || !session.has(viewerId)) return false;
+    switch (msg.type) {
+      case "answer":
+        void session.relayAnswer(viewerId, msg.sdp);
+        break;
+      case "ice":
+        void session.relayIce(viewerId, msg.candidate);
+        break;
+      case "state":
+        session.noteStreaming(viewerId);
+        break;
+    }
+    return true;
+  }
+
+  controlActive(): ControlInjector | null {
+    return this.injector ?? null;
+  }
+
+  // ─── internals ──────────────────────────────────────────────────────────
+
+  /** The manager's adapter start: build (once) the RtcSession + injector. */
+  private async adapterStart(serial: string): Promise<RtcSession> {
+    const session = await this.ensureSession();
+    void serial;
+    return session;
+  }
+
+  /**
+   * ONE shared creation promise per session lifetime: the manager's
+   * (fire-and-forget) start and the gateway's awaited subscribe both funnel
+   * through it, so concurrent starts can never build two sessions.
+   */
+  private ensureSession(): Promise<RtcSession> {
+    if (this.session) return Promise.resolve(this.session);
+    if (!this.sessionCreation) {
+      this.sessionCreation = this.createSessionNow().then(
+        (s) => s,
+        (e: unknown) => {
+          this.sessionCreation = undefined; // allow the next viewer to retry
+          throw e;
+        },
+      );
+    }
+    return this.sessionCreation;
+  }
+
+  private async createSessionNow(): Promise<RtcSession> {
+    const cap = this.capability;
+    if (!cap?.supported || !cap.endpoint) {
+      throw new Error(cap?.reason ?? "rtc unavailable");
+    }
+    const create = this.deps.createSession;
+    if (!create) throw new Error("rtc session factory not wired");
+    const session = create(cap.endpoint, this.managerRef.targetSerial);
+    // Loss chain (task 2.3): session watchdog → manager forceStop →
+    // teardown event → fanout.closeAll → bridge closes every socket 4409.
+    session.onLoss(() => void this.managerRef.forceStop("device_lost"));
+    this.session = session;
+    const controlFor = this.deps.controlFor;
+    if (controlFor) {
+      const control = await controlFor(this.managerRef.targetSerial);
+      this.injector = control ? grpcControlInjector(control) : undefined;
+    }
+    return session;
+  }
+
+  /** Resolve the target serial ("auto" → the single attached emulator). */
+  private async resolveTarget(): Promise<string | null> {
+    const configured = this.managerRef.targetSerial;
+    if (configured && configured !== "auto") return configured;
+    let devices: Device[];
+    try {
+      devices = this.deps.pollDevices ? await this.deps.pollDevices() : await defaultPollDevices();
+    } catch {
+      return null;
+    }
+    const emulators = devices.filter((d) => d.serial.startsWith("emulator-") && d.state === "device");
+    if (emulators.length !== 1) return null;
+    const serial = emulators[0]!.serial;
+    this.managerRef.updateTargetSerial(serial);
+    return serial;
+  }
+
+  /** Capability for the CURRENT serial (cached per serial; sync). */
+  private currentCapability(): RtcCapability {
+    const serial = this.managerRef.targetSerial;
+    if (this.capability && this.capabilitySerial === serial) return this.capability;
+    if (!serial || serial === "auto") return { supported: false, reason: "no_device_selected" };
+    const cap =
+      this.deps.resolveCapability?.(serial) ?? { supported: false, reason: "grpc_permission_denied" };
+    this.capability = cap;
+    this.capabilitySerial = serial;
+    return cap;
+  }
+
+  /** Release one viewer: fanout + session detach + manager refcount. */
+  private releaseViewer(viewerId: string): void {
+    this.fanout.remove(viewerId);
+    this.session?.detach(viewerId);
+    const sub = this.viewerSubs.get(viewerId);
+    if (sub) {
+      this.viewerSubs.delete(viewerId);
+      this.managerRef.unsubscribe(sub);
+    }
+  }
+
+  /** Map a failed subscribe onto the spec close-code semantics. */
+  private mapSubscribeFailure(e: unknown): StreamSubscribeResult {
+    const err = e as { code?: RtcSessionErrorCode | string; message?: string; wsCloseCode?: number };
+    if (err?.code === "PERMISSION_DENIED") {
+      return { ok: false, code: "PERMISSION_DENIED", reason: err.message };
+    }
     return {
-      video,
-      write: async (bytes: Buffer[]) => {
-        for (const b of bytes) await session.sendControl(b);
-      },
+      ok: false,
+      code: "NO_DEVICE",
+      reason: err?.message ?? "the rtc stream failed to start",
     };
   }
+}
 
-  /** Attach the viewer once the session is up; deliver the handshake first. */
-  private async attachToSession(viewer: StreamViewer, subscriptionId: string): Promise<void> {
-    // Wait for an active session (first viewer starts it). Retry a few times
-    // in case adapter.start is still in flight; fall back gracefully.
-    for (let i = 0; i < 40 && !this.manager.activeSession(); i++) {
-      await new Promise((r) => setTimeout(r, 25));
-    }
-    const session = this.manager.activeSession();
-    if (!session) {
-      // Start failed (push/reverse/spawn): reject the viewer.
-      viewer.close();
-      return;
-    }
-    // Connect race: the viewer's WS may have closed while the session was
-    // starting (attachToSession polls up to 1s). Re-check liveness right
-    // before attaching, or the unsubscribe that already removed the viewer
-    // would be undone — a ghost re-attached to the fanout forever.
-    if (!viewer.open) return;
-    const fanout = session.fanout ?? undefined;
-    if (fanout) {
-      if (!fanout.add(viewer)) {
-        // Cap raced — close the viewer (bridge → 4429).
-        viewer.close();
-        return;
-      }
-    }
-    void subscriptionId;
-    // Handshake: deliver once available. If the session dies before the
-    // handshake, the fanout closeAll (on teardown) closes the viewer anyway.
-    // The STREAMING state follows the handshake (contract order: handshake
-    // first, then state messages — the client configures its decoder from
-    // the handshake SPS/PPS before acting on state).
-    if (session.handshakeReady) {
-      void session.handshakeReady
-        .then(async (hs) => {
-          await viewer.sendHandshake(hs);
-          await viewer.sendState({ type: "state", state: "streaming" });
-        })
-        .catch(() => {});
-    }
-  }
+/** Default "auto" resolution source: live `adb devices -l`. */
+async function defaultPollDevices(): Promise<Device[]> {
+  // Lazy import keeps the gateway dependency-light for tests and avoids a
+  // hard import cycle with the device core.
+  const { AdbWrapper } = await import("../device/adb");
+  const { BunCommandRunner } = await import("../device/runner");
+  return new AdbWrapper(new BunCommandRunner()).devices();
 }

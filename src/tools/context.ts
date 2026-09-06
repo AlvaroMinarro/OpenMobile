@@ -3,6 +3,8 @@ import { AdbWrapper } from "../device/adb";
 import { BunCommandRunner } from "../device/runner";
 import { tempPngPath } from "../device/temp";
 import { resolveDeviceSelection } from "../device/selection";
+import { defaultRunDir, findEmulatorConfig, GrpcEmulatorControl } from "../device/grpc";
+import type { EmulatorControl } from "../device/grpc";
 import type { Device } from "../device/types";
 import type { ToolResult } from "./handlers";
 
@@ -25,6 +27,13 @@ export interface DeviceContext {
   tempPngPath?: (kind: string, serial: string) => string;
   /** Outer timeout (ms) for CLI-delegated emulator readiness / deploy. */
   timeoutMs: number;
+  /**
+   * gRPC-first input surface (input-channel delta, design D3/D5). Resolves the
+   * serial to an EmulatorController-backed injector when the running instance
+   * has a per-instance pid ini (bridge-launched emulator); null ⇒ `adb shell
+   * input` fallback. Absent ⇒ adb only (legacy minimal deps stay valid).
+   */
+  grpcControl?: (serial: string) => Promise<EmulatorControl | null>;
 }
 
 /** Error surfaced to the calling agent as an actionable tool error. */
@@ -103,6 +112,17 @@ function isToolResult(value: unknown): value is ToolResult {
   );
 }
 
+/**
+ * Resolve `serial` → the emulator gRPC control surface (design D3/D5). The
+ * per-instance pid ini carries the token + port; external launches (Studio,
+ * manual, physical devices) yield null so callers fall back to adb input.
+ */
+export async function resolveGrpcControl(serial: string): Promise<EmulatorControl | null> {
+  const cfg = findEmulatorConfig(defaultRunDir(), serial);
+  if (!cfg) return null;
+  return new GrpcEmulatorControl(`localhost:${cfg.port}`, cfg.token);
+}
+
 /** Production context factory bound to Bun.spawn + process.env. */
 export function createContext(opts: Partial<Omit<DeviceContext, "cli" | "adb">> = {}): DeviceContext {
   const runner = new BunCommandRunner();
@@ -114,5 +134,6 @@ export function createContext(opts: Partial<Omit<DeviceContext, "cli" | "adb">> 
     timeoutMs: opts.timeoutMs ?? 120_000,
     readFile: opts.readFile ?? (async (p: string) => new Uint8Array(await Bun.file(p).arrayBuffer())),
     tempPngPath: opts.tempPngPath ?? tempPngPath,
+    grpcControl: opts.grpcControl ?? resolveGrpcControl,
   };
 }

@@ -26,7 +26,7 @@ describe("allowlist generation — -grpc-allowlist golden (design D6)", () => {
     const entries = buildAllowlist().allowlist;
     expect(entries).toHaveLength(1);
     expect(entries[0]!.iss).toBe("android-studio");
-    expect(entries[0]!.allowed).toEqual(ALLOWLIST_PATTERNS);
+    expect(entries[0]!.allowed).toEqual([...ALLOWLIST_PATTERNS]);
   });
 
   it("permits EmulatorController (control), RtcService v1+v2 (video) and reflection (our launch surface)", () => {

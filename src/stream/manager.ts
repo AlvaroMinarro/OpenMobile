@@ -1,30 +1,23 @@
 /**
  * StreamManager — stream lifecycle controller (design D5, D6).
  *
- * UI-agnostic session lifecycle on top of the scrcpy adapter:
- *  - START on the first viewer subscribing (push→reverse→listen→spawn→read-loop),
+ * UI-agnostic session lifecycle skeleton:
+ *  - START on the first viewer subscribing,
  *  - TEARDOWN when the last viewer unsubscribes,
  *  - device-loss watchdog: while active, poll `adb devices -l`; when the
  *    stream's serial disappears, tear the session down and report
  *    `reason: "device_lost"` (spec: Device lost mid-stream, Restart after
  *    disconnect — re-subscribing restarts a fresh session).
  *
- * The manager does NOT know about WebSockets: routing a viewer/subscription
- * to a socket is the bridge's job (slice 2B). It exposes a typed interface
- * (subscribe/unsubscribe/start/stop/sendControl/snapshot/onEvent) that the
- * WS layer maps onto.
+ * PR1 (native gRPC control, legacy encoder deleted): the in-guest transport
+ * is GONE and the emulator-native RTC session (RtcService v1) is not wired
+ * yet, so no adapter session ever starts. The lifecycle skeleton (refcount,
+ * watchdog, kill-switch, events) is KEPT — the PR2 RtcSession retarget plugs
+ * a real adapter back in (task 2.5). The manager does NOT know about
+ * WebSockets: routing a viewer/subscription to a socket is the bridge's job.
  */
 
-import { existsSync } from "node:fs";
 import type { Device } from "../device/types";
-import type { ControlEvent, FanoutRegistry, VideoHandshake } from "./types";
-import { JAR_LOCAL_PATH } from "./scrcpy";
-
-/** Video size reported by the session, updated from handshake meta. */
-export interface StreamVideoInfo {
-  width: number;
-  height: number;
-}
 
 export type StreamManagerEvent =
   | { type: "started" }
@@ -39,42 +32,25 @@ export interface StreamSnapshot {
   viewers: number;
 }
 
-/** A live scrcpy session handed to the manager by the adapter. */
+/** A live streaming session handed to the manager by the adapter (PR2: RtcSession). */
 export interface AdapterSession {
   serial: string;
-  /** Non-null when the session reports the video size (from the handshake). */
-  video?: StreamVideoInfo;
-  /** Inject control bytes into the CONTROL socket. */
-  sendControl(bytes: Uint8Array): Promise<void>;
   /** Register the device-loss callback (fires when the device vanishes). */
   onLoss(cb: (() => void) | undefined): void;
-  /** Full teardown: kill spawn, remove reverse, clean jar. */
+  /** Full teardown. */
   close(): void;
-  /** Session fan-out registry — the gateway attaches WS viewers (slice 2B). */
-  fanout?: FanoutRegistry;
-  /** Resolves with the handshake once the CONFIG frame is parsed (slice 2B). */
-  handshakeReady?: Promise<VideoHandshake>;
-  /** Resolves with the video size when the handshake lands (slice 2B). */
-  ready?: Promise<StreamVideoInfo>;
 }
 
-/** Dependency surface StreamManager needs from the scrcpy adapter. */
+/** Dependency surface StreamManager needs from the streaming adapter. */
 export interface AdapterDeps {
-  /** Produce a NEW session bound to the adapter's device (re-push + spawn). */
+  /** Produce a NEW session bound to the adapter's device. */
   start(serial: string): Promise<AdapterSession>;
   /** General adapter teardown (running sessions may self-manage). */
   stop(): Promise<void>;
 }
 
-/** Adapter events a session may emit while streaming. */
-export interface AdapterEvent {
-  type: "frame" | "handshake" | "control";
-  // The manager forwards raw stream events; the bridge interprets them.
-  data?: unknown;
-}
-
 export interface StreamManagerOptions {
-  /** The scrcpy adapter (production: src/stream/scrcpy.ts wiring; tests: double). */
+  /** The streaming adapter (PR2: RtcSession wiring; tests: double). */
   adapter: AdapterDeps;
   /** Device the manager streams (serial that must stay in `adb devices`). */
   serial: string;
@@ -84,16 +60,6 @@ export interface StreamManagerOptions {
   pollDevices?: () => Promise<Device[]>;
   /** Watchdog poll interval ms. Default 3000. */
   watchdogMs?: number;
-  /** Resolution of the video stream reported in the snapshot. */
-  video?: StreamVideoInfo;
-  /**
-   * Path of the scrcpy-server jar whose PRESENCE gates stream support.
-   * Defaults to the bundled asset (design D1). When the file is absent,
-   * the snapshot reports supported:false with reason "jar_missing" at
-   * STATE-READ time (spec: Unsupported environment) instead of surfacing
-   * the unusable stream only at WS connect time (close 4404).
-   */
-  jarPath?: string;
 }
 
 /**
@@ -113,9 +79,6 @@ export class StreamManager {
   private viewerRefs = 0;
   private active = false;
   private reason?: string;
-  private _video: StreamVideoInfo;
-  /** Cached jar-presence stat: ONE fs hit per manager, never per snapshot. */
-  private readonly jarPresent: boolean;
   private watchdogTimer: ReturnType<typeof setInterval> | undefined;
   private eventHandler?: (e: StreamManagerEvent) => void;
   /** In-flight start guard so a failed adapter.start isn't retried in a loop. */
@@ -127,13 +90,6 @@ export class StreamManager {
     this._enabled = options.enabled ?? true;
     this.pollDevices = options.pollDevices ?? defaultPollDevices;
     this.watchdogMs = options.watchdogMs ?? 3000;
-    this._video = options.video ?? { width: 0, height: 0 };
-    this.jarPresent = existsSync(options.jarPath ?? JAR_LOCAL_PATH);
-  }
-
-  /** Video size reported by the active session (0x0 before the handshake). */
-  get videoInfo(): StreamVideoInfo {
-    return this._video;
   }
 
   /** Subscribe a viewer — starts the stream on the FIRST subscriber. */
@@ -194,51 +150,14 @@ export class StreamManager {
     };
   }
 
-  /** Inject a control event (tap/swipe/text/key) into the active session. */
-  async sendControl(event: ControlEvent): Promise<void> {
-    const session = this.sessions[0];
-    if (!session || !this.active) return;
-    // Encoding is the control module's job (task 2.3); the manager only
-    // routes the raw event to the session's control socket.
-    const messages = encodeControlEvent(event, this._video);
-    for (const bytes of messages) await session.sendControl(bytes);
-  }
-
   /**
-   * Bound control writer for the ACTIVE session (or null when no stream is
-   * up). The WS control route uses this with control.ts's sendControlEvent to
-   * return the typed STREAM_OFF result when nothing is streaming (task 2.3).
+   * Design D6 snapshot for /v1/state and the WS state message. Support is
+   * enabled-driven at this layer; transport capability (RTC availability) is
+   * reported by the gateway above it.
    */
-  controlWriter(): StreamControlWriter | null {
-    const session = this.sessions[0];
-    if (!session || !this.active) return null;
-    return {
-      video: { ...this._video },
-      write: async (bytes: Buffer[]) => {
-        for (const b of bytes) await session.sendControl(b);
-      },
-    };
-  }
-
-  /**
-   * The ACTIVE adapter session (or null). The gateway uses it to attach
-   * fanout viewers, await the handshake, and observe the video size.
-   */
-  activeSession(): AdapterSession | null {
-    return this.active ? (this.sessions[0] ?? null) : null;
-  }
-
-  /** Design D6 snapshot for /v1/state and the WS state message. */
   snapshot(): StreamSnapshot {
-    // Support is enabled-driven AND environment-gated: a missing bundled
-    // jar means the stream cannot start, so /v1/state must say supported:
-    // false with a machine-readable cause (spec: Unsupported environment)
-    // rather than deferring the failure to connect time. The jar-missing
-    // reason is derived at read time so lifecycle transitions that clear
-    // this.reason (start/unsubscribe) can never mask it.
-    const supported = this._enabled && this.jarPresent;
-    const reason =
-      this.reason ?? (this._enabled && !this.jarPresent ? "jar_missing" : undefined);
+    const supported = this._enabled;
+    const reason = this.reason ?? (this._enabled ? undefined : "OPENMOBILE_STREAM=off");
     return {
       supported,
       active: this.active,
@@ -264,6 +183,16 @@ export class StreamManager {
       this.reason = "device_lost";
       await this.stopSession();
     }
+  }
+
+  /**
+   * Report device loss from OUTSIDE the poll loop (task 2.3: the RtcSession's
+   * getStatus watchdog fires this through the gateway). Sets the reason and
+   * tears the session down — same observable outcome as a failed poke.
+   */
+  async forceStop(reason: string): Promise<void> {
+    this.reason = reason;
+    await this.stopSession();
   }
 
   /** Explicit start (used by hosts that pre-warm the stream). */
@@ -348,14 +277,6 @@ export interface StreamViewerSubscription {
   id: string;
 }
 
-/** A control writer bound to the ACTIVE session (design D3, slice 2B). */
-export interface StreamControlWriter {
-  /** Current video size (0x0 before the handshake). */
-  video: StreamVideoInfo;
-  /** Write the encoded scrcpy control bytes into the session's CONNECT socket. */
-  write(bytes: Buffer[]): Promise<void>;
-}
-
 /** Default watchdog source: live `adb devices -l`. */
 async function defaultPollDevices(): Promise<Device[]> {
   // Lazy import keeps the manager dependency-light for tests and avoids a
@@ -364,14 +285,3 @@ async function defaultPollDevices(): Promise<Device[]> {
   const { BunCommandRunner } = await import("../device/runner");
   return new AdbWrapper(new BunCommandRunner()).devices();
 }
-
-// ─── control-encoding delegation (task 2.3) ───────────────────────────────
-
-import { encodeControlEvent } from "./control";
-
-/**
- * Encode a typed control event into scrcpy control bytes. Delegates to the
- * control module (task 2.3), which owns validation + swipe stepping; the
- * manager only routes raw events to the active session's control socket.
- */
-export { encodeControlEvent };

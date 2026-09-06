@@ -17,6 +17,10 @@ export const emulatorListSchema = z.object({});
 export const emulatorStartSchema = z.object({
   name: z.string().optional().describe("AVD name; defaults to the single available AVD"),
   timeoutMs: z.number().int().positive().optional().describe("Outer readiness timeout (ms)"),
+  fps: z
+    .union([z.literal(30), z.literal(60)])
+    .optional()
+    .describe("RTC encoder fps for -rtcfps (30 default; 60 needs emulator ≥ 36.6)"),
 });
 
 export const emulatorStopSchema = z.object({
@@ -57,16 +61,16 @@ export const readLogcatSchema = z.object({
 });
 
 export const tapSchema = z.object({
-  x: z.number().int(),
-  y: z.number().int(),
+  x: z.number().int().describe("Device PHYSICAL pixel column (gRPC path validates against the display config)"),
+  y: z.number().int().describe("Device PHYSICAL pixel row (gRPC path validates against the display config)"),
   ...deviceOption,
 });
 
 export const swipeSchema = z.object({
-  x1: z.number().int(),
-  y1: z.number().int(),
-  x2: z.number().int(),
-  y2: z.number().int(),
+  x1: z.number().int().describe("Start PHYSICAL pixel column"),
+  y1: z.number().int().describe("Start PHYSICAL pixel row"),
+  x2: z.number().int().describe("End PHYSICAL pixel column"),
+  y2: z.number().int().describe("End PHYSICAL pixel row"),
   durationMs: z.number().int().nonnegative().optional(),
   ...deviceOption,
 });

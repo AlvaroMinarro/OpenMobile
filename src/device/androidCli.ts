@@ -1,9 +1,42 @@
 import { detectDiffShape, parseBounds } from "./serialize";
 import { SPAWN_TIMEOUTS, type CommandRunner } from "./runner";
+import { isAtLeast, MIN_EMULATOR_VERSION, parseEmulatorVersion, RTCPFS_VERSION } from "./grpc";
+import { writeAllowlist } from "../stream/rtc/allowlist";
 import type { AVD, LayoutDiffResult, Point, UIElement } from "./types";
+import { join } from "node:path";
 
 export interface DeviceTarget {
   serial: string;
+}
+
+/**
+ * A long-lived spawned process the CLI does NOT wait on (the emulator runs
+ * detached). `exited` resolves with the process exit code — used to detect an
+ * emulator dying before it registers a serial; `kill()` reaps a timed-out
+ * launch.
+ */
+export interface SpawnedProcess {
+  exited: Promise<number>;
+  kill(): void;
+}
+
+/** Spawn a detached process (injected in tests with a record/playback double). */
+export type SpawnFn = (argv: string[]) => SpawnedProcess;
+
+/** Production spawn: detached emulator process, no piped stdio to clog. */
+const defaultSpawn: SpawnFn = (argv) => {
+  const proc = Bun.spawn(argv, { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+  return { exited: proc.exited, kill: () => proc.kill() };
+};
+
+/** Launch options for `emulatorStart` (design D4/D6). */
+export interface EmulatorStartOptions {
+  /** RTC encoder fps the emulator is launched with (30 default, 60 max). */
+  fps?: number;
+  /** Delay between `emulator list --long` registration polls (ms). */
+  pollMs?: number;
+  /** Overall deadline to observe a registered serial (ms). */
+  timeoutMs?: number;
 }
 
 /** Parse the recorded string center format `"[x,y]"` (or `"[x, y]"`). */
@@ -99,9 +132,11 @@ function toUiElement(raw: Record<string, unknown>): UIElement {
  */
 export class AndroidCli {
   private readonly runner: CommandRunner;
+  private readonly spawn: SpawnFn;
 
-  constructor(runner: CommandRunner) {
+  constructor(runner: CommandRunner, spawn: SpawnFn = defaultSpawn) {
     this.runner = runner;
+    this.spawn = spawn;
   }
 
   private cmd(...parts: string[]): string[] {
@@ -206,20 +241,70 @@ export class AndroidCli {
   }
 
   /**
-   * Start an AVD. The official CLI blocks until boot and prints the serial of
-   * the started emulator (`Virtual device successfully started as 'emulator-NNN'`),
-   * which is the ONLY reliable name→serial correlation under multi-device
-   * conditions (design D5). Returns the started serial, or null when the CLI
-   * prints no marker (caller falls back to a device-list diff).
+   * Start an AVD by DIRECTLY spawning the emulator binary (design D4/D6):
+   * `android emulator start` forwards no extra flags, and RTC streaming needs
+   * `-grpc-allowlist <generated>` (plus `-rtcfps` on emulators ≥ 36.6 where
+   * the option exists). The generated allowlist keeps the `android-studio`
+   * issuer so the per-instance token maps to it.
+   *
+   * Flow: validate fps → resolve the SDK path (`android info sdk`) → version
+   * gate (≥ 36.5.11, actionable error naming the requirement below it) →
+   * write the allowlist → detached spawn → poll `emulator list --long` until
+   * the AVD row is Online WITH a serial (the ONLY reliable name→serial
+   * correlation under multi-device conditions, design D5). An emulator that
+   * exits before registering, or a launch that never registers within
+   * `timeoutMs`, fails with an actionable error — never a silent hang.
    */
-  async emulatorStart(name: string, timeoutMs?: number): Promise<string | null> {
-    const stdout = await this.exec(
-      this.cmd("emulator", "start", name),
-      timeoutMs ?? SPAWN_TIMEOUTS.emulatorStart,
-    );
-    const m = /started as '(emulator-\d+)'/.exec(stdout);
-    if (!m) return null;
-    return m[1] as string;
+  async emulatorStart(name: string, opts: EmulatorStartOptions = {}): Promise<string> {
+    const sdk = await this.info("sdk");
+    const emu = join(sdk, "emulator", "emulator");
+    const versionRaw = await this.exec([emu, "-version"], SPAWN_TIMEOUTS.devices);
+    const version = parseEmulatorVersion(versionRaw);
+    if (!version) {
+      throw new Error(
+        `could not parse an emulator version from "${emu} -version" output; RTC streaming needs the versioned emulator binary (≥ 36.5.11)`,
+      );
+    }
+    if (!isAtLeast(version, MIN_EMULATOR_VERSION)) {
+      throw new Error(
+        `emulator ${version.major}.${version.minor}.${version.patch} is below the required 36.5.11; upgrade the emulator (sdkmanager --install emulator) to launch with RTC flags`,
+      );
+    }
+    const fps = opts.fps ?? 30;
+    if (fps !== 30 && fps !== 60) {
+      throw new Error(`-rtcfps must be 30 or 60 (got ${fps}); pass fps: 30 or fps: 60`);
+    }
+    const allowlistPath = writeAllowlist();
+    const argv = [emu, `@${name}`, "-grpc-allowlist", allowlistPath];
+    if (isAtLeast(version, RTCPFS_VERSION)) argv.push("-rtcfps", String(fps));
+    const proc = this.spawn(argv);
+
+    // Losing the emulator before it registers is fatal: surface the exit code.
+    const earlyExit = proc.exited.then((code) => {
+      throw new Error(
+        `emulator for ${name} exited with code ${code} before registering a serial; rerun with -verbose or inspect the AVD log for the launch failure`,
+      );
+    });
+    const pollMs = opts.pollMs ?? 500;
+    const timeoutMs = opts.timeoutMs ?? SPAWN_TIMEOUTS.emulatorStart;
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      // The early-exit race wins BEFORE the first poll when the process dies
+      // immediately — no wasted list reads, no masking by a poll error.
+      await Promise.race([
+        new Promise((resolve) => setTimeout(resolve, pollMs)),
+        earlyExit,
+      ]);
+      if (Date.now() > deadline) {
+        proc.kill();
+        throw new Error(
+          `emulator ${name} did not register a serial within ${timeoutMs}ms; it may still be booting — check 'android emulator list --long'`,
+        );
+      }
+      const avds = await this.emulatorList();
+      const registered = avds.find((a) => a.name === name && a.running && a.serial !== undefined);
+      if (registered) return registered.serial!;
+    }
   }
 
   async emulatorStop(name: string): Promise<void> {

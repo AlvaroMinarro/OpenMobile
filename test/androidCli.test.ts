@@ -1,5 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { AndroidCli } from "../src/device/androidCli";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { AndroidCli, type SpawnedProcess } from "../src/device/androidCli";
 import { expectFixture, loadFixture } from "./helpers/fixtures";
 import { MemoryRunner } from "./helpers/memoryRunner";
 
@@ -139,31 +142,235 @@ describe("AndroidCli — command builder + typed results", () => {
     runner.assertSatisfied();
   });
 
-  it("emulatorStart() issues the start command for a named AVD", async () => {
-    const runner = new MemoryRunner();
-    runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], { exitCode: 0 });
-    const cli = new AndroidCli(runner);
-    await cli.emulatorStart("Pixel_9_Pro");
-    runner.assertSatisfied();
+describe("emulatorStart() — direct spawn with -grpc-allowlist (design D4/D6, -rtcfps ≥ 36.6)", () => {
+  const SDK = "/opt/fake-sdk";
+  const EMU = `${SDK}/emulator/emulator`;
+  const VERSION_36_5 = "Android emulator version 36.5.11.0 (build_id 15261951) (CL:N/A)\n";
+  const VERSION_36_6 = "Android emulator version 36.6.11.0 (build_id 16000000) (CL:N/A)\n";
+  const LIST_OFFLINE =
+    "AVD ID            AVD Name       API Level    Status   Serial\nPixel_9_Pro       Pixel 9 Pro    android-36   Offline\n";
+  const LIST_ONLINE =
+    "AVD ID            AVD Name       API Level    Status   Serial\nPixel_9_Pro       Pixel 9 Pro    android-36   Online   emulator-5554\n";
+
+  /** Detached-spawn double: the emulator keeps running (exited stays pending). */
+  function fakeSpawn(opts: { exitCode?: number } = {}): {
+    spawn: (argv: string[]) => SpawnedProcess;
+    calls: string[][];
+  } {
+    const calls: string[][] = [];
+    return {
+      calls,
+      spawn: (argv: string[]) => {
+        calls.push([...argv]);
+        return {
+          exited: opts.exitCode === undefined ? new Promise<number>(() => {}) : Promise.resolve(opts.exitCode),
+          kill: () => {},
+        };
+      },
+    };
+  }
+
+  /** Deterministic allowlist location for assertions; returns the tmp dir. */
+  function allowlistDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), "om-test-allowlist-"));
+    process.env["OPENMOBILE_ALLOWLIST_DIR"] = dir;
+    return dir;
+  }
+
+  function cleanup(dir?: string): void {
+    delete process.env["OPENMOBILE_ALLOWLIST_DIR"];
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+
+  it("spawns <sdk>/emulator/emulator @<avd> -grpc-allowlist <generated> directly (no `android emulator start`)", async () => {
+    const dir = allowlistDir();
+    try {
+      const runner = new MemoryRunner();
+      runner.expect(["android", "info", "sdk"], { stdout: `${SDK}\n` });
+      runner.expect([EMU, "-version"], { stdout: VERSION_36_5 });
+      runner.expect(["android", "emulator", "list", "--long"], { stdout: LIST_ONLINE });
+      const { spawn, calls } = fakeSpawn();
+      const cli = new AndroidCli(runner, spawn);
+      const serial = await cli.emulatorStart("Pixel_9_Pro", { pollMs: 1 });
+      expect(serial).toBe("emulator-5554");
+      expect(calls).toHaveLength(1);
+      const argv = calls[0]!;
+      expect(argv[0]).toBe(EMU);
+      expect(argv[1]).toBe("@Pixel_9_Pro");
+      expect(argv).toContain("-grpc-allowlist");
+      const flagIdx = argv.indexOf("-grpc-allowlist");
+      expect(argv[flagIdx + 1]).toBe(join(dir, "om_allowlist.json"));
+      // 36.5.11 has NO -rtcfps (unknown option — live-verified, design D6).
+      expect(argv).not.toContain("-rtcfps");
+      // The old CLI-mediated start is gone entirely.
+      expect(runner.called("android", "emulator", "start", "Pixel_9_Pro")).toBe(false);
+      runner.assertSatisfied();
+    } finally {
+      cleanup(dir);
+    }
   });
 
-  it("emulatorStart() parses the started serial from the 'started as' marker", async () => {
-    const runner = new MemoryRunner();
-    runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], {
-      stdout: "Virtual device successfully started as 'emulator-5554'.\n",
-    });
-    const cli = new AndroidCli(runner);
-    expect(await cli.emulatorStart("Pixel_9_Pro")).toBe("emulator-5554");
-    runner.assertSatisfied();
+  it("writes a usable allowlist permitting RtcService + reflection for the android-studio issuer", async () => {
+    const dir = allowlistDir();
+    try {
+      const runner = new MemoryRunner();
+      runner.expect(["android", "info", "sdk"], { stdout: `${SDK}\n` });
+      runner.expect([EMU, "-version"], { stdout: VERSION_36_5 });
+      runner.expect(["android", "emulator", "list", "--long"], { stdout: LIST_ONLINE });
+      const { spawn } = fakeSpawn();
+      const cli = new AndroidCli(runner, spawn);
+      await cli.emulatorStart("Pixel_9_Pro", { pollMs: 1 });
+      const written = JSON.parse(readFileSync(join(dir, "om_allowlist.json"), "utf8")) as {
+        allowlist: Array<{ iss: string; allowed: string[] }>;
+      };
+      const entry = written.allowlist.find((e) => e.iss === "android-studio");
+      expect(entry).toBeDefined();
+      expect(entry!.allowed).toContain("/android.emulation.control.Rtc/.*");
+      expect(entry!.allowed).toContain("/grpc.reflection.v1alpha.ServerReflection/.*");
+      runner.assertSatisfied();
+    } finally {
+      cleanup(dir);
+    }
   });
 
-  it("emulatorStart() returns null when the CLI prints no 'started as' marker", async () => {
-    const runner = new MemoryRunner();
-    runner.expect(["android", "emulator", "start", "Pixel_9_Pro"], { exitCode: 0, stdout: "" });
-    const cli = new AndroidCli(runner);
-    expect(await cli.emulatorStart("Pixel_9_Pro")).toBeNull();
-    runner.assertSatisfied();
+  it("adds -rtcfps 30 by default when the emulator is ≥ 36.6", async () => {
+    const dir = allowlistDir();
+    try {
+      const runner = new MemoryRunner();
+      runner.expect(["android", "info", "sdk"], { stdout: `${SDK}\n` });
+      runner.expect([EMU, "-version"], { stdout: VERSION_36_6 });
+      runner.expect(["android", "emulator", "list", "--long"], { stdout: LIST_ONLINE });
+      const { spawn, calls } = fakeSpawn();
+      const cli = new AndroidCli(runner, spawn);
+      await cli.emulatorStart("Pixel_9_Pro", { pollMs: 1 });
+      const argv = calls[0]!;
+      const idx = argv.indexOf("-rtcfps");
+      expect(idx).toBeGreaterThan(-1);
+      expect(argv[idx + 1]).toBe("30");
+      runner.assertSatisfied();
+    } finally {
+      cleanup(dir);
+    }
   });
+
+  it("honors an explicit fps: 60 for -rtcfps", async () => {
+    const dir = allowlistDir();
+    try {
+      const runner = new MemoryRunner();
+      runner.expect(["android", "info", "sdk"], { stdout: `${SDK}\n` });
+      runner.expect([EMU, "-version"], { stdout: VERSION_36_6 });
+      runner.expect(["android", "emulator", "list", "--long"], { stdout: LIST_ONLINE });
+      const { spawn, calls } = fakeSpawn();
+      const cli = new AndroidCli(runner, spawn);
+      await cli.emulatorStart("Pixel_9_Pro", { fps: 60, pollMs: 1 });
+      expect(calls[0]!.slice(calls[0]!.indexOf("-rtcfps") + 1)[0]).toBe("60");
+      runner.assertSatisfied();
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+  it("rejects an fps outside {30, 60} BEFORE spawning anything", async () => {
+    const dir = allowlistDir();
+    try {
+      const runner = new MemoryRunner();
+      runner.expect(["android", "info", "sdk"], { stdout: `${SDK}\n` });
+      runner.expect([EMU, "-version"], { stdout: VERSION_36_6 });
+      const { spawn, calls } = fakeSpawn();
+      const cli = new AndroidCli(runner, spawn);
+      await expect(cli.emulatorStart("Pixel_9_Pro", { fps: 144, pollMs: 1 })).rejects.toThrow(/fps/);
+      expect(calls).toHaveLength(0);
+      runner.assertSatisfied();
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+  it("fails with an actionable version-gate error below 36.5.11 (names the requirement + upgrade path)", async () => {
+    const dir = allowlistDir();
+    try {
+      const runner = new MemoryRunner();
+      runner.expect(["android", "info", "sdk"], { stdout: `${SDK}\n` });
+      runner.expect([EMU, "-version"], {
+        stdout: "Android emulator version 36.4.9.0 (build_id 1) (CL:N/A)\n",
+      });
+      const { spawn, calls } = fakeSpawn();
+      const cli = new AndroidCli(runner, spawn);
+      await expect(cli.emulatorStart("Pixel_9_Pro", { pollMs: 1 })).rejects.toThrow(/36\.5\.11/);
+      expect(calls).toHaveLength(0); // nothing launched below the gate
+      runner.assertSatisfied();
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+  it("fails actionably when `emulator -version` output is unparseable", async () => {
+    const dir = allowlistDir();
+    try {
+      const runner = new MemoryRunner();
+      runner.expect(["android", "info", "sdk"], { stdout: `${SDK}\n` });
+      runner.expect([EMU, "-version"], { stdout: "garbage\n" });
+      const { spawn, calls } = fakeSpawn();
+      const cli = new AndroidCli(runner, spawn);
+      await expect(cli.emulatorStart("Pixel_9_Pro", { pollMs: 1 })).rejects.toThrow(/version/);
+      expect(calls).toHaveLength(0);
+      runner.assertSatisfied();
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+  it("polls `emulator list --long` until the AVD row reports Online with a serial", async () => {
+    const dir = allowlistDir();
+    try {
+      const runner = new MemoryRunner();
+      runner.expect(["android", "info", "sdk"], { stdout: `${SDK}\n` });
+      runner.expect([EMU, "-version"], { stdout: VERSION_36_5 });
+      runner.expect(["android", "emulator", "list", "--long"], { stdout: LIST_OFFLINE }); // still booting
+      runner.expect(["android", "emulator", "list", "--long"], { stdout: LIST_ONLINE }); // registered
+      const { spawn } = fakeSpawn();
+      const cli = new AndroidCli(runner, spawn);
+      expect(await cli.emulatorStart("Pixel_9_Pro", { pollMs: 1 })).toBe("emulator-5554");
+      runner.assertSatisfied();
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+  it("throws an actionable error when the emulator process exits before registering a serial", async () => {
+    const dir = allowlistDir();
+    try {
+      const runner = new MemoryRunner();
+      runner.expect(["android", "info", "sdk"], { stdout: `${SDK}\n` });
+      runner.expect([EMU, "-version"], { stdout: VERSION_36_5 });
+      const { spawn } = fakeSpawn({ exitCode: 1 });
+      const cli = new AndroidCli(runner, spawn);
+      await expect(cli.emulatorStart("Pixel_9_Pro", { pollMs: 1 })).rejects.toThrow(/exited/);
+      runner.assertSatisfied(); // no polling happened — the early exit won the race
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+  it("times out with an actionable error when the serial never registers", async () => {
+    const dir = allowlistDir();
+    try {
+      const runner = new MemoryRunner();
+      runner.expect(["android", "info", "sdk"], { stdout: `${SDK}\n` });
+      runner.expect([EMU, "-version"], { stdout: VERSION_36_5 });
+      const { spawn } = fakeSpawn();
+      const cli = new AndroidCli(runner, spawn);
+      // The unbounded poll loop would exhaust MemoryRunner expectations; the
+      // list read is stubbed to a permanent Offline for this test only.
+      cli.emulatorList = async () => [{ name: "Pixel_9_Pro", running: false }];
+      await expect(cli.emulatorStart("Pixel_9_Pro", { pollMs: 1, timeoutMs: 25 })).rejects.toThrow(
+        /did not register a serial/,
+      );
+    } finally {
+      cleanup(dir);
+    }
+  });
+});
 
   it("emulatorStop() issues the stop command for a named AVD", async () => {
     const runner = new MemoryRunner();
