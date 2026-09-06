@@ -83,7 +83,20 @@ export class GrpcRtcAdapter implements RtcAdapter {
   }
 
   stop(): void {
-    this.stopped = true;
-    this.client.close();
+    if (this.stopped) return;
+    // Drain queued sends (the teardown byes) BEFORE tearing the channel
+    // down: a stop that lands while sends are in flight must still deliver
+    // them (probe-b2: the emulator expects bye after the answer). A send to
+    // a dead device fails fast and keeps the chain moving.
+    this.sendChain = this.sendChain.then(
+      () => {
+        this.stopped = true;
+        this.client.close();
+      },
+      () => {
+        this.stopped = true;
+        this.client.close();
+      },
+    );
   }
 }

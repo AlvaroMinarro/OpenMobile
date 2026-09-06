@@ -1,0 +1,16 @@
+{
+  "description": "probe-b2 JSEP replay: the emulator-side message sequence a 36.5.11 RtcService v1 stream sends on requestRtcStream — start, the video-only VP8 offer, then a trickle host candidate. The daemon relays these VERBATIM; probe B proved the emulator drops candidates received before the answer.",
+  "stream": {
+    "version": "36.5.11",
+    "service": "android.emulation.control.Rtc/v1"
+  },
+  "messages": [
+    { "message": "{\"start\":{}}" },
+    {
+      "message": "{\"type\":\"offer\",\"sdp\":\"v=0\\r\\no=- 1 1 IN IP4 127.0.0.1\\r\\ns=Emulator RTC\\r\\nt=0 0\\r\\nm=video 11111 UDP/TLS/RTP/SAVPF 96\\r\\nc=IN IP4 127.0.0.1\\r\\na=rtpmap:96 VP8/90000\\r\\na=sendonly\\r\\nm=audio 0 UDP/TLS/RTP/SAVPF 0\\r\\nm=application 0 UDP/DTLS/SCTP webrtc-datachannel\\r\\n\"}"
+    },
+    {
+      "message": "{\"candidate\":\"candidate:1 1 UDP 2130706431 127.0.0.1 1111 typ host generation 0\",\"sdpMid\":\"0\",\"sdpMLineIndex\":0}"
+    }
+  ]
+}
