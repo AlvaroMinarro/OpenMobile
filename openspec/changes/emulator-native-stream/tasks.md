@@ -35,17 +35,17 @@ Chain strategy: feature-branch-chain
 
 ## Phase 2: PR2, RtcSession + signaling + fanout
 
-- [ ] 2.1 `src/stream/rtc/adapter.ts`: RtcService v1 conformance, start/sendJsep/receive/stop; serialized sends
-- [ ] 2.2 `src/stream/rtc/session.ts`: per-viewer RtcId; first-viewer start, last-viewer bye:true; answer-before-candidates flush (probe-b2)
-- [ ] 2.3 getStatus watchdog; loss→4409+active:false; 4401/4404/4429 JSON bodies; cap=8
-- [ ] 2.4 `src/stream/types.ts`: JSEP types (handshake/offer/answer/ice/state); viewer contract
-- [ ] 2.5 `src/stream/{manager,gateway,fanout}.ts`: retarget lifecycle to RtcSession; controlActive→gRPC injector
-- [ ] 2.6 `src/device/grpc.ts`: Rtc stub, requestRtcStream, receiveJsepMessages (server-stream), sendJsepMessage; 64MB receive limit
-- [ ] 2.7 `src/bridge/server.ts`: video WS→JSON signaling (handshake first; malformed→error+close); additive `stream.rtc{supported,active,viewers,guid?,fps?,reason?}`
-- [ ] 2.8 `src/bridge/main.ts`: wire grpc client + RtcSession factory into gateway deps
-- [ ] 2.9 Integration: in-process fake grpc server replaying jsep fixtures (probe-b2): round-trips, flush, cap, teardown, state
-- [ ] 2.10 Live conformance (env-gated): v1 offer/answer/ICE round-trip
-- [ ] 2.11 `bun test` + typecheck green; work-unit commits
+- [x] 2.1 `src/stream/rtc/adapter.ts`: RtcService v1 conformance, start/sendJsep/receive/stop; serialized sends
+- [x] 2.2 `src/stream/rtc/session.ts`: per-viewer RtcId; first-viewer start, last-viewer bye:true; answer-before-candidates flush (probe-b2)
+- [x] 2.3 getStatus watchdog; loss→4409+active:false; 4401/4404/4429 JSON bodies; cap=8
+- [x] 2.4 `src/stream/types.ts`: JSEP types (handshake/offer/answer/ice/state); viewer contract
+- [x] 2.5 `src/stream/{manager,gateway,fanout}.ts`: retarget lifecycle to RtcSession; controlActive→gRPC injector
+- [x] 2.6 `src/device/grpc.ts`: Rtc stub, requestRtcStream, receiveJsepMessages (server-stream), sendJsepMessage; 64MB receive limit
+- [x] 2.7 `src/bridge/server.ts`: video WS→JSON signaling (handshake first; malformed→error+close); additive `stream.rtc{supported,active,viewers,guid?,fps?,reason?}`
+- [x] 2.8 `src/bridge/main.ts`: wire grpc client + RtcSession factory into gateway deps
+- [x] 2.9 Integration: in-process fake grpc server replaying jsep fixtures (probe-b2): round-trips, flush, cap, teardown, state
+- [x] 2.10 Live conformance (env-gated): v1 offer/answer/ICE round-trip
+- [x] 2.11 `bun test` + typecheck green; work-unit commits
 
 ## Phase 3: PR3, Browser RTC rewrite
 
