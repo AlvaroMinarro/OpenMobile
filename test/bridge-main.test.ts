@@ -93,10 +93,20 @@ describe("createBridgeDeps — RTC gateway wiring (task 2.8)", () => {
   });
 
   it("reports grpc_permission_denied when no pid ini matches (external launch)", () => {
-    const deps = createBridgeDeps({ ANDROID_DEVICE: "emulator-5554" });
-    const snap = deps.streamGateway?.snapshot();
-    expect(snap?.supported).toBe(false);
-    expect(snap?.rtc?.reason).toBe("grpc_permission_denied");
+    // Empty run dir: the ambient /run/user/<uid>/avd/running may legitimately
+    // hold a live emulator's pid ini — this scenario must not depend on it.
+    const dir = mkdtempSync(join(tmpdir(), "om-empty-rundir-"));
+    try {
+      const deps = createBridgeDeps({
+        ANDROID_DEVICE: "emulator-5554",
+        OPENMOBILE_AVD_RUN_DIR: dir,
+      });
+      const snap = deps.streamGateway?.snapshot();
+      expect(snap?.supported).toBe(false);
+      expect(snap?.rtc?.reason).toBe("grpc_permission_denied");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("honors OPENMOBILE_RTC_FPS=60 and ignores invalid values (default 30)", () => {
