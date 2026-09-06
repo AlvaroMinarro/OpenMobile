@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { join } from "node:path";
 import {
   StreamManager,
   type AdapterDeps,
@@ -299,6 +300,32 @@ describe("StreamManager env kill-switch — OPENMOBILE_STREAM=off (design D6)", 
     expect(adapter.started).toBe("emulator-5554");
     manager.unsubscribe(v);
     await flush(); // teardown still happens on last viewer
+  });
+});
+
+describe("StreamManager jar-presence support detection (spec: Unsupported environment)", () => {
+  it("gates snapshot().supported on the configured jar path; kill-switch still wins", () => {
+    // GIVEN the configured scrcpy-server jar is ABSENT — WHEN /v1/state
+    // reads the snapshot — THEN supported:false with a machine-readable
+    // reason naming the cause, and active:false (spec: Unsupported
+    // environment). The failure must surface at STATE-READ time, not only
+    // at WS connect time (close 4404).
+    const missing = makeManager({ jarPath: join(import.meta.dir, "does-not-exist.jar") });
+    const gone = missing.manager.snapshot();
+    expect(gone.supported).toBe(false);
+    expect(gone.reason).toBe("jar_missing");
+    expect(gone.active).toBe(false);
+    // A PRESENT jar keeps support enabled-driven: explicit existing path…
+    const present = makeManager({ jarPath: join(import.meta.dir, "stream-manager.test.ts") });
+    const ok = present.manager.snapshot();
+    expect(ok.supported).toBe(true);
+    expect(ok.reason).toBeUndefined();
+    // …and the DEFAULT wiring (bundled assets/scrcpy-server.jar) stays true.
+    const defaulted = makeManager();
+    expect(defaulted.manager.snapshot().supported).toBe(true);
+    // The kill-switch wins over jar presence when engaged.
+    const off = makeManager({ enabled: false, jarPath: join(import.meta.dir, "stream-manager.test.ts") });
+    expect(off.manager.snapshot().supported).toBe(false);
   });
 });
 

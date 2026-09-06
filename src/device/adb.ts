@@ -30,14 +30,185 @@ export function deviceShotPath(): string {
   return `/sdcard/om_shot_${rand6}.png`;
 }
 
+/** Parse a `wm size|density` "Physical size|density: <value>" line. */
+function parsePhysical(out: string, kind: "size" | "density"): string | undefined {
+  const m = new RegExp(`Physical ${kind}:\\s*(.+)`).exec(out);
+  return m ? (m[1] as string).trim() : undefined;
+}
+
 /** Extract a logcat priority token (V/D/I/W/E/F/S) from a `-v time` line. */
-function priorityOf(line: string): string | null {
-  // Real recorded lines: "MM-DD HH:MM:SS.mmm P/Tag(  pid): msg" — priority is
+function priorityOf(line: string): string | null {  // Real recorded lines: "MM-DD HH:MM:SS.mmm P/Tag(  pid): msg" — priority is
   // followed by '/' (e.g. " I/AiAiEcho("), NOT a space as the legacy regex
   // assumed.
   const m = /\s([VDIWEFS])\//.exec(line);
   return m ? (m[1] as string) : null;
 }
+
+// ─── Logcat live follow (bridge-surface-v2 task 4.1, design D5) ──────────
+
+/**
+ * Full per-line parse of one `-v time` record, extending the `priorityOf`
+ * shape with ts/tag/pid/message (task 4.2). Buffer headers
+ * ("--------- beginning of …") and any unparseable line yield `null` and are
+ * skipped by callers. Grammar proven against real recorded output by
+ * test/logcat-backlog-accounting.test.ts (SPIKE-2).
+ */
+export interface ParsedLogLine {
+  /** Raw `-v time` timestamp, e.g. "08-22 14:03:11.123". */
+  ts: string;
+  /** Single priority token V/D/I/W/E/F/S. */
+  priority: string;
+  /** Log tag (trimmed). */
+  tag: string;
+  /** Emitting process id. */
+  pid: number;
+  /** Remainder of the line after "): ". */
+  message: string;
+}
+
+const TIME_LINE_RE =
+  /^(\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+([VDIWEFS])\/([^(]+)\(\s*(\d+)\):\s?(.*)$/;
+
+export function parseLogcatTimeLine(line: string): ParsedLogLine | null {
+  const m = TIME_LINE_RE.exec(line);
+  if (!m) return null;
+  return {
+    ts: m[1] ?? "",
+    priority: m[2] ?? "",
+    tag: (m[3] ?? "").trim(),
+    pid: Number(m[4]),
+    message: m[5] ?? "",
+  };
+}
+
+/** Subscribable tag grammar pinned by the stream spec: [A-Za-z0-9._-]+ */
+export const LOGCAT_TAG_RE = /^[A-Za-z0-9._-]+$/;
+
+export type LogcatPriority = "V" | "D" | "I" | "W" | "E" | "F" | "S";
+
+export interface LogcatFollowOptions {
+  /** `-T <n>` follow-from count; 0/undefined omits -T entirely (live only). */
+  tail?: number;
+  /**
+   * Pre-validated filterspecs appended verbatim after `-v time`, e.g.
+   * ["ActivityManager:W", "*:S"]. Callers derive them from validated frames.
+   */
+  filterspecs?: string[];
+}
+
+export interface LogcatFollowHandle {
+  /** Terminate the child process; resolves once it has been reaped. */
+  stop(): Promise<void>;
+  /**
+   * SIGKILL escalation for teardown (task 4.8, design D5): fires only when a
+   * child ignored the graceful SIGTERM. OPTIONAL — simple doubles may omit it.
+   */
+  forceStop?(): Promise<void>;
+}
+
+/**
+ * Threat-matrix shell boundary (design D5): every argv element must survive
+ * contact with a shell even though we never pass through one. Serial allows
+ * ':' for tcp host:port serials; filterspecs are `<tag>:<PRIORITY>` or `*:S`
+ * with the tag restricted to [A-Za-z0-9._-]+ and the priority to V..S.
+ * Error messages NEVER echo the rejected input (D6 redaction precedent).
+ */
+const LOGCAT_SERIAL_RE = /^[A-Za-z0-9._:-]+$/;
+const LOGCAT_FILTERSPEC_RE = /^([A-Za-z0-9._-]+|\*):([VDIWEFS])$/;
+
+/** Build the exact follow argv, throwing on hostile input BEFORE any spawn. */
+export function buildLogcatFollowArgv(serial: string, opts: LogcatFollowOptions = {}): string[] {
+  if (!LOGCAT_SERIAL_RE.test(serial)) {
+    throw new Error("invalid serial for logcat follow");
+  }
+  if (opts.tail !== undefined && (!Number.isInteger(opts.tail) || opts.tail < 0)) {
+    throw new Error("invalid -T count for logcat follow");
+  }
+  for (const spec of opts.filterspecs ?? []) {
+    if (!LOGCAT_FILTERSPEC_RE.test(spec)) {
+      throw new Error("invalid filterspec for logcat follow");
+    }
+  }
+  const argv = ["adb", "-s", serial, "logcat"];
+  if (opts.tail !== undefined && opts.tail > 0) argv.push("-T", String(opts.tail));
+  argv.push("-v", "time");
+  if (opts.filterspecs !== undefined && opts.filterspecs.length > 0) {
+    argv.push(...opts.filterspecs);
+  }
+  return argv;
+}
+
+/**
+ * Spawn an argv-array process whose stdout is consumed INCREMENTALLY:
+ * every complete line invokes `onLine` as soon as it arrives (partial chunks
+ * are buffered until their newline; a trailing unterminated line is flushed
+ * at EOF). `stop()` sends SIGTERM and resolves once the child is reaped.
+ * This is the long-running counterpart of CommandRunner.run, which buffers
+ * until exit and therefore cannot stream.
+ */
+export function spawnLineFollow(argv: string[], onLine: (line: string) => void): LogcatFollowHandle {
+  const proc = Bun.spawn(argv, {
+    // Inherited explicitly (same as BunCommandRunner): keeps child env
+    // deterministic and lets tests shim the adb binary via PATH.
+    env: process.env,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  let stopped = false;
+  const emit = (raw: string): void => {
+    if (raw.length === 0) return;
+    onLine(raw.endsWith("\r") ? raw.slice(0, -1) : raw);
+  };
+  const done = (async (): Promise<void> => {
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    try {
+      for (;;) {
+        const { done: eof, value } = await reader.read();
+        if (eof) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl = buf.indexOf("\n");
+        while (nl >= 0) {
+          emit(buf.slice(0, nl));
+          buf = buf.slice(nl + 1);
+          nl = buf.indexOf("\n");
+        }
+      }
+      buf += decoder.decode(); // flush any pending multi-byte tail
+      emit(buf);
+    } finally {
+      reader.releaseLock();
+    }
+  })();
+  done.catch(() => {}); // kill-induced read errors surface via stop()/exited
+  return {
+    stop: async () => {
+      if (!stopped) {
+        stopped = true;
+        try {
+          proc.kill(); // SIGTERM
+        } catch {
+          // already dead — nothing to reap beyond `exited`
+        }
+      }
+      await proc.exited;
+      await done.catch(() => {});
+    },
+    // Escalation surface the LogcatHub grace timer fires (task 4.8): SIGKILL
+    // for a child that ignored the graceful SIGTERM; safe on a dead child.
+    forceStop: async () => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // already dead — nothing to reap beyond `exited`
+      }
+      await proc.exited;
+    },
+  };
+}
+
 
 /**
  * Fallback device-interface layer wrapping `adb`: device enumeration/state,
@@ -143,6 +314,17 @@ export class AdbWrapper {
     };
   }
 
+  /**
+   * Long-running `adb -s <serial> logcat -T <n> -v time <filterspecs…>`
+   * follow spawn (bridge-surface-v2 task 4.1, design D5): ONE process per
+   * subscriber produces replay + live with no gap/dup window. Argv-array
+   * only (no shell); hostile serial/tag/priority input throws BEFORE the
+   * child spawns. stdout is delivered incrementally line-by-line.
+   */
+  logcatFollow(serial: string, opts: LogcatFollowOptions, onLine: (line: string) => void): LogcatFollowHandle {
+    return spawnLineFollow(buildLogcatFollowArgv(serial, opts), onLine);
+  }
+
   /** `adb install -r <apk>` — fallback when the android CLI install is unavailable. */
   async install(serial: string, apk: string): Promise<void> {
     await this.exec(["adb", "-s", serial, "install", "-r", apk], SPAWN_TIMEOUTS.install);
@@ -160,18 +342,23 @@ export class AdbWrapper {
 
   /** Best-effort screen metrics via `wm size` / `wm density`; both may be missing on quirky devices. */
   async wm(serial: string): Promise<{ size?: string; density?: string }> {
-    const parsePhysical = (out: string): string | undefined => {
-      const m = /Physical (?:size|density):\s*(.+)/.exec(out);
-      return m ? (m[1] as string).trim() : undefined;
-    };
     const [sizeOut, densityOut] = await Promise.all([
       this.shell(serial, SPAWN_TIMEOUTS.devices, "wm", "size").catch(() => ""),
       this.shell(serial, SPAWN_TIMEOUTS.devices, "wm", "density").catch(() => ""),
     ]);
     return {
-      size: parsePhysical(sizeOut),
-      density: parsePhysical(densityOut),
+      size: parsePhysical(sizeOut, "size"),
+      density: parsePhysical(densityOut, "density"),
     };
+  }
+
+  /**
+   * Physical screen size only (`wm size`, e.g. "1080x2400") — the single
+   * cheap probe behind the tap range gate; undefined when unsupported.
+   */
+  async wmSize(serial: string): Promise<string | undefined> {
+    const out = await this.shell(serial, SPAWN_TIMEOUTS.devices, "wm", "size").catch(() => "");
+    return parsePhysical(out, "size");
   }
 
   /**

@@ -26,12 +26,17 @@ const cache = new Map<string, FixtureEnvelope>();
  * Load a recorded CLI-output fixture envelope by file name (without the .json
  * extension). Panics on missing files, malformed JSON, or envelopes without
  * full provenance — a fixture without provenance is not fit for parser tests.
+ * A `version` that differs from FIXTURE_VERSION is rejected with the re-record
+ * instruction, so a CLI upgrade cannot silently invalidate recorded shapes.
+ *
+ * `dir` defaults to the committed `test/fixtures/` set; tests pass a temp
+ * directory to exercise the rejection branches against crafted envelopes.
  */
-export function loadFixture(name: string): FixtureEnvelope {
+export function loadFixture(name: string, dir: string = FIXTURES_DIR): FixtureEnvelope {
   const cached = cache.get(name);
   if (cached) return cached;
 
-  const raw = readFileSync(join(FIXTURES_DIR, `${name}.json`), "utf8");
+  const raw = readFileSync(join(dir, `${name}.json`), "utf8");
   const env = JSON.parse(raw) as FixtureEnvelope;
   if (!Array.isArray(env.argv) || typeof env.stdout !== "string") {
     throw new Error(`fixture ${name}.json: envelope must carry argv[] and stdout`);

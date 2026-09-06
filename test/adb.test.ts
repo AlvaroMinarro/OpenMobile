@@ -237,6 +237,24 @@ describe("AdbWrapper — devices/state, logcat, screencap, uiautomator, input ch
     runner.assertSatisfied();
   });
 
+  it("wmSize() probes only `wm size` and returns the WxH physical size", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "-s", "emulator-5554", "shell", "wm", "size"], {
+      stdout: "Physical size: 1080x2400\n",
+    });
+    const adb = new AdbWrapper(runner);
+    expect(await adb.wmSize("emulator-5554")).toBe("1080x2400");
+    runner.assertSatisfied(); // density was never queried
+  });
+
+  it("wmSize() returns undefined when the device reports no physical size", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["adb", "-s", "emulator-5554", "shell", "wm", "size"], { exitCode: 1 });
+    const adb = new AdbWrapper(runner);
+    expect(await adb.wmSize("emulator-5554")).toBeUndefined();
+    runner.assertSatisfied();
+  });
+
   it("wm() returns undefined fields when the device reports no physical values", async () => {
     const runner = new MemoryRunner();
     runner.expect(["adb", "-s", "emulator-5554", "shell", "wm", "size"], { stdout: "" });

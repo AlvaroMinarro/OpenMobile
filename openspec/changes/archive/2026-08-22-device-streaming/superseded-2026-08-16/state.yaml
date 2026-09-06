@@ -1,0 +1,21 @@
+# DAG state — device-streaming (openmobile)
+# Created by sdd-archive at close time. Prior DAG state for this change was
+# session-tracked only (no state.yaml existed for any change in this project).
+
+status: archived
+archived_at: 2026-08-16
+verify_verdict: PASS_WITH_WARNINGS
+
+artifacts:
+  proposal: proposal.md
+  spec: specs/
+  design: design.md
+  tasks: tasks.md
+  verify_report: verify-report.md
+  archive_report: archive-report.md
+
+delta_sync:
+  openspec/specs/device-streaming/spec.md: created (NEW full spec)
+  openspec/specs/local-bridge/spec.md: created (base android-device-bridge + delta)
+  openspec/specs/input-channel/spec.md: created (base android-device-bridge + delta)
+  openspec/specs/screen-capture/spec.md: created (base android-device-bridge + delta)

@@ -1,0 +1,18 @@
+{
+    "unprotected": [],
+    "allowlist": [
+        {
+            "iss": "android-studio",
+            "allowed": [
+                "/android.emulation.control.EmulatorController/.*",
+                "/android.emulation.control.UiController/.*",
+                "/android.emulation.control.SnapshotService/.*",
+                "/android.emulation.control.incubating.*",
+                "/android.emulation.control.Rtc/.*",
+                "/android.emulation.control.v2.Rtc/.*",
+                "/grpc.reflection.v1alpha.ServerReflection/.*",
+                "/grpc.reflection.v1.ServerReflection/.*"
+            ]
+        }
+    ]
+}

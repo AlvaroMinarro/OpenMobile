@@ -76,6 +76,30 @@ async function retryOnce<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+/**
+ * Signature-conflict classifier (Install APK spec): real adb/CLI output for a
+ * signing-key mismatch carries INSTALL_FAILED_UPDATE_INCOMPATIBLE or an
+ * explicit "signatures do not match" note.
+ */
+export function isSignatureMismatch(message: string): boolean {
+  return /INSTALL_FAILED_UPDATE_INCOMPATIBLE|signatures? (do|does) not match/i.test(message);
+}
+
+/**
+ * Tap range gate (Tap spec SHOULD): returns an actionable error stating the
+ * valid range when the coordinates fall outside a KNOWN screen size; null
+ * when the size is unknown/unparsable (the gate never blocks blind taps).
+ */
+export function tapRangeError(x: number, y: number, screenSize: string | undefined): string | null {
+  if (!screenSize) return null;
+  const m = /^(\d+)x(\d+)$/.exec(screenSize.trim());
+  if (!m) return null;
+  const w = Number(m[1]);
+  const h = Number(m[2]);
+  if (x >= 0 && x < w && y >= 0 && y < h) return null;
+  return `tap (${x}, ${y}) is outside the valid range x:[0,${w}) y:[0,${h}) for screen ${screenSize.trim()}`;
+}
+
 async function toBase64(bytes: Uint8Array): Promise<string> {
   let bin = "";
   for (const b of bytes) bin += String.fromCharCode(b);
@@ -93,7 +117,14 @@ export const listDevices = (ctx: DeviceContext, _args?: unknown) =>
       ctx.cli.emulatorList(),
       ctx.cli.version(),
     ]);
-    return { devices, avds, cliVersion };
+    // Unauthorized devices are listed with an actionable RSA-authorization
+    // hint instead of leaving the agent to guess why state != 'device'.
+    const withHints = devices.map((d) =>
+      d.state === "unauthorized"
+        ? { ...d, hint: "accept the RSA debugging prompt on the device screen, then reconnect" }
+        : d,
+    );
+    return { devices: withHints, avds, cliVersion };
   });
 
 export const getDeviceInfo = (ctx: DeviceContext, args: { device?: string }) =>
@@ -134,6 +165,12 @@ export const emulatorStart = (ctx: DeviceContext, args: { name?: string; timeout
         );
       }
       name = available[0]!.name;
+    }
+    // Unknown-AVD spec scenario: fail BEFORE launching, listing what exists.
+    if (!available.some((a) => a.name === name)) {
+      throw new ToolError(
+        `unknown AVD '${name}'; available AVDs: ${available.map((a) => a.name).join(", ") || "(none)"}`,
+      );
     }
     // CLI-delegated readiness: the start command blocks until boot, wrapped in
     // an outer timeout, and prints the serial of the STARTED emulator. We poll
@@ -178,6 +215,12 @@ export const emulatorStop = (ctx: DeviceContext, args: { name: string }) =>
 
 export const emulatorCreate = (ctx: DeviceContext, args: { name: string }) =>
   safe(async () => {
+    // Duplicate-name spec scenario: reject BEFORE issuing the create command
+    // so an existing AVD is never clobbered and nothing is created.
+    const avds = await ctx.cli.emulatorList();
+    if (avds.some((a) => a.name === args.name)) {
+      throw new ToolError(`AVD '${args.name}' already exists; choose a different name (nothing was created)`);
+    }
     await ctx.cli.emulatorCreate(args.name);
     return { created: args.name };
   });
@@ -196,11 +239,25 @@ export const deployApp = (
     // Primary: android CLI install; fallback: adb install (design: CLI installs
     // are best-effort, adb ALWAYS works). Wrapped so a CLI failure never fails
     // the whole deploy when adb can do the job.
+    const signatureError = (raw: string) =>
+      new ToolError(
+        `install of ${args.apk} failed: signature conflict with the installed app — uninstall it or sign with the same key (${raw})`,
+      );
     const install = async () => {
       try {
         await ctx.cli.install({ serial: target.serial, apk: args.apk });
-      } catch {
-        await ctx.adb.install(target.serial, args.apk);
+      } catch (e) {
+        // A signature conflict is terminal: never mask it behind the adb
+        // fallback (Install APK spec — actionable error naming the conflict).
+        if (isSignatureMismatch(e instanceof Error ? e.message : String(e))) {
+          throw signatureError(e instanceof Error ? e.message : String(e));
+        }
+        await ctx.adb.install(target.serial, args.apk).catch((adbErr: unknown) => {
+          if (isSignatureMismatch(adbErr instanceof Error ? adbErr.message : String(adbErr))) {
+            throw signatureError(adbErr instanceof Error ? adbErr.message : String(adbErr));
+          }
+          throw adbErr;
+        });
       }
     };
     await withTimeout(install(), ctx.timeoutMs, `install of ${args.apk} timed out`);
@@ -229,13 +286,21 @@ export const getUiTree = (ctx: DeviceContext, args: { device?: string }) =>
   safe(async () => {
     const target = await requireTarget(ctx, args.device);
     if (!target.ok) return errText(target.error);
-    const tree = await ctx.cli.layout({ serial: target.serial });
-    if (tree.length > 0) return { serial: target.serial, empty: false, tree: serializeTree(tree) };
-    // CLI layout empty (e.g. WebView): fall back to the parsed uiautomator XML.
-    const xml = await ctx.adb.uiautomatorDump(target.serial);
-    const parsed = xmlToTree(xml);
-    if (parsed.length > 0) return { serial: target.serial, empty: false, tree: serializeTree(parsed) };
-    return { serial: target.serial, empty: true, tree: [] };
+    const fromXml = async () => xmlToTree(await ctx.adb.uiautomatorDump(target.serial));
+    let elements;
+    try {
+      elements = await ctx.cli.layout({ serial: target.serial });
+    } catch {
+      // CLI unavailable entirely (not just an empty screen): the uiautomator
+      // XML fallback IS the tree (Full UI Tree spec, CLI-unavailable scenario).
+      elements = await fromXml();
+    }
+    if (elements.length === 0) {
+      // CLI layout empty (e.g. WebView): fall back to the parsed
+      // uiautomator XML before signalling empty explicitly.
+      elements = await fromXml();
+    }
+    return { serial: target.serial, empty: elements.length === 0, tree: serializeTree(elements) };
   });
 
 export const getUiTreeDiff = (ctx: DeviceContext, args: { device?: string }) =>
@@ -275,7 +340,13 @@ export const takeScreenshot = (ctx: DeviceContext, args: { device?: string }) =>
     if (!target.ok) return errText(target.error);
     const path = ctx.tempPngPath!("shot", target.serial);
     try {
-      await ctx.cli.capture({ serial: target.serial, outPath: path });
+      try {
+        await ctx.cli.capture({ serial: target.serial, outPath: path });
+      } catch {
+        // Raw Screenshot spec: the android CLI capture falls back to
+        // `screencap` when the CLI path fails or is unavailable.
+        await ctx.adb.screencap(target.serial, path);
+      }
       const bytes = await ctx.readFile!(path);
       return okImage(await toBase64(bytes));
     } finally {
@@ -347,6 +418,10 @@ export const tap = (ctx: DeviceContext, args: { x: number; y: number; device?: s
   safe(async () => {
     const target = await requireTarget(ctx, args.device);
     if (!target.ok) return errText(target.error);
+    // Tap spec: reject out-of-range coordinates when the screen size is known
+    // (best-effort `wm size` probe; unknown size never blocks the tap).
+    const oob = tapRangeError(args.x, args.y, await ctx.adb.wmSize(target.serial));
+    if (oob) throw new ToolError(oob);
     await retryOnce(() => ctx.adb.inputTap(target.serial, args.x, args.y));
     return { injected: "tap", x: args.x, y: args.y, serial: target.serial };
   });

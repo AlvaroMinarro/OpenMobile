@@ -63,27 +63,23 @@ The daemon MUST bind to localhost only, MUST version the contract under the `/v1
 - GIVEN the bridge started
 - THEN it listens on a loopback address only and serves only `/v1/*` routes
 
-#### Scenario: Contract evolution
-
-- GIVEN a future breaking change to the contract
-- WHEN the route shape changes
-- THEN the change lands under a new path version (`/v2`), leaving `/v1` intact
-
 ### Requirement: Contract Stability
 
 The `/v1` contract MUST be documented with this change so the `openchamber-emulator-surface` change can implement against it without coupling to this repo's internals.
 
-#### Scenario: Downstream implementation
+#### Scenario: Documented contract
 
-- GIVEN the documented `/v1` contract shipped
-- WHEN the OpenChamber surface change is built
-- THEN it implements against the contract endpoints without changes to this repo
+- GIVEN the `/v1` contract shipped with this change
+- WHEN any endpoint documented in README §`/v1` bridge contract is exercised
+- THEN it responds with exactly the documented route shape, status codes, and error bodies
 
 ## Non-Goals
 
 - No authentication beyond the localhost trust boundary
 - No WebSocket/streaming endpoints (polling only)
 - No proxying of MCP tools over HTTP
+- No `/v2` versioning policy: routing future breaking changes under `/v2` is future policy, exercisable only when an actual breaking change lands — no runtime test is constructible today (`/v1` versioning remains normative in the Binding requirement)
+- No downstream implementation of the documented contract: consuming the shipped `/v1` REST contract (documented in README) is owned by the external `openchamber-emulator-surface` change — no runtime test is constructible until that change lands
 
 ## Out of Scope
 

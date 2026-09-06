@@ -173,7 +173,7 @@ describe("AndroidCli — command builder + typed results", () => {
     runner.assertSatisfied();
   });
 
-  it("emulatorCreate() issues the create command and rejects duplicates via stderr", async () => {
+  it("emulatorCreate() issues the create command for a new AVD (duplicate policy lives in the handler)", async () => {
     const runner = new MemoryRunner();
     runner.expect(["android", "emulator", "create", "New_AVD"], { exitCode: 0 });
     const cli = new AndroidCli(runner);
@@ -207,6 +207,64 @@ describe("AndroidCli — command builder + typed results", () => {
     expect(tree).toHaveLength(1);
     expect(tree[0]!.offScreen).toBe(true);
     expect(tree[0]!.center).toEqual({ x: 640, y: 1384 });
+    runner.assertSatisfied();
+  });
+
+  it("derives center from the bounds midpoint when an element has string bounds but no center", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["android", "layout", "--device=emulator-5554"], {
+      // Bounds-only element (Bounds-only spec scenario): NO center key at all.
+      stdout: JSON.stringify([{ bounds: "[100,200][300,400]", interactions: ["click"] }]),
+      exitCode: 0,
+    });
+    const cli = new AndroidCli(runner);
+    const tree = await cli.layout({ serial: "emulator-5554" });
+    expect(tree).toHaveLength(1);
+    expect(tree[0]!.center).toEqual({ x: 200, y: 300 }); // midpoint of [100,200][300,400]
+    expect(tree[0]!.targetable).toBeUndefined(); // parseable data ⇒ stays tappable
+    runner.assertSatisfied();
+  });
+
+  it("derives center from the bounds midpoint for OBJECT-shaped bounds without a center too", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["android", "layout", "--device=emulator-5554"], {
+      stdout: JSON.stringify([
+        { bounds: { left: 10, top: 20, right: 110, bottom: 120 }, interactions: ["click"] },
+      ]),
+      exitCode: 0,
+    });
+    const cli = new AndroidCli(runner);
+    const tree = await cli.layout({ serial: "emulator-5554" });
+    expect(tree[0]!.center).toEqual({ x: 60, y: 70 }); // midpoint of the object bounds
+    runner.assertSatisfied();
+  });
+
+  it("marks elements with neither parseable center nor bounds as non-targetable (never silent (0,0))", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["android", "layout", "--device=emulator-5554"], {
+      stdout: JSON.stringify([{ center: "not-a-center", text: "Ghost" }]),
+      exitCode: 0,
+    });
+    const cli = new AndroidCli(runner);
+    const tree = await cli.layout({ serial: "emulator-5554" });
+    expect(tree).toHaveLength(1);
+    expect(tree[0]!.center).toEqual({ x: 0, y: 0 }); // MAY output (0,0)…
+    expect(tree[0]!.targetable).toBe(false); // …but MUST record non-targetable
+    runner.assertSatisfied();
+  });
+
+  it("unparseable center still falls back to parseable bounds and keeps the element targetable", async () => {
+    const runner = new MemoryRunner();
+    runner.expect(["android", "layout", "--device=emulator-5554"], {
+      stdout: JSON.stringify([
+        { center: "garbage", bounds: "[0,0][200,80]", text: "Rescued" },
+      ]),
+      exitCode: 0,
+    });
+    const cli = new AndroidCli(runner);
+    const tree = await cli.layout({ serial: "emulator-5554" });
+    expect(tree[0]!.center).toEqual({ x: 100, y: 40 }); // bounds midpoint wins
+    expect(tree[0]!.targetable).toBeUndefined(); // NOT flagged non-targetable
     runner.assertSatisfied();
   });
 });

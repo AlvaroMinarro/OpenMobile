@@ -170,6 +170,76 @@ describe("plugin wiring (headless hooks)", () => {
     expect(typeof hooks["experimental.session.compacting"]).toBe("function");
   });
 
+  it("compacting hook pushes the last snapshot via args.context.push", async () => {
+    const loop = new FeedbackLoop({
+      throttleMs: 1,
+      fetchState: async () => ({ selected: dev, devices: [dev] }),
+      push: async () => {},
+    });
+    await loop.flush(); // capture a snapshot so lastSnapshot() is non-null
+    const snapshot = loop.lastSnapshot();
+    expect(snapshot).not.toBeNull();
+    const parts: unknown[] = [];
+    const hooks = makePluginHooks({}, loop);
+    await hooks["experimental.session.compacting"]({
+      context: { push: (part: unknown) => void parts.push(part) },
+    });
+    expect(parts).toEqual([{ type: "text", text: snapshot }]);
+  });
+
+  it("compacting hook also accepts the args.output.context shape", async () => {
+    const loop = new FeedbackLoop({
+      throttleMs: 1,
+      fetchState: async () => ({ selected: dev, devices: [dev] }),
+      push: async () => {},
+    });
+    await loop.flush();
+    const snapshot = loop.lastSnapshot() as string;
+    const parts: unknown[] = [];
+    const hooks = makePluginHooks({}, loop);
+    await hooks["experimental.session.compacting"]({
+      output: { context: { push: (part: unknown) => void parts.push(part) } },
+    });
+    expect(parts).toEqual([{ type: "text", text: snapshot }]);
+  });
+
+  it("compacting hook pushes nothing when no snapshot exists", async () => {
+    let pushes = 0;
+    const loop = new FeedbackLoop({
+      throttleMs: 1,
+      fetchState: async () => ({ selected: null, devices: [] }), // never usable
+      push: async () => void pushes++,
+    });
+    await loop.flush();
+    expect(loop.lastSnapshot()).toBeNull(); // precondition: nothing captured
+    const hooks = makePluginHooks({}, loop);
+    await hooks["experimental.session.compacting"]({
+      context: { push: () => void pushes++ },
+    });
+    expect(pushes).toBe(0);
+  });
+
+  it("compacting hook swallows a throwing context.push so compaction never crashes", async () => {
+    let calls = 0;
+    const loop = new FeedbackLoop({
+      throttleMs: 1,
+      fetchState: async () => ({ selected: dev, devices: [dev] }),
+      push: async () => {},
+    });
+    await loop.flush();
+    const hooks = makePluginHooks({}, loop);
+    // If the hook's try/catch were removed, this rejected promise would fail the test.
+    await hooks["experimental.session.compacting"]({
+      context: {
+        push: () => {
+          calls++;
+          throw new Error("context.push exploded");
+        },
+      },
+    });
+    expect(calls).toBe(1); // push WAS attempted, its error absorbed
+  });
+
   it("pushes to session.prompt with noReply:true via createPush", async () => {
     const calls: unknown[] = [];
     const client: SessionClient = {

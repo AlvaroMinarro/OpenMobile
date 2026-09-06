@@ -9,7 +9,9 @@ provides:
 - **MCP server** (`src/mcp-server.ts`) — a stdio server exposing ~12 tools that
   route through the device core.
 - **Localhost bridge** (`src/bridge/`) — an HTTP daemon serving the `/v1`
-  contract (state, screenshot, input) for the future OpenChamber surface.
+  contract (state, screenshot, input, emulator lifecycle, UI tree, device
+  selection, logcat live streaming) with opt-in token auth for browser
+  surfaces such as OpenChamber.
 - **Plugin** (`src/plugin/`) — a headless OpenCode plugin that pushes compact
   screen snapshots into the session on idle / tool-execute.
 
@@ -45,7 +47,10 @@ Config via env:
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `OPENMOBILE_BRIDGE_PORT` | `8765` | Loopback port for the `/v1` bridge. `0` = ephemeral. |
-| `OPENMOBILE_BRIDGE_SECRET` | *(off)* | When set, every request must carry `X-OpenMobile-Secret`. Loopback is the trust boundary, so it is off by default. |
+| `OPENMOBILE_BRIDGE_SECRET` | *(off)* | Seed secret. When set, every `/v1` request and WS upgrade must carry a credential and `POST /v1/auth/token` mints tokens. Loopback is the trust boundary, so it is off by default. |
+| `OPENMOBILE_BRIDGE_TOKEN_TTL` | `3600` | Default lifetime (seconds) of minted tokens; requests clamp to ≥ 60. |
+| `OPENMOBILE_BRIDGE_TOKEN_TTL_MAX` | `86400` | Server-enforced cap for requested token lifetimes. |
+| `OPENMOBILE_BRIDGE_ALLOWED_ORIGINS` | *(none)* | While auth is on: csv of origins eligible for CORS reflection (default none ⇒ no ACAO header at all). Auth off keeps legacy reflect-any-origin. |
 
 ### OpenCode feedback-loop plugin
 
@@ -89,11 +94,12 @@ knobs as the bridge.
 
 ## Device selection
 
-Selection precedence: explicit device argument `--device` > `ANDROID_DEVICE`
-env var > single-device auto-detection. With multiple attached devices and no
-explicit selection, tools fail listing all available serials. Only state
-`device` is a usable target; `unauthorized` and `offline` are surfaced in
-errors, never silently skipped.
+Selection precedence: explicit device argument `--device` / `?device=` >
+runtime HTTP override (`POST /v1/device/select`, daemon-memory only) >
+`ANDROID_DEVICE` env var > single-device auto-detection. With multiple
+attached devices and no explicit selection, tools fail listing all available
+serials. Only state `device` is a usable target; `unauthorized` and `offline`
+are surfaced in errors, never silently skipped.
 
 ## Latency notes
 
@@ -104,21 +110,113 @@ errors, never silently skipped.
 
 ## `/v1` bridge contract
 
-The localhost bridge exposes (loopback `127.0.0.1`; bind host + port via env):
+The localhost bridge serves five route groups under `/v1` (loopback
+`127.0.0.1`; bind host + port via env). Everything here is additive: with
+`OPENMOBILE_BRIDGE_SECRET` unset the surface behaves exactly as it did before.
+
+### Core device routes
 
 - `GET /v1/state` → `200` always (empty lists when no device):
-  `{ "selected": {...}|null, "frame": {...}|null, "devices": [...], "emulators": [...], "stream"?: {...} }`
+  `{ "selected": {...}|null, "frame": {...}|null, "devices": [...], "emulators": [...], "stream"?: {...}, "selection"?: {"serial","source":"override"} }`
   The additive `stream` object (present when streaming is wired):
-  `{ supported, active, reason?, viewers, width?, height? }`.
+  `{ supported, active, reason?, viewers, width?, height? }`. The additive
+  `selection` sibling appears only while a selection override is active —
+  without one those keys are absent entirely.
 - `GET /v1/screenshot` → `200 image/png`, or an error body when no usable device.
 - `POST /v1/input/tap`   body `{"x","y"}` → `200`
 - `POST /v1/input/swipe` body `{"x1","y1","x2","y2","durationMs"?}` → `200`
 - `POST /v1/input/text`  body `{"text"}` → `200`
 
+### Emulator lifecycle
+
+Bodies reuse the local tool schemas; success payloads pass through
+byte-shape-equal to the MCP handlers.
+
+- `POST /v1/emulator/start` body `{"name"}` → `200 {"started","serial"}`
+- `POST /v1/emulator/stop`  body `{"name"}` → `200 {"stopped",...}`; stopping
+  a known not-running AVD issues no CLI stop, and repeat calls answer
+  `"alreadyStopped":true`.
+- `POST /v1/emulator/create` body `{"name"}` → `200 {"created":"<name>"}`.
+
+Errors: duplicate name ⇒ `409 avd_exists` (nothing created); unknown AVD ⇒
+`404 avd_not_found` with `details.available`; boot timeout ⇒ `504 boot_timeout`
+detailing `{name?, serial, lastState}`; malformed body ⇒ `422 validation_error`.
+
+### Device selection & UI tree
+
+- `POST /v1/device/select` body `{"serial"}` → `200 {"selected"}`; unknown
+  serial ⇒ `404 device_not_found` with `details.attached`. The override lives
+  in daemon memory only (a restart clears it) and surfaces in `/v1/state`.
+- `GET /v1/ui-tree` → `200 {"serial","empty","tree"}` — same JSON shape as the
+  local `get_ui_tree` tool; an empty hierarchy is signalled in-band
+  (`empty:true`), never as an HTTP error.
+
+Selection precedence (highest wins):
+
+| Tier | Source |
+|------|--------|
+| 1 | Explicit `?device=<serial>` query parameter |
+| 2 | Runtime override (`POST /v1/device/select`) |
+| 3 | `ANDROID_DEVICE` env var |
+| 4 | Single-device auto-detection |
+
+With multiple devices attached and no explicit tier, requests fail listing all
+serials; a stale override serial errors naming it — never a silent fallback.
+
+### Logcat live stream
+
+- **`WS /v1/logcat/ws`** — ONE long-lived `adb logcat -T <n> -v time <specs>`
+  spawn per subscriber: replay and live come from the same process, so there
+  is no gap/duplication window. After the upgrade the client sends exactly ONE
+  filter frame:
+  `{"tags":["ActivityManager"],"priority":"W","backlog":50}`
+  (tags match `[A-Za-z0-9._-]+`, priority `V`–`S`, backlog clamped to
+  `[0,1000]`, default `100`). The server then delivers up to `backlog` matching
+  recent records, sends `{"type":"live"}`, and streams live-only:
+  - line frame: `{"type":"line","ts","priority","tag","pid","message"}`
+  - slow-consumer notice: `{"type":"dropped","count":n}` — bounded queue with
+    drop-oldest; the socket never closes for being slow
+  - malformed or duplicate filter frame: `{"type":"error","code":"validation_error","message"}`
+    then close `1008`
+  - close codes: `4429` subscriber cap (8 per bridge), `4409` device lost
+    mid-stream (reason names the serial)
+
+### Token issuance (auth flow)
+
+Setting `OPENMOBILE_BRIDGE_SECRET` (the seed) gates EVERY route and WS
+upgrade. Credentials: `Authorization: Bearer <seed|token>`, legacy
+`X-OpenMobile-Secret: <seed>` header, or — because browsers cannot attach
+headers to WebSocket upgrades — a requested subprotocol entry
+`openmobile.bearer.<token>`. Query-param credentials are refused.
+
+1. Mint: `POST /v1/auth/token`, authenticated AS THE SEED, optional body
+   `{"ttlSeconds":<int>}` → `200 {"token","expiresAt"(ISO),"ttlSeconds"}`,
+   TTL clamped to `[60, OPENMOBILE_BRIDGE_TOKEN_TTL_MAX]` (default from
+   `OPENMOBILE_BRIDGE_TOKEN_TTL`). Wrong/missing credential ⇒
+   `401 unauthorized`; seed unset ⇒ the route is not registered (legacy 404).
+2. Call: present the token as Bearer credential or subprotocol entry until it
+   expires ⇒ `401 token_expired`; mint again from the seed.
+3. Rotate: restart with a new seed. Tokens are stored hashed, in daemon memory
+   only — they die with the process, and a token can never mint more tokens.
+
+While auth is on, CORS reflects ONLY origins listed in
+`OPENMOBILE_BRIDGE_ALLOWED_ORIGINS` (csv; default none ⇒ no ACAO header at
+all). Auth off keeps the legacy loopback posture (any origin reflected).
+
+### Browser caveats
+
+- Binding stays loopback `127.0.0.1`: token auth exists to keep OTHER local
+  pages out (DNS-rebinding/CSRF posture), not to enable remote access.
+- Embedders driving the bridge from a web page should enable auth by default
+  (set a seed) and allow-list their page origin.
+- Non-browser clients may keep using `X-OpenMobile-Secret`.
+
 Error body (all non-2xx): `{"error":{"code","message","details?"}}`.
-Status codes: `400 BAD_REQUEST`, `401 UNAUTHORIZED`, `404 NOT_FOUND`,
-`409 NO_DEVICE/DEVICE_OFFLINE/AMBIGUOUS_DEVICE/STREAM_OFF`, `422 VALIDATION_ERROR`,
-`500 INTERNAL_ERROR`. Contract is versioned: breaking changes land under `/v2`.
+Status map: `400 BAD_REQUEST`, `401 UNAUTHORIZED/TOKEN_EXPIRED`,
+`404 NOT_FOUND/AVD_NOT_FOUND/DEVICE_NOT_FOUND`,
+`409 NO_DEVICE/DEVICE_OFFLINE/AMBIGUOUS_DEVICE/STREAM_OFF/AVD_EXISTS`,
+`422 VALIDATION_ERROR`, `504 BOOT_TIMEOUT`, `500 INTERNAL_ERROR`. Contract is
+versioned: breaking changes land under `/v2`.
 
 ### Streaming WebSockets (device streaming)
 
@@ -182,9 +280,12 @@ client.sendInput({ type: "inject", event: "tap", x: 215, y: 480 }); // video-spa
   on the control socket. `client.videoSize` exposes the handshake size once
   the stream is configured.
 - Close codes surface through `onStatus` (`4403/4404/4429/4409`).
-- **Secret caveat**: browsers cannot attach the `X-OpenMobile-Secret` header
-  to WebSocket upgrades — keep `OPENMOBILE_BRIDGE_SECRET` unset (the default;
-  loopback is the trust boundary) when using the browser client.
+- **Auth caveat**: browsers cannot attach custom headers to WebSocket
+  upgrades, so authenticate stream sockets with a requested subprotocol entry
+  `openmobile.bearer.<token>` (minted via `POST /v1/auth/token`) instead of
+  `X-OpenMobile-Secret`. Embedders should enable auth by default when serving
+  the bridge to a browser page; with auth off, loopback remains the trust
+  boundary and any local page can drive the daemon.
 
 Demo page: `examples/stream.html` (open it in a browser while the bridge
 streams; tap the canvas to inject taps). The client bundle it imports is
