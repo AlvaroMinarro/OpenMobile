@@ -147,6 +147,7 @@ describe("emulatorStart() — direct spawn with -grpc-allowlist (design D4/D6, -
   const EMU = `${SDK}/emulator/emulator`;
   const VERSION_36_5 = "Android emulator version 36.5.11.0 (build_id 15261951) (CL:N/A)\n";
   const VERSION_36_6 = "Android emulator version 36.6.11.0 (build_id 16000000) (CL:N/A)\n";
+  const VERSION_37_1 = "Android emulator version 37.1.11.0 (build_id 15917651) (CL:N/A)\n";
   const LIST_OFFLINE =
     "AVD ID            AVD Name       API Level    Status   Serial\nPixel_9_Pro       Pixel 9 Pro    android-36   Offline\n";
   const LIST_ONLINE =
@@ -247,6 +248,25 @@ describe("emulatorStart() — direct spawn with -grpc-allowlist (design D4/D6, -
       const idx = argv.indexOf("-rtcfps");
       expect(idx).toBeGreaterThan(-1);
       expect(argv[idx + 1]).toBe("30");
+      runner.assertSatisfied();
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+  it("does NOT pass -rtcfps on 37.x — the option was removed in 37.0 (live-verified: `unknown option: -rtcfps`)", async () => {
+    const dir = allowlistDir();
+    try {
+      const runner = new MemoryRunner();
+      runner.expect(["android", "info", "sdk"], { stdout: `${SDK}\n` });
+      runner.expect([EMU, "-version"], { stdout: VERSION_37_1 });
+      runner.expect(["android", "emulator", "list", "--long"], { stdout: LIST_ONLINE });
+      const { spawn, calls } = fakeSpawn();
+      const cli = new AndroidCli(runner, spawn);
+      const serial = await cli.emulatorStart("Pixel_9_Pro", { fps: 60, pollMs: 1 });
+      expect(serial).toBe("emulator-5554");
+      expect(calls[0]!).not.toContain("-rtcfps");
+      expect(calls[0]!).toContain("-grpc-allowlist");
       runner.assertSatisfied();
     } finally {
       cleanup(dir);

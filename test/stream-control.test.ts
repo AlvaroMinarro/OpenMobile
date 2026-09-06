@@ -76,11 +76,42 @@ describe("grpcControlInjector — JSON inject → gRPC unary (design D3/D5)", ()
     expect(control.calls).toEqual(["text(hola ñ)"]);
   });
 
-  it("injects a key keycode via sendKey", async () => {
+  it("translates ANDROID keycodes to Evdev — Usb codeType delivers nothing on 37.x (live-verified via getevent)", async () => {
     const control = fakeControl();
     const injector = grpcControlInjector(control);
-    await injector.inject({ type: "inject", event: "key", keycode: 4 });
-    expect(control.calls).toEqual(["keyCode(4,0)"]);
+    await injector.inject({ type: "inject", event: "key", keycode: 4 }); // Android BACK
+    await injector.inject({ type: "inject", event: "key", keycode: 3 }); // Android HOME
+    await injector.inject({ type: "inject", event: "key", keycode: 29 }); // A → KEY_A=30
+    await injector.inject({ type: "inject", event: "key", keycode: 7 }); // 0 → KEY_0=2
+    await injector.inject({ type: "inject", event: "key", keycode: 66 }); // ENTER → KEY_ENTER=28
+    await injector.inject({ type: "inject", event: "key", keycode: 62 }); // SPACE → KEY_SPACE=57
+    await injector.inject({ type: "inject", event: "key", keycode: 20 }); // DPAD_DOWN → KEY_DOWN=108
+    await injector.inject({ type: "inject", event: "key", keycode: 24 }); // VOLUME_UP → KEY_VOLUMEUP=115
+    await injector.inject({ type: "inject", event: "key", keycode: 111 }); // ESC → KEY_ESC=1
+    expect(control.calls).toEqual([
+      "key(GoBack)", // Android-special: named event (live-verified), Evdev has no BACK
+      "key(GoHome)",
+      "keyCode(30,1)",
+      "keyCode(2,1)",
+      "keyCode(28,1)",
+      "keyCode(57,1)",
+      "keyCode(108,1)",
+      "keyCode(115,1)",
+      "keyCode(1,1)",
+    ]);
+  });
+
+  it("rejects unmappable Android keycodes with an actionable error (never a silent no-op)", async () => {
+    const control = fakeControl();
+    const injector = grpcControlInjector(control);
+    const err = await injector.inject({ type: "inject", event: "key", keycode: 187 }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ControlError);
+    expect((err as ControlError).code).toBe("UNSUPPORTED_EVENT");
+    expect((err as ControlError).message).toContain("187");
+    expect(control.calls).toEqual([]);
   });
 
   it("maps gRPC OUT_OF_RANGE onto a ControlError with the same code", async () => {

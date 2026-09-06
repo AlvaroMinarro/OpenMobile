@@ -1,6 +1,6 @@
 import { detectDiffShape, parseBounds } from "./serialize";
 import { SPAWN_TIMEOUTS, type CommandRunner } from "./runner";
-import { isAtLeast, MIN_EMULATOR_VERSION, parseEmulatorVersion, RTCPFS_VERSION } from "./grpc";
+import { isAtLeast, MIN_EMULATOR_VERSION, parseEmulatorVersion, RTCPFS_REMOVED_VERSION, RTCPFS_VERSION } from "./grpc";
 import { writeAllowlist } from "../stream/rtc/allowlist";
 import type { AVD, LayoutDiffResult, Point, UIElement } from "./types";
 import { join } from "node:path";
@@ -276,7 +276,11 @@ export class AndroidCli {
     }
     const allowlistPath = writeAllowlist();
     const argv = [emu, `@${name}`, "-grpc-allowlist", allowlistPath];
-    if (isAtLeast(version, RTCPFS_VERSION)) argv.push("-rtcfps", String(fps));
+    // `-rtcfps` exists ONLY in the [36.6, 37.0) window: unknown on 36.5.11,
+    // removed in 37.0 (`unknown option: -rtcfps`, live-verified on 37.1.11).
+    if (isAtLeast(version, RTCPFS_VERSION) && !isAtLeast(version, RTCPFS_REMOVED_VERSION)) {
+      argv.push("-rtcfps", String(fps));
+    }
     const proc = this.spawn(argv);
 
     // Losing the emulator before it registers is fatal: surface the exit code.
