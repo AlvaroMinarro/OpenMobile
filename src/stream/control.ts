@@ -23,6 +23,7 @@
 import type { ControlEvent } from "./types";
 import type { EmulatorControl } from "../device/grpc";
 import { GrpcControlError } from "../device/grpc";
+import { ANDROID_SPECIAL_KEYS, androidKeycodeToEvdev } from "./keymap";
 
 /** Typed control error codes (mapped onto WS error frames by the route). */
 export type ControlErrorCode =
@@ -147,11 +148,27 @@ export function grpcControlInjector(control: EmulatorControl): ControlInjector {
             // (probe D, design D3). Full UTF-8: no legacy ASCII-only restriction.
             await control.text(event.text);
             return;
-          case "key":
-            // codeType Usb=0: the WS keycode space is the emulator's raw
-            // input code (translated via the emulator's chromium tables).
-            await control.keyCode(event.keycode, 0);
+          case "key": {
+            // The WS keycode space is ANDROID keycodes (design: the natural
+            // space for browser clients). Translation (live-verified on
+            // 37.1.11): Usb codeType delivers NOTHING into the guest, so
+            // mappable keys ride Evdev; Android-special keys (BACK, HOME)
+            // ride the named events (GoBack/GoHome, live-verified).
+            const special = ANDROID_SPECIAL_KEYS.get(event.keycode);
+            if (special !== undefined) {
+              await control.keyPress(special);
+              return;
+            }
+            const evdev = androidKeycodeToEvdev(event.keycode);
+            if (evdev === null) {
+              throw new ControlError(
+                "UNSUPPORTED_EVENT",
+                `Android keycode ${event.keycode} has no emulator key mapping; use /v1/input/key (adb path) for exotic keys`,
+              );
+            }
+            await control.keyCode(evdev, 1);
             return;
+          }
           default:
             throw new ControlError(
               "UNSUPPORTED_EVENT",
