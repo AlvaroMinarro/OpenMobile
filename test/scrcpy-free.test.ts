@@ -64,7 +64,12 @@ describe("deletion proof — zero references to the deleted streaming world", ()
       "src/stream/scrcpy.ts",
       "src/stream/wire.ts",
       "src/stream/daemon.ts",
-      "src/stream/client",
+      // The client directory is REBORN as the Phase-3 RTC client
+      // (src/stream/client/index.ts); the Annex-B/WebCodecs modules stay
+      // deleted — asserted file-by-file so a reintroduction cannot hide.
+      "src/stream/client/annexb.ts",
+      "src/stream/client/decoder.ts",
+      "src/stream/client/support.ts",
       "assets/scrcpy-server.jar",
       "assets/README.md",
       "scripts/record-stream-fixture.ts",
